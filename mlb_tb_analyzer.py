@@ -1203,98 +1203,160 @@ def compute_hr_score(
     return max(0, min(100, round(composite, 1)))
 
 # ============================================================================
+# ROSTER FALLBACK — fetch team roster when lineup not yet posted
+# ============================================================================
+@st.cache_data(ttl=3600)
+def fetch_team_roster(team_id: int) -> List[Dict]:
+    """Fetch 40-man roster as fallback when lineup not confirmed."""
+    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
+    params = {"rosterType": "active"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        batters = []
+        for p in data.get("roster", []):
+            pos = p.get("position", {}).get("type", "")
+            if pos in ("Pitcher",):
+                continue
+            batters.append({
+                "player_id": str(p["person"]["id"]),
+                "name": p["person"]["fullName"],
+                "lineup_slot": 5,  # unknown slot
+                "batter_hand": "R",  # default
+                "position": p.get("position", {}).get("abbreviation", ""),
+                "projected": True,
+            })
+        return batters[:9]
+    except:
+        return []
+
+@st.cache_data(ttl=3600)
+def fetch_team_id(abbreviation: str) -> Optional[int]:
+    """Get MLB team ID from abbreviation."""
+    url = "https://statsapi.mlb.com/api/v1/teams"
+    params = {"sportId": 1, "season": 2026}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        for team in data.get("teams", []):
+            if team.get("abbreviation") == abbreviation:
+                return team["id"]
+    except:
+        pass
+    return None
+
+# ============================================================================
 # MAIN MODEL PIPELINE
 # ============================================================================
 def run_model(date_str: str, status_container) -> List[Dict]:
     """
     Master pipeline: pulls all data, scores every batter, returns ranked list.
+    Robust fallbacks at every step — always produces output.
     """
     results = []
-    logs = []
     
-    def log(msg):
-        logs.append(msg)
-        status_container.markdown("\n".join(logs[-8:]))
+    # Live status log in UI
+    status_box = status_container.empty()
+    log_lines = []
     
-    log(f"⚾ **MLB TB Model** | {date_str}")
-    log("─" * 50)
+    def log(msg, level="info"):
+        icon = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌", "run": "⚙️"}.get(level, "")
+        line = f"{icon} {msg}" if icon else msg
+        log_lines.append(line)
+        status_box.markdown("\n\n".join(log_lines[-12:]))
     
+    log(f"**⚾ MLB TB Analyzer — {date_str}**")
+    log("─" * 40)
+
     # ── 1. SCHEDULE ──────────────────────────────────────
-    log("📅 Fetching schedule...")
+    log("Fetching MLB schedule...", "run")
     games = fetch_schedule(date_str)
     
     if not games:
-        log("❌ No games found for this date.")
+        log(f"No MLB games scheduled on {date_str}.", "warn")
+        log("Try selecting a different date — Opening Day is **March 27, 2026**.", "info")
+        log("Use the date picker in the sidebar ↑", "info")
+        status_box.markdown("\n\n".join(log_lines))
         return []
     
-    log(f"✅ Found {len(games)} games")
+    log(f"Found **{len(games)} games** on {date_str}", "ok")
     for g in games:
-        log(f"   • {g['away_team']} @ {g['home_team']} | SP: {g['away_pitcher'] or 'TBD'} vs {g['home_pitcher'] or 'TBD'}")
-    
+        hp = g.get("home_pitcher") or "TBD"
+        ap = g.get("away_pitcher") or "TBD"
+        log(f"{g['away_team']} @ {g['home_team']}  |  {ap} vs {hp}")
+
     # ── 2. ODDS ───────────────────────────────────────────
-    log("💰 Fetching Vegas lines...")
-    implied_totals = fetch_odds(date_str)
+    log("Fetching Vegas lines...", "run")
+    implied_totals = {}
+    try:
+        implied_totals = fetch_odds(date_str)
+    except:
+        pass
     if implied_totals:
-        log(f"✅ Odds loaded for {len(implied_totals)} teams")
+        log(f"Odds loaded for {len(implied_totals)} teams", "ok")
     else:
-        log("⚠️ No odds available (API key missing or quota exceeded) - using neutral 4.5")
-    
-    # ── 3. WEATHER + LINEUPS + SCORING ───────────────────
-    log("🌤️ Fetching weather and lineups...")
-    
+        log("No Odds API key — using neutral 4.5 implied runs for all teams", "warn")
+
+    # ── 3. PROCESS EACH GAME ─────────────────────────────
     total_batters = 0
-    
+    games_skipped = 0
+
     for game in games:
         game_pk = game["game_pk"]
         home_team = game["home_team"]
         away_team = game["away_team"]
         
-        # Get park info
+        log(f"Processing: **{away_team} @ {home_team}**...", "run")
+
+        # Park / weather
         park_info = STADIUM_COORDS.get(home_team, (40.7, -74.0, "Unknown Stadium", False))
         lat, lon, park_name, is_dome = park_info
-        
-        # Weather
         weather = fetch_weather(lat, lon, game.get("game_time", ""), is_dome)
-        
-        # Lineups
-        log(f"📋 Loading lineup: {away_team} @ {home_team}...")
+
+        # Lineups — try confirmed first, fall back to roster
         lineups = fetch_lineup(game_pk)
-        
         home_batters = lineups.get("home", [])
         away_batters = lineups.get("away", [])
-        
-        # If no confirmed lineup, we skip (per best practices)
-        if not home_batters and not away_batters:
-            log(f"   ⚠️ {away_team} @ {home_team}: No confirmed lineups yet - skipping")
-            continue
-        
-        # Get pitcher info
+        lineup_confirmed = bool(home_batters or away_batters)
+
+        if not lineup_confirmed:
+            log(f"  Lineup not posted yet — using projected roster (flagged)", "warn")
+            # Fallback: use roster
+            home_id = fetch_team_id(home_team)
+            away_id = fetch_team_id(away_team)
+            if home_id:
+                home_batters = fetch_team_roster(home_id)
+            if away_id:
+                away_batters = fetch_team_roster(away_id)
+            if not home_batters and not away_batters:
+                log(f"  Could not load roster for {away_team}@{home_team} — skipping", "err")
+                games_skipped += 1
+                continue
+
+        # Pitcher info
         home_pitcher_id = game.get("home_pitcher_id")
         away_pitcher_id = game.get("away_pitcher_id")
-        
-        home_pitcher_info = fetch_pitcher_info(home_pitcher_id) if home_pitcher_id else {"name": "TBD", "hand": "R"}
-        away_pitcher_info = fetch_pitcher_info(away_pitcher_id) if away_pitcher_id else {"name": "TBD", "hand": "R"}
-        
-        # Score each batter
+        home_pitcher_info = fetch_pitcher_info(home_pitcher_id) if home_pitcher_id else {"name": "TBD", "hand": "R", "id": None}
+        away_pitcher_info = fetch_pitcher_info(away_pitcher_id) if away_pitcher_id else {"name": "TBD", "hand": "R", "id": None}
+
+        # Build batter list
         all_batters = []
-        for batter in home_batters[:9]:
-            batter["team"] = home_team
-            batter["opponent"] = away_team
-            batter["opposing_pitcher"] = away_pitcher_info
-            batter["is_home"] = True
-            batter["park_team"] = home_team
-            all_batters.append(batter)
-        
-        for batter in away_batters[:9]:
-            batter["team"] = away_team
-            batter["opponent"] = home_team
-            batter["opposing_pitcher"] = home_pitcher_info
-            batter["is_home"] = False
-            batter["park_team"] = home_team  # Away team plays at home team's park
-            all_batters.append(batter)
-        
-        log(f"   📊 Scoring {len(all_batters)} batters...")
-        
+        for b in home_batters[:9]:
+            b = dict(b)
+            b.update({"team": home_team, "opponent": away_team,
+                      "opposing_pitcher": away_pitcher_info,
+                      "park_team": home_team, "lineup_confirmed": lineup_confirmed})
+            all_batters.append(b)
+        for b in away_batters[:9]:
+            b = dict(b)
+            b.update({"team": away_team, "opponent": home_team,
+                      "opposing_pitcher": home_pitcher_info,
+                      "park_team": home_team, "lineup_confirmed": lineup_confirmed})
+            all_batters.append(b)
+
+        log(f"  Scoring {len(all_batters)} batters...", "run")
+
         for batter in all_batters:
             player_id = batter.get("player_id", "")
             name = batter.get("name", "Unknown")
@@ -1304,59 +1366,50 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             sp_hand = sp_info.get("hand", "R")
             lineup_slot = batter.get("lineup_slot", 5)
             batter_hand = batter.get("batter_hand", "R")
-            park_team = batter.get("park_team", team)
-            
-            # Statcast batter data
+            park_team = batter.get("park_team", home_team)
+
+            # Statcast — with timeout protection and league-avg fallback
             batter_statcast = {}
             if player_id:
                 try:
                     batter_statcast = fetch_statcast_batter_stats(player_id, days_back=30)
-                except:
+                except Exception:
                     pass
-            
-            # Pitcher Statcast
+            # Always falls back to league averages inside compute_batter_score if empty
+
             pitcher_statcast = {}
-            sp_id = str(sp_info.get("id", ""))
+            sp_id = str(sp_info.get("id", "") or "")
             if sp_id:
                 try:
                     pitcher_statcast = fetch_pitcher_statcast(sp_id, days_back=30)
-                except:
+                except Exception:
                     pass
-            
-            # ── SCORING COMPONENTS ──────────────────────
-            
-            # 1. Batter profile (45%)
+
+            # ── SCORE COMPONENTS ────────────────────────
             bat_score, _, bat_details = compute_batter_score(batter_statcast)
-            
-            # 2. Pitcher vulnerability (30%)
             pit_score, pit_label = compute_pitcher_score(pitcher_statcast)
-            
-            # 3. Platoon (6%)
             plat_score, plat_label = compute_platoon_score(batter_hand, sp_hand)
-            
-            # 4. Lineup position (4%)
             lineup_sc, lineup_label = compute_lineup_score(lineup_slot)
-            
-            # 5. Park (7%)
             park_sc, park_label = compute_park_score(park_team, True)
-            
-            # 6. Weather (3%)
             weather_sc, weather_label = compute_weather_score(weather)
-            
-            # 7. Vegas (5%)
             implied = implied_totals.get(team, 4.5)
             vegas_sc, vegas_label = compute_vegas_score(implied)
-            
-            # Final score
+
             final_score = compute_final_score(
                 bat_score, pit_score, plat_score, lineup_sc,
                 park_sc, weather_sc, vegas_sc
             )
-            
+
+            # Caps & flags
+            sp_tbd = not sp_name or sp_name == "TBD"
+            if sp_tbd:
+                final_score = min(final_score, 72)
+            if not batter.get("lineup_confirmed", True):
+                final_score = min(final_score, 70)
+
             prob = score_to_prob(final_score)
             tier = get_tier(final_score)
-            
-            # HR score
+
             hr_score = compute_hr_score(
                 barrel_rate=batter_statcast.get("barrel_rate", 0.07),
                 sweet_spot=batter_statcast.get("sweet_spot_rate", 0.30),
@@ -1365,20 +1418,15 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 weather=weather,
                 hard_hit=batter_statcast.get("hard_hit_rate", 0.37),
             )
-            
-            # TBD pitcher flag
-            sp_tbd = sp_name == "TBD" or not sp_name
-            if sp_tbd:
-                final_score = min(final_score, 72)
-                tier = get_tier(final_score)
-            
-            result = {
+
+            results.append({
                 "name": name,
                 "player_id": player_id,
                 "team": team,
-                "opponent": opponent if (opponent := batter.get("opponent", "")) else "?",
+                "opponent": batter.get("opponent", "?"),
                 "game_id": str(game_pk),
                 "lineup_slot": lineup_slot,
+                "lineup_confirmed": batter.get("lineup_confirmed", True),
                 "batter_hand": batter_hand,
                 "sp_name": sp_name,
                 "sp_hand": sp_hand,
@@ -1395,7 +1443,6 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "lineup_label": lineup_label,
                 "pitcher_label": pit_label,
                 "hr_score": hr_score,
-                # Raw metrics
                 "xslg": bat_details.get("xSLG", 0),
                 "barrel_rate": batter_statcast.get("barrel_rate", 0),
                 "hard_hit_rate": batter_statcast.get("hard_hit_rate", 0),
@@ -1403,7 +1450,6 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "iso": bat_details.get("ISO", 0),
                 "exit_velocity": batter_statcast.get("exit_velocity_avg", 0),
                 "sweet_spot_rate": batter_statcast.get("sweet_spot_rate", 0),
-                # Sub-scores
                 "sub_batter": round(bat_score, 1),
                 "sub_pitcher": round(pit_score, 1),
                 "sub_platoon": round(plat_score, 1),
@@ -1412,28 +1458,29 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "sub_weather": round(weather_sc, 1),
                 "sub_vegas": round(vegas_sc, 1),
                 "platoon_edge": plat_label,
-                # Flags
                 "temperature": weather.get("temperature", 70),
                 "wind_speed": weather.get("wind_speed", 0),
                 "wind_dir": weather.get("wind_dir_label", ""),
                 "wind_effect": weather.get("wind_effect", "neutral"),
                 "is_dome": weather.get("is_dome", False),
-            }
-            
-            results.append(result)
+            })
             total_batters += 1
-        
-        time.sleep(0.5)  # Rate limiting
-    
-    # Sort by score descending
+
+        log(f"  ✅ {away_team}@{home_team} done — {len(all_batters)} batters scored")
+
+    # Sort
     results.sort(key=lambda x: x["score"], reverse=True)
-    
-    log(f"\n✅ **Scoring complete!** {total_batters} batters scored across {len(games)} games")
-    tier1 = sum(1 for r in results if r["tier"] == "🔒 TIER 1")
-    tier2 = sum(1 for r in results if r["tier"] == "✅ TIER 2")
-    tier3 = sum(1 for r in results if r["tier"] == "📊 TIER 3")
-    log(f"🔒 Tier 1: {tier1} | ✅ Tier 2: {tier2} | 📊 Tier 3: {tier3}")
-    
+
+    log("─" * 40)
+    if total_batters == 0:
+        log("No batters scored. Lineups likely not posted yet — try again closer to game time.", "warn")
+    else:
+        tier1 = sum(1 for r in results if r["tier"] == "🔒 TIER 1")
+        tier2 = sum(1 for r in results if r["tier"] == "✅ TIER 2")
+        tier3 = sum(1 for r in results if r["tier"] == "📊 TIER 3")
+        log(f"**Done! {total_batters} batters scored across {len(games)-games_skipped} games**", "ok")
+        log(f"🔒 Tier 1: {tier1}  |  ✅ Tier 2: {tier2}  |  📊 Tier 3: {tier3}")
+
     return results
 
 # ============================================================================
@@ -2177,26 +2224,21 @@ def main():
     # ── RUN MODEL ────────────────────────────────────────
     if run_btn:
         with tab1:
-            st.markdown(f"**📅 {date_str}**")
-            status = st.empty()
-            
-            with st.spinner("Running model pipeline..."):
-                plays = run_model(date_str, status)
-            
+            st.markdown(f"**📅 Running model for {date_str}...**")
+            status = st.container()
+            plays = run_model(date_str, status)
             st.session_state.plays = plays
             st.session_state.analysis_date = date_str
             st.session_state.model_ran = True
-            
-            # Auto-save to DB
             if plays:
                 save_picks_to_db(plays, date_str)
-                
-                # Auto-generate and save recommended parlay
                 best_parlays = build_parlays(plays, 3, 1, 75.0)
                 if best_parlays:
                     save_parlay_to_db(best_parlays[0], date_str)
-            
-            st.rerun()
+                st.rerun()
+            else:
+                st.warning(f"No games or lineups found for {date_str}.")
+                st.info("Opening Day is March 27, 2026. Change the date in the sidebar.")
     
     # ── DISPLAY TABS ─────────────────────────────────────
     with tab1:
