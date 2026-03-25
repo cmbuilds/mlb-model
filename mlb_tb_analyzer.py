@@ -645,74 +645,72 @@ def clean_fangraphs_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str) -> Optional[pd.Series]:
+import unicodedata as _uda
+
+def _norm(s: str) -> str:
+    """Normalize name: lowercase, strip accents, remove punctuation."""
+    s = str(s).lower().strip()
+    s = ''.join(c for c in _uda.normalize('NFD', s) if _uda.category(c) != 'Mn')
+    return s.replace('.','').replace("'",'').replace('-',' ').replace('  ',' ').strip()
+
+def prepare_lookup_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Find a player row using name matching (primary) or ID (secondary).
-    Tries multiple name variations to handle accents, suffixes, nicknames.
+    Pre-process a DataFrame for fast player lookup.
+    Adds _norm_name column once. Call this ONCE before the scoring loop.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    name_col = "_name" if "_name" in df.columns else next(
+        (c for c in df.columns if c.lower() in ("name","playername")), None)
+    if name_col and "_norm_name" not in df.columns:
+        df["_norm_name"] = df[name_col].apply(_norm)
+    return df
+
+def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str = "") -> Optional[pd.Series]:
+    """
+    Fast player lookup using pre-built _norm_name index.
+    Requires prepare_lookup_df() to have been called first.
     """
     if df is None or df.empty or not player_name:
         return None
 
-    import unicodedata
-
-    def normalize(s: str) -> str:
-        """Lowercase, strip accents, remove punctuation."""
-        s = str(s).lower().strip()
-        s = ''.join(c for c in unicodedata.normalize('NFD', s)
-                    if unicodedata.category(c) != 'Mn')
-        s = s.replace('.', '').replace("'", '').replace('-', ' ')
-        return s
-
-    name_col = "_name" if "_name" in df.columns else next(
-        (c for c in df.columns if c.lower() in ("name", "playername")), None)
-    id_col = "_mlb_id" if "_mlb_id" in df.columns else None
-
-    # Pre-compute normalized names once (cached per call via the df)
-    if name_col and "_norm_name" not in df.columns:
-        try:
-            df = df.copy()
-            df["_norm_name"] = df[name_col].apply(normalize)
-        except Exception:
-            pass
-
-    norm_name = normalize(player_name)
-    parts = norm_name.split()
+    norm = _norm(player_name)
+    parts = norm.split()
     last  = parts[-1] if parts else ""
     first = parts[0]  if len(parts) > 1 else ""
 
-    # 1. Exact normalized full name match
-    if "_norm_name" in df.columns:
-        match = df[df["_norm_name"] == norm_name]
-        if not match.empty:
-            return match.iloc[0]
+    nc = "_norm_name" if "_norm_name" in df.columns else None
+    id_col = "_mlb_id" if "_mlb_id" in df.columns else None
 
-        # 2. Last name + first initial
-        if first and last:
-            cands = df[df["_norm_name"].str.contains(last, na=False, regex=False)]
+    if nc:
+        # 1. Exact full name
+        m = df[df[nc] == norm]
+        if not m.empty:
+            return m.iloc[0]
+
+        # 2. Last + first initial
+        if last:
+            cands = df[df[nc].str.contains(last, na=False, regex=False)]
             if not cands.empty:
-                refined = cands[cands["_norm_name"].str.startswith(first[0], na=False)]
-                if not refined.empty:
-                    return refined.iloc[0]
-                # 3. Just last name if unique
+                if first:
+                    refined = cands[cands[nc].str.contains(first[:2], na=False, regex=False)]
+                    if not refined.empty:
+                        return refined.iloc[0]
                 if len(cands) == 1:
                     return cands.iloc[0]
 
-        # 4. Last name only (wider net)
-        if last and len(last) > 3:
-            cands = df[df["_norm_name"].str.contains(last, na=False, regex=False)]
-            if len(cands) == 1:
-                return cands.iloc[0]
-
-    # 5. ID fallback
+    # 3. ID fallback
     if mlb_id and id_col:
         try:
-            match = df[df[id_col].astype(str) == str(mlb_id)]
-            if not match.empty:
-                return match.iloc[0]
+            m = df[df[id_col].astype(str) == str(mlb_id)]
+            if not m.empty:
+                return m.iloc[0]
         except Exception:
             pass
 
     return None
+
 
 def safe_get(row: pd.Series, *col_names, default=None, as_pct=False):
     """
@@ -1474,6 +1472,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
     if not batting_df.empty:
         log(f"Batting stats: {len(batting_df)} players loaded", "ok")
+        batting_df = prepare_lookup_df(batting_df)  # build _norm_name index ONCE
         # Store debug info
         st.session_state.batting_cols = list(batting_df.columns)
         # Find Judge specifically to verify stats loading
@@ -1495,6 +1494,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         log("Batting stats unavailable — all scores use league averages", "warn")
     if not pitching_df.empty:
         log(f"Pitching stats: {len(pitching_df)} pitchers loaded", "ok")
+        pitching_df = prepare_lookup_df(pitching_df)  # build _norm_name index ONCE
         st.session_state.pitching_cols = list(pitching_df.columns)
     else:
         log("Pitching stats unavailable — using league averages", "warn")
@@ -1606,6 +1606,12 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 batting_df=batting_df,
                 statcast_df=statcast_df,
             )
+
+            # Track match rate
+            if batter_statcast.get("data_source") == "fangraphs":
+                st.session_state["_matched"] = st.session_state.get("_matched", 0) + 1
+            else:
+                st.session_state["_unmatched"] = st.session_state.get("_unmatched", 0) + 1
 
             # Debug log first batter so we can see what's loading
             if not first_batter_logged:
@@ -2459,6 +2465,15 @@ Free tier (500/mo) is more than enough.
         
         with st.expander("🔍 Debug: Data Quality Check"):
             st.caption("Expand after running model to verify all key stats loaded")
+            matched = st.session_state.get("_matched", 0)
+            unmatched = st.session_state.get("_unmatched", 0)
+            total = matched + unmatched
+            if total > 0:
+                rate = matched / total * 100
+                color = "✅" if rate > 80 else "⚠️" if rate > 50 else "❌"
+                st.markdown(f"**{color} Player match rate: {matched}/{total} ({rate:.0f}%)**")
+                if rate < 80:
+                    st.warning("Low match rate — scores using league averages for unmatched players")
             if "batting_cols" in st.session_state:
                 cols = st.session_state.batting_cols
                 # Check for the critical columns we need
