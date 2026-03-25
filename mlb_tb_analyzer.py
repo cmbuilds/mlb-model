@@ -583,66 +583,78 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
 
 def clean_fangraphs_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean FanGraphs API response:
-    - Strip HTML tags from Name column (returns raw anchor tags)
-    - Extract playerid from href for reliable ID matching
-    - Normalize % columns to decimals
+    Clean FanGraphs API response.
+    Robustly finds name column regardless of what it's called.
+    Strips HTML if present, extracts FG playerid, normalizes % columns.
     """
     import re
+    df = df.copy()
 
-    # Find the name column (FanGraphs returns HTML like <a href="...playerid=15640...">Aaron Judge</a>)
-    name_col = next((c for c in df.columns if c.lower() in ("name", "playername")), None)
+    # Step 1: Find name column — try known names then auto-detect
+    name_col = None
+    for candidate in ["Name", "name", "PlayerName", "playername", "player_name", "PLAYER"]:
+        if candidate in df.columns:
+            name_col = candidate
+            break
+    if not name_col:
+        for col in df.columns:
+            try:
+                sample = df[col].dropna().head(5).astype(str)
+                looks_like_names = sample.apply(lambda s:
+                    bool(re.search(r'[A-Za-z]{2,}', s)) and
+                    ' ' in s and len(s) < 100 and not s.startswith('http')
+                ).sum()
+                if looks_like_names >= 4:
+                    name_col = col
+                    break
+            except Exception:
+                pass
 
+    # Step 2: Extract clean name and FG playerid from name column
     if name_col:
         raw = df[name_col].astype(str)
 
-        # Extract playerid from href: playerid=15640
         def extract_id(s):
             m = re.search(r'playerid=(\d+)', s, re.IGNORECASE)
             return m.group(1) if m else None
 
-        # Extract clean name from HTML: >Aaron Judge<
         def extract_name(s):
             m = re.search(r'>([^<]+)<', s)
             if m:
                 return m.group(1).strip()
-            # No HTML — return as-is stripped
-            return re.sub(r'<[^>]+>', '', s).strip()
+            return re.sub(r'<[^>]+>', '', s).strip() or s.strip()
 
-        df = df.copy()
-        df["_fg_id"]  = raw.apply(extract_id)
-        df["_name"]   = raw.apply(extract_name)
+        df["_fg_id"] = raw.apply(extract_id)
+        df["_name"] = raw.apply(extract_name)
 
-        # Use _fg_id as primary ID (FanGraphs playerid maps to IDfg)
-        if "_fg_id" not in df.columns or df["_fg_id"].isna().all():
+        if df["_fg_id"].notna().any():
+            df["_mlb_id"] = df["_fg_id"]
+        else:
             for id_col in ["playerid", "PlayerID", "IDfg"]:
                 if id_col in df.columns:
                     df["_mlb_id"] = df[id_col].astype(str)
                     break
-        else:
-            df["_mlb_id"] = df["_fg_id"]
     else:
-        # Fallback name standardization
-        for n in ["Name", "PlayerName", "name"]:
-            if n in df.columns:
-                df["_name"] = df[n].astype(str).str.strip()
-                break
-        for i in ["playerid", "PlayerID", "IDfg", "mlbamid"]:
-            if i in df.columns:
-                df["_mlb_id"] = df[i].astype(str)
+        # Last resort: use playerid as id, no name
+        for id_col in ["playerid", "PlayerID", "IDfg"]:
+            if id_col in df.columns:
+                df["_mlb_id"] = df[id_col].astype(str)
                 break
 
-    # Normalize % columns to decimals (FanGraphs returns 0-100)
+    # Step 3: Normalize % columns to 0-1
+    pct_names = {"Hard%","Barrel%","K%","BB%","LD%","GB%","FB%","HardHit%","SwStr%"}
     for col in df.columns:
-        if "%" in str(col) or col in ("Hard%","Barrel%","K%","BB%","HardHit%","LD%","GB%","FB%"):
+        if col.startswith("_"):
+            continue
+        if "%" in str(col) or col in pct_names:
             try:
-                vals = df[col].dropna()
+                vals = pd.to_numeric(df[col], errors='coerce').dropna()
                 if len(vals) > 0 and float(vals.max()) > 1.5:
                     df[col] = pd.to_numeric(df[col], errors='coerce') / 100.0
             except Exception:
                 pass
-
     return df
+
 
 
 import unicodedata as _uda
@@ -1482,8 +1494,17 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         # Store raw name samples to diagnose lookup failures
         if "_name" in batting_df.columns:
             st.session_state.batting_df_sample = [str(x) for x in batting_df["_name"].head(10).tolist()]
+        else:
+            # _name missing — show all columns so we know what we have
+            st.session_state.batting_df_sample = [f"NO _name COLUMN. All cols: {list(batting_df.columns[:20])}"]
         if "_norm_name" in batting_df.columns:
             st.session_state.norm_name_sample = [str(x) for x in batting_df["_norm_name"].head(10).tolist()]
+        else:
+            st.session_state.norm_name_sample = ["NO _norm_name COLUMN — prepare_lookup_df failed"]
+        # Also show first row raw to see column names with data
+        if not batting_df.empty:
+            first_row = batting_df.iloc[0]
+            st.session_state.batting_df_sample.append(f"First row columns with data: {[c for c in batting_df.columns if pd.notna(first_row.get(c)) and str(first_row.get(c)) not in ('', 'nan')][:15]}")
         # Find Judge specifically to verify stats loading
         judge_row = find_player_row(batting_df, "Aaron Judge", "")
         sample = judge_row if judge_row is not None else (batting_df.iloc[0] if not batting_df.empty else None)
