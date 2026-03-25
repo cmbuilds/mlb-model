@@ -433,69 +433,132 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
 @st.cache_data(ttl=7200)
 def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     """
-    Load FanGraphs batting leaderboard via pybaseball.
-    Returns one row per qualified batter with all standard + advanced stats.
-    pybaseball returns K% and BB% as decimals (0.23), 
-    Hard% and Barrel% as percentages (34.0) — we normalize everything to decimals.
+    Load FanGraphs batting stats via pybaseball.
+    Merges standard + advanced tables to get all key metrics:
+    SLG, ISO, K%, BB%, wRC+, wOBA from standard/advanced
+    Barrel%, Hard%, EV from Statcast table
     """
-    try:
-        from pybaseball import batting_stats
-        df = batting_stats(season, qual=30)
-        if df.empty:
+    from pybaseball import batting_stats
+    
+    frames = []
+    
+    # Table 1: Standard stats (SLG, ISO, K%, BB%, wRC+, wOBA)
+    # stat_type=1 = standard, stat_type=2 = advanced
+    for stat_type in [1, 2, 8]:  # 1=standard, 2=advanced, 8=statcast-era
+        try:
+            df = batting_stats(season, qual=30, stat_columns=stat_type)
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
+            pass
+    
+    # Fallback: no stat_type arg (older pybaseball)
+    if not frames:
+        try:
+            df = batting_stats(season, qual=30)
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
             return pd.DataFrame()
-        
-        # Auto-normalize percentage columns to decimals
-        pct_cols = [c for c in df.columns if c.endswith('%') or c in ('Hard%', 'Soft%', 'Med%')]
-        for col in pct_cols:
-            if col in df.columns:
-                # If values are 0-100 range, divide by 100
-                if df[col].dropna().max() > 1.5:
-                    df[col] = df[col] / 100.0
-        
-        # Standardize name column
-        for name_try in ['Name', 'PlayerName', 'name', 'player']:
-            if name_try in df.columns:
-                df['_name'] = df[name_try].str.strip()
-                break
-        
-        # Standardize ID column  
-        for id_try in ['IDfg', 'mlbamid', 'MLBAMID', 'key_mlbam', 'id', 'xMLBAMID']:
-            if id_try in df.columns:
-                df['_mlb_id'] = df[id_try].astype(str)
-                break
-        
-        return df
-    except Exception as e:
+    
+    if not frames:
         return pd.DataFrame()
+    
+    # Merge all tables on player name
+    result = frames[0]
+    for extra in frames[1:]:
+        try:
+            # Find common key column
+            for key in ['IDfg', 'Name', 'name']:
+                if key in result.columns and key in extra.columns:
+                    # Only add new columns, don't overwrite existing
+                    new_cols = [c for c in extra.columns if c not in result.columns]
+                    if new_cols:
+                        result = result.merge(
+                            extra[[key] + new_cols], on=key, how='left'
+                        )
+                    break
+        except Exception:
+            pass
+    
+    # Normalize % columns to decimals (0.23 not 23.0)
+    pct_cols = [c for c in result.columns if 
+                c.endswith('%') or c in ('Hard%', 'Soft%', 'Med%', 'K%', 'BB%')]
+    for col in pct_cols:
+        try:
+            if result[col].dropna().max() > 1.5:
+                result[col] = result[col] / 100.0
+        except Exception:
+            pass
+    
+    # Standardize name and ID columns for fast lookup
+    for name_try in ['Name', 'PlayerName', 'name', 'player']:
+        if name_try in result.columns:
+            result['_name'] = result[name_try].astype(str).str.strip()
+            break
+    for id_try in ['IDfg', 'mlbamid', 'MLBAMID', 'key_mlbam']:
+        if id_try in result.columns:
+            result['_mlb_id'] = result[id_try].astype(str)
+            break
+    
+    return result
 
 @st.cache_data(ttl=7200)
 def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
-    """Load FanGraphs pitching leaderboard, normalize % columns."""
-    try:
-        from pybaseball import pitching_stats
-        df = pitching_stats(season, qual=5)
-        if df.empty:
+    """Load FanGraphs pitching stats — standard + advanced merged."""
+    from pybaseball import pitching_stats
+    
+    frames = []
+    for stat_type in [1, 2, 8]:
+        try:
+            df = pitching_stats(season, qual=5, stat_columns=stat_type)
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
+            pass
+    
+    if not frames:
+        try:
+            df = pitching_stats(season, qual=5)
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
             return pd.DataFrame()
-        
-        # Normalize percentage columns
-        pct_cols = [c for c in df.columns if c.endswith('%') or c in ('Hard%', 'Soft%', 'Med%')]
-        for col in pct_cols:
-            if col in df.columns:
-                if df[col].dropna().max() > 1.5:
-                    df[col] = df[col] / 100.0
-        
-        for name_try in ['Name', 'PlayerName', 'name']:
-            if name_try in df.columns:
-                df['_name'] = df[name_try].str.strip()
-                break
-        for id_try in ['IDfg', 'mlbamid', 'key_mlbam', 'id']:
-            if id_try in df.columns:
-                df['_mlb_id'] = df[id_try].astype(str)
-                break
-
-        return df
-    except Exception as e:
+    
+    if not frames:
         return pd.DataFrame()
+    
+    result = frames[0]
+    for extra in frames[1:]:
+        try:
+            for key in ['IDfg', 'Name']:
+                if key in result.columns and key in extra.columns:
+                    new_cols = [c for c in extra.columns if c not in result.columns]
+                    if new_cols:
+                        result = result.merge(extra[[key] + new_cols], on=key, how='left')
+                    break
+        except Exception:
+            pass
+    
+    pct_cols = [c for c in result.columns if
+                c.endswith('%') or c in ('Hard%', 'Soft%', 'K%', 'BB%')]
+    for col in pct_cols:
+        try:
+            if result[col].dropna().max() > 1.5:
+                result[col] = result[col] / 100.0
+        except Exception:
+            pass
+    
+    for name_try in ['Name', 'PlayerName', 'name']:
+        if name_try in result.columns:
+            result['_name'] = result[name_try].astype(str).str.strip()
+            break
+    for id_try in ['IDfg', 'mlbamid', 'key_mlbam']:
+        if id_try in result.columns:
+            result['_mlb_id'] = result[id_try].astype(str)
+            break
+    
+    return result
 
 def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str) -> Optional[pd.Series]:
     """
@@ -2284,14 +2347,28 @@ Free tier (500/mo) is more than enough.
             - ❌ Below 65: Fade
             """)
         
-        with st.expander("🔍 Debug: Data columns loaded"):
-            st.caption("Expand after running model to verify stats loaded correctly")
+        with st.expander("🔍 Debug: Data Quality Check"):
+            st.caption("Expand after running model to verify all key stats loaded")
             if "batting_cols" in st.session_state:
-                st.write("**Batting cols:**", st.session_state.batting_cols)
+                cols = st.session_state.batting_cols
+                # Check for the critical columns we need
+                critical_bat = ["SLG", "ISO", "K%", "BB%", "wRC+", "wOBA", 
+                               "Barrel%", "Hard%", "EV", "xSLG", "xwOBA"]
+                st.markdown("**Batting — critical columns:**")
+                for c in critical_bat:
+                    found = c in cols
+                    st.markdown(f"{'✅' if found else '❌'} `{c}`")
+                st.caption(f"Total columns loaded: {len(cols)}")
             if "pitching_cols" in st.session_state:
-                st.write("**Pitching cols:**", st.session_state.pitching_cols)
+                cols = st.session_state.pitching_cols
+                critical_pit = ["K%", "ERA", "FIP", "xFIP", "Hard%", "Barrel%"]
+                st.markdown("**Pitching — critical columns:**")
+                for c in critical_pit:
+                    found = c in cols
+                    st.markdown(f"{'✅' if found else '❌'} `{c}`")
             if "sample_player" in st.session_state:
-                st.write("**Sample player stats:**", st.session_state.sample_player)
+                st.markdown("**Sample player (Judge):**")
+                st.json(st.session_state.sample_player)
 
         st.caption(f"v1.1 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
