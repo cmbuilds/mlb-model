@@ -1463,6 +1463,10 @@ def run_model(date_str: str, status_container) -> List[Dict]:
     
     log(f"**⚾ MLB TB Analyzer — {date_str}**")
     log("─" * 40)
+    # Reset match tracking
+    st.session_state["_matched"] = 0
+    st.session_state["_unmatched"] = 0
+    st.session_state["_search_names"] = []
 
     # ── 0. BULK STATS (one call loads all players) ───────
     log("Loading 2025 season batting stats...", "run")
@@ -1475,6 +1479,11 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         batting_df = prepare_lookup_df(batting_df)  # build _norm_name index ONCE
         # Store debug info
         st.session_state.batting_cols = list(batting_df.columns)
+        # Store raw name samples to diagnose lookup failures
+        if "_name" in batting_df.columns:
+            st.session_state.batting_df_sample = [str(x) for x in batting_df["_name"].head(10).tolist()]
+        if "_norm_name" in batting_df.columns:
+            st.session_state.norm_name_sample = [str(x) for x in batting_df["_norm_name"].head(10).tolist()]
         # Find Judge specifically to verify stats loading
         judge_row = find_player_row(batting_df, "Aaron Judge", "")
         sample = judge_row if judge_row is not None else (batting_df.iloc[0] if not batting_df.empty else None)
@@ -1606,6 +1615,13 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 batting_df=batting_df,
                 statcast_df=statcast_df,
             )
+
+            # Store first 5 searched names for debug
+            if "_search_names" not in st.session_state:
+                st.session_state["_search_names"] = []
+            if len(st.session_state["_search_names"]) < 5:
+                st.session_state["_search_names"].append(f"'{name}' (id={player_id})")
+            st.session_state["search_sample"] = st.session_state["_search_names"]
 
             # Track match rate
             if batter_statcast.get("data_source") == "fangraphs":
@@ -2474,6 +2490,17 @@ Free tier (500/mo) is more than enough.
                 st.markdown(f"**{color} Player match rate: {matched}/{total} ({rate:.0f}%)**")
                 if rate < 80:
                     st.warning("Low match rate — scores using league averages for unmatched players")
+            
+            # Show raw name samples from DataFrame so we can diagnose lookup failures
+            if "batting_df_sample" in st.session_state:
+                st.markdown("**Raw _name values in batting DataFrame (first 10):**")
+                st.code("\n".join(st.session_state.batting_df_sample))
+            if "norm_name_sample" in st.session_state:
+                st.markdown("**Normalized _norm_name values (first 10):**")
+                st.code("\n".join(st.session_state.norm_name_sample))
+            if "search_sample" in st.session_state:
+                st.markdown("**Names we searched for (first 5):**")
+                st.code("\n".join(st.session_state.search_sample))
             if "batting_cols" in st.session_state:
                 cols = st.session_state.batting_cols
                 # Check for the critical columns we need
