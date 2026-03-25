@@ -492,27 +492,7 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     else:
         result = list(frames.values())[0].copy()
     
-    # Normalize % columns to decimals
-    for col in result.columns:
-        if "%" in col or col in ("Hard%","Barrel%","K%","BB%","LD%","GB%","FB%","HardHit%"):
-            try:
-                vals = result[col].dropna()
-                if len(vals) > 0 and float(vals.max()) > 1.5:
-                    result[col] = result[col] / 100.0
-            except Exception:
-                pass
-    
-    # Standardize lookup columns
-    for n in ["Name", "PlayerName", "name"]:
-        if n in result.columns:
-            result["_name"] = result[n].astype(str).str.strip()
-            break
-    for i in ["playerid", "PlayerID", "IDfg", "mlbamid"]:
-        if i in result.columns:
-            result["_mlb_id"] = result[i].astype(str)
-            break
-    
-    return result
+    return clean_fangraphs_df(result)
 
 
 @st.cache_data(ttl=7200)
@@ -568,58 +548,100 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     else:
         result = list(frames.values())[0].copy()
     
-    for col in result.columns:
-        if "%" in col or col in ("Hard%","Barrel%","K%","BB%","HardHit%"):
+    return clean_fangraphs_df(result)
+
+
+def clean_fangraphs_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean FanGraphs API response:
+    - Strip HTML tags from Name column (returns raw anchor tags)
+    - Extract playerid from href for reliable ID matching
+    - Normalize % columns to decimals
+    """
+    import re
+
+    # Find the name column (FanGraphs returns HTML like <a href="...playerid=15640...">Aaron Judge</a>)
+    name_col = next((c for c in df.columns if c.lower() in ("name", "playername")), None)
+
+    if name_col:
+        raw = df[name_col].astype(str)
+
+        # Extract playerid from href: playerid=15640
+        def extract_id(s):
+            m = re.search(r'playerid=(\d+)', s, re.IGNORECASE)
+            return m.group(1) if m else None
+
+        # Extract clean name from HTML: >Aaron Judge<
+        def extract_name(s):
+            m = re.search(r'>([^<]+)<', s)
+            if m:
+                return m.group(1).strip()
+            # No HTML — return as-is stripped
+            return re.sub(r'<[^>]+>', '', s).strip()
+
+        df = df.copy()
+        df["_fg_id"]  = raw.apply(extract_id)
+        df["_name"]   = raw.apply(extract_name)
+
+        # Use _fg_id as primary ID (FanGraphs playerid maps to IDfg)
+        if "_fg_id" not in df.columns or df["_fg_id"].isna().all():
+            for id_col in ["playerid", "PlayerID", "IDfg"]:
+                if id_col in df.columns:
+                    df["_mlb_id"] = df[id_col].astype(str)
+                    break
+        else:
+            df["_mlb_id"] = df["_fg_id"]
+    else:
+        # Fallback name standardization
+        for n in ["Name", "PlayerName", "name"]:
+            if n in df.columns:
+                df["_name"] = df[n].astype(str).str.strip()
+                break
+        for i in ["playerid", "PlayerID", "IDfg", "mlbamid"]:
+            if i in df.columns:
+                df["_mlb_id"] = df[i].astype(str)
+                break
+
+    # Normalize % columns to decimals (FanGraphs returns 0-100)
+    for col in df.columns:
+        if "%" in str(col) or col in ("Hard%","Barrel%","K%","BB%","HardHit%","LD%","GB%","FB%"):
             try:
-                vals = result[col].dropna()
+                vals = df[col].dropna()
                 if len(vals) > 0 and float(vals.max()) > 1.5:
-                    result[col] = result[col] / 100.0
+                    df[col] = pd.to_numeric(df[col], errors='coerce') / 100.0
             except Exception:
                 pass
-    
-    for n in ["Name", "PlayerName", "name"]:
-        if n in result.columns:
-            result["_name"] = result[n].astype(str).str.strip()
-            break
-    for i in ["playerid", "PlayerID", "IDfg", "mlbamid"]:
-        if i in result.columns:
-            result["_mlb_id"] = result[i].astype(str)
-            break
-    
-    return result
+
+    return df
 
 
 def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str) -> Optional[pd.Series]:
     """
-    Find a player row in a pre-processed DataFrame.
-    Uses _name and _mlb_id standardized columns created by load_all_batting_stats.
-    Falls back to raw column name detection if standardized cols don't exist.
+    Find a player row using _name and _mlb_id columns created by clean_fangraphs_df.
+    Priority: FanGraphs ID → MLB ID → last name → full name.
     """
     if df is None or df.empty:
         return None
 
-    cols = list(df.columns)
+    # 1. FanGraphs ID match via _mlb_id (most reliable — extracted from href)
+    if "_mlb_id" in df.columns:
+        for id_val in [mlb_id]:
+            if id_val:
+                try:
+                    match = df[df["_mlb_id"].astype(str) == str(id_val)]
+                    if not match.empty:
+                        return match.iloc[0]
+                except Exception:
+                    pass
 
-    # Determine name and id columns — prefer standardized versions
-    name_col = "_name" if "_name" in cols else next(
-        (c for c in cols if c.lower() in ("name", "playername", "player_name", "player")), None)
-    id_col = "_mlb_id" if "_mlb_id" in cols else next(
-        (c for c in cols if c.lower() in ("mlbamid", "xmlbamid", "mlb_id", "key_mlbam")), None)
+    # 2. Name match via _name (HTML-stripped clean name)
+    name_col = "_name" if "_name" in df.columns else next(
+        (c for c in df.columns if c.lower() in ("name", "playername")), None)
 
-    # 1. ID match (most reliable)
-    if mlb_id and id_col:
-        try:
-            match = df[df[id_col].astype(str) == str(mlb_id)]
-            if not match.empty:
-                return match.iloc[0]
-        except:
-            pass
-
-    # 2. Name match
     if player_name and name_col:
         try:
             parts = player_name.strip().split()
-            last = parts[-1].lower()
+            last  = parts[-1].lower()
             first = parts[0].lower() if len(parts) > 1 else ""
 
             candidates = df[df[name_col].str.lower().str.contains(last, na=False, regex=False)]
@@ -631,7 +653,7 @@ def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str) -> Optional
                     return refined.iloc[0]
             if not candidates.empty:
                 return candidates.iloc[0]
-        except:
+        except Exception:
             pass
 
     return None
@@ -1397,18 +1419,21 @@ def run_model(date_str: str, status_container) -> List[Dict]:
     if not batting_df.empty:
         log(f"Batting stats: {len(batting_df)} players loaded", "ok")
         # Store debug info
-        st.session_state.batting_cols = list(batting_df.columns[:30])
-        # Sample first player
-        if not batting_df.empty:
-            sample = batting_df.iloc[0]
+        st.session_state.batting_cols = list(batting_df.columns)
+        # Find Judge specifically to verify stats loading
+        judge_row = find_player_row(batting_df, "Aaron Judge", "")
+        sample = judge_row if judge_row is not None else (batting_df.iloc[0] if not batting_df.empty else None)
+        if sample is not None:
             st.session_state.sample_player = {
-                "name": sample.get("_name", sample.get("Name", "?")),
-                "SLG": sample.get("SLG", "?"),
-                "ISO": sample.get("ISO", "?"),
-                "K%": sample.get("K%", "?"),
-                "Barrel%": sample.get("Barrel%", "?"),
-                "Hard%": sample.get("Hard%", "?"),
-                "wRC+": sample.get("wRC+", "?"),
+                "_name (cleaned)": str(sample.get("_name", "MISSING — HTML not stripped")),
+                "_mlb_id": str(sample.get("_mlb_id", "MISSING")),
+                "SLG": sample.get("SLG", "❌ missing"),
+                "ISO": sample.get("ISO", "❌ missing"),
+                "K%": sample.get("K%", "❌ missing"),
+                "Barrel%": sample.get("Barrel%", "❌ missing"),
+                "Hard%": sample.get("Hard%", "❌ missing"),
+                "wRC+": sample.get("wRC+", "❌ missing"),
+                "xSLG": sample.get("xSLG", "❌ missing"),
             }
     else:
         log("Batting stats unavailable — all scores use league averages", "warn")
