@@ -520,18 +520,37 @@ def get_batter_stats(player_name: str, mlb_id: str,
 
         if not row.empty:
             r = row.iloc[0]
+            # FanGraphs column names (exact) -> our internal key
+            # K%, BB% come as decimals (0.23) in pybaseball
+            # Barrel%, Hard% come as percentages (34.0) — divide by 100
+            # SLG, ISO, wOBA come as decimals
             col_map = {
-                "SLG": "slg_proxy", "ISO": "iso_proxy",
-                "K%": "k_rate", "BB%": "bb_rate",
-                "wRC+": "wrc_plus", "wOBA": "woba",
+                # Core batting
+                "SLG": ("slg_proxy", 1.0),
+                "ISO": ("iso_proxy", 1.0),
+                "K%": ("k_rate", 1.0),
+                "BB%": ("bb_rate", 1.0),
+                "wRC+": ("wrc_plus", 1.0),
+                "wOBA": ("woba", 1.0),
+                # Expected stats (FanGraphs advanced)
+                "xSLG": ("slg_proxy", 1.0),       # prefer xSLG over SLG
+                "xwOBA": ("woba", 1.0),
+                # Contact quality — FanGraphs stores these as 0-100 percentages
+                "Barrel%": ("barrel_rate", 0.01),  # 8.5 -> 0.085
+                "Hard%": ("hard_hit_rate", 0.01),  # 34.0 -> 0.340
+                "Soft%": ("soft_rate", 0.01),
+                # Exit velo / launch
+                "EV": ("exit_velocity_avg", 1.0),
+                "LA": ("launch_angle_avg", 1.0),
             }
-            for fg_col, our_key in col_map.items():
+            for fg_col, (our_key, multiplier) in col_map.items():
                 if fg_col in r.index and pd.notna(r[fg_col]):
-                    val = float(r[fg_col])
-                    # FanGraphs stores K% and BB% as decimals or percentages
-                    if fg_col in ("K%", "BB%") and val > 1:
-                        val = val / 100
-                    stats[our_key] = val
+                    try:
+                        val = float(r[fg_col]) * multiplier
+                        if val != 0:  # don't overwrite with zero
+                            stats[our_key] = val
+                    except:
+                        pass
             stats["data_source"] = "fangraphs"
 
     # Try Statcast leaderboard
@@ -608,13 +627,27 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
 
     if not row.empty:
         r = row.iloc[0]
-        if "K%" in r.index and pd.notna(r["K%"]):
-            val = float(r["K%"])
-            stats["k_rate_allowed"] = val / 100 if val > 1 else val
-        if "ERA" in r.index and pd.notna(r["ERA"]):
-            stats["era"] = float(r["ERA"])
-        if "FIP" in r.index and pd.notna(r["FIP"]):
-            stats["fip"] = float(r["FIP"])
+        # FanGraphs pitching columns
+        # K% stored as decimal in pybaseball (0.23)
+        # ERA, FIP stored as floats
+        pitch_col_map = {
+            "K%":   ("k_rate_allowed", 1.0),
+            "BB%":  ("bb_rate_allowed", 1.0),
+            "ERA":  ("era", 1.0),
+            "FIP":  ("fip", 1.0),
+            "xFIP": ("xfip", 1.0),
+            "WHIP": ("whip", 1.0),
+            "Hard%": ("hard_hit_allowed", 0.01),  # 34.0 → 0.340
+            "Barrel%": ("barrel_allowed", 0.01),  # 8.5 → 0.085
+        }
+        for fg_col, (our_key, mult) in pitch_col_map.items():
+            if fg_col in r.index and pd.notna(r[fg_col]):
+                try:
+                    val = float(r[fg_col]) * mult
+                    if val != 0:
+                        stats[our_key] = val
+                except:
+                    pass
         stats["data_source"] = "fangraphs"
 
     return stats
@@ -941,62 +974,64 @@ def compute_lineup_score(lineup_slot: int) -> Tuple[float, str]:
 def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, str, Dict]:
     """
     Compute batter profile sub-score 0-100.
-    Primary inputs: xSLG proxy, barrel%, hard hit%, ISO, K rate.
-    Uses research-backed weights: barrel(8-10%), hard_hit(6-8%), ISO(6%), K rate inverse.
+    Calibrated so league-average batter = ~50, elite = 85+.
+    Primary inputs: xSLG, barrel%, hard hit%, ISO, K rate.
     """
     details = {}
-    
-    # Extract metrics with league average defaults
-    xslg = statcast.get("slg_proxy", 0.380)  # league avg ~.380
-    barrel_rate = statcast.get("barrel_rate", 0.070)  # league avg ~7%
-    hard_hit = statcast.get("hard_hit_rate", 0.370)   # league avg ~37%
-    k_rate = statcast.get("k_rate", 0.230)             # league avg ~23%
-    iso = statcast.get("iso_proxy", 0.155)             # league avg ~.155
-    exit_vel = statcast.get("exit_velocity_avg", 88.5) # league avg ~88.5
-    sweet_spot = statcast.get("sweet_spot_rate", 0.30)
-    tb_per_g = statcast.get("tb_per_game", 0.85)       # league avg ~.85 TB/PA
-    
-    details["xSLG"] = round(xslg, 3)
+
+    # Extract with league average defaults
+    xslg       = statcast.get("slg_proxy", 0.380)
+    barrel_rate= statcast.get("barrel_rate", 0.070)
+    hard_hit   = statcast.get("hard_hit_rate", 0.370)
+    k_rate     = statcast.get("k_rate", 0.228)
+    iso        = statcast.get("iso_proxy", 0.155)
+    wrc_plus   = statcast.get("wrc_plus", 100)
+    exit_vel   = statcast.get("exit_velocity_avg", 88.5)
+    sweet_spot = statcast.get("sweet_spot_rate", 0.305)
+    tb_per_g   = statcast.get("tb_per_game", 0.85)
+
+    details["xSLG"]    = round(xslg, 3)
     details["Barrel%"] = f"{barrel_rate*100:.1f}%"
-    details["HardHit%"] = f"{hard_hit*100:.1f}%"
-    details["K%"] = f"{k_rate*100:.1f}%"
-    details["ISO"] = round(iso, 3)
-    
-    # Sub-scores (normalize to 0-100)
-    
-    # xSLG: .200=0, .380=50, .600=100
+    details["HardHit%"]= f"{hard_hit*100:.1f}%"
+    details["K%"]      = f"{k_rate*100:.1f}%"
+    details["ISO"]     = round(iso, 3)
+    details["wRC+"]    = round(wrc_plus)
+
+    # Sub-scores — calibrated ranges based on actual MLB distribution
+    # xSLG: .200=0, .380=50, .600=100  (league avg .380 → 50)
     xslg_score = (xslg - 0.200) / (0.600 - 0.200) * 100
     xslg_score = max(0, min(100, xslg_score))
-    
-    # Barrel rate: 0%=0, 7%=50, 20%=100
+
+    # wRC+: 60=0, 100=50, 160=100  (league avg 100 → 50)
+    wrc_score = (wrc_plus - 60) / (160 - 60) * 100
+    wrc_score = max(0, min(100, wrc_score))
+
+    # Barrel%: 0%=0, 7%=50, 20%=100  (league avg 7% → 50)
     barrel_score = barrel_rate / 0.20 * 100
     barrel_score = max(0, min(100, barrel_score))
-    
-    # Hard hit rate: 20%=0, 37%=50, 60%=100
+
+    # Hard hit%: 20%=0, 37%=50, 60%=100  (league avg 37% → 50)
     hard_hit_score = (hard_hit - 0.20) / (0.60 - 0.20) * 100
     hard_hit_score = max(0, min(100, hard_hit_score))
-    
-    # K rate: INVERSE. 5%=100, 23%=50, 40%=0
+
+    # K rate INVERSE: 5%=100, 23%=50, 40%=0  (league avg 23% → 50)
     k_score = max(0, min(100, (0.40 - k_rate) / (0.40 - 0.05) * 100))
-    
-    # ISO: .050=0, .155=50, .350=100
-    iso_score = (iso - 0.050) / (0.350 - 0.050) * 100
+
+    # ISO: .050=0, .155=50, .300=100  (league avg .155 → 50)
+    iso_score = (iso - 0.050) / (0.300 - 0.050) * 100
     iso_score = max(0, min(100, iso_score))
-    
-    # TB per game recency: 0=0, 0.85=50, 2.0=100
-    tb_score = min(100, tb_per_g / 2.0 * 100)
-    
-    # Weighted composite (per research: xSLG 12-15%, barrel 8-10%, hard_hit 6-8%, ISO 6%, K 5-7%)
+
+    # Weighted composite — research weights, xSLG+wRC+ as primary signals
     composite = (
-        xslg_score * 0.28 +      # xSLG highest weight
-        barrel_score * 0.22 +    # barrel rate
-        hard_hit_score * 0.18 +  # hard hit rate
-        iso_score * 0.14 +       # ISO power
-        k_score * 0.12 +         # K rate inverse
-        tb_score * 0.06          # recent form
+        xslg_score   * 0.22 +   # xSLG / expected slugging (highest weight)
+        wrc_score    * 0.18 +   # wRC+ overall offensive value
+        barrel_score * 0.20 +   # barrel rate (strong HR/XBH predictor)
+        hard_hit_score * 0.16 + # hard hit rate
+        iso_score    * 0.14 +   # ISO power
+        k_score      * 0.10     # K rate inverse (PA completion)
     )
-    
-    return max(0, min(100, composite)), "Statcast profile", details
+
+    return max(0, min(100, composite)), "Contact quality profile", details
 
 
 def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, str]:
@@ -1087,19 +1122,18 @@ def compute_final_score(
 
 def score_to_prob(score: float) -> float:
     """
-    Map 0-100 score to probability using logistic function.
-    Calibrated so:
-    - Score 47 → ~47% probability (league average)
-    - Score 85+ → 75-85% probability
-    - Score 65 → ~60% probability
+    Map 0-100 score to probability.
+    Calibrated for MLB O1.5 TB props:
+    - Score 50 (league avg) → ~52% probability
+    - Score 75 → ~65% probability  
+    - Score 85+ → ~72-78% probability
     """
-    # Logistic: P = 1 / (1 + exp(-a*(score - b)))
-    a = 0.07
-    b = 50
+    a = 0.06
+    b = 48
     prob = 1 / (1 + math.exp(-a * (score - b)))
-    # Scale to reasonable MLB prop range (35% - 85%)
-    prob = 0.35 + prob * 0.50
-    return round(min(0.85, max(0.35, prob)), 3)
+    # Scale to MLB prop range (40% - 80%)
+    prob = 0.40 + prob * 0.40
+    return round(min(0.80, max(0.40, prob)), 3)
 
 
 def get_tier(score: float) -> str:
