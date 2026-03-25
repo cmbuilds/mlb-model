@@ -433,132 +433,161 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
 @st.cache_data(ttl=7200)
 def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     """
-    Load FanGraphs batting stats via pybaseball.
-    Merges standard + advanced tables to get all key metrics:
-    SLG, ISO, K%, BB%, wRC+, wOBA from standard/advanced
-    Barrel%, Hard%, EV from Statcast table
+    Load batter stats from FanGraphs JSON API directly.
+    type=8 = advanced stats (SLG, ISO, K%, BB%, wRC+, wOBA)
+    type=24 = statcast stats (Barrel%, HardHit%, EV, xSLG, xwOBA)
+    Merges both tables for complete picture.
+    Falls back to pybaseball if API fails.
     """
-    from pybaseball import batting_stats
+    base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.fangraphs.com/leaders/major-league",
+        "Accept": "application/json",
+    }
+    common_params = {
+        "age": "", "pos": "all", "stats": "bat", "lg": "all",
+        "qual": "y", "season": season, "season1": season,
+        "ind": "0", "team": "0", "pageitems": "500", "pagenum": "1",
+        "sortdir": "default",
+    }
     
-    frames = []
-    
-    # Table 1: Standard stats (SLG, ISO, K%, BB%, wRC+, wOBA)
-    # stat_type=1 = standard, stat_type=2 = advanced
-    for stat_type in [1, 2, 8]:  # 1=standard, 2=advanced, 8=statcast-era
+    frames = {}
+    for stat_type, label in [("8", "advanced"), ("24", "statcast")]:
         try:
-            df = batting_stats(season, qual=30, stat_columns=stat_type)
-            if df is not None and not df.empty:
-                frames.append(df)
+            params = {**common_params, "type": stat_type, "sortstat": "WAR" if stat_type == "8" else "xSLG"}
+            r = requests.get(base_url, params=params, headers=headers, timeout=20)
+            if r.status_code == 200:
+                rows = r.json().get("data", [])
+                if rows:
+                    frames[label] = pd.DataFrame(rows)
         except Exception:
             pass
     
-    # Fallback: no stat_type arg (older pybaseball)
+    # Pybaseball fallback
     if not frames:
         try:
+            from pybaseball import batting_stats
             df = batting_stats(season, qual=30)
             if df is not None and not df.empty:
-                frames.append(df)
+                frames["pybaseball"] = df
         except Exception:
-            return pd.DataFrame()
+            pass
     
     if not frames:
         return pd.DataFrame()
     
-    # Merge all tables on player name
-    result = frames[0]
-    for extra in frames[1:]:
-        try:
-            # Find common key column
-            for key in ['IDfg', 'Name', 'name']:
-                if key in result.columns and key in extra.columns:
-                    # Only add new columns, don't overwrite existing
-                    new_cols = [c for c in extra.columns if c not in result.columns]
+    # Use advanced as base, merge statcast
+    if "advanced" in frames:
+        result = frames["advanced"].copy()
+        if "statcast" in frames:
+            sc = frames["statcast"]
+            # Find join key
+            for k in ["playerid", "PlayerID", "IDfg", "Name"]:
+                if k in result.columns and k in sc.columns:
+                    new_cols = [c for c in sc.columns if c not in result.columns]
                     if new_cols:
-                        result = result.merge(
-                            extra[[key] + new_cols], on=key, how='left'
-                        )
+                        result = result.merge(sc[[k] + new_cols], on=k, how="left")
                     break
-        except Exception:
-            pass
+    else:
+        result = list(frames.values())[0].copy()
     
-    # Normalize % columns to decimals (0.23 not 23.0)
-    pct_cols = [c for c in result.columns if 
-                c.endswith('%') or c in ('Hard%', 'Soft%', 'Med%', 'K%', 'BB%')]
-    for col in pct_cols:
-        try:
-            if result[col].dropna().max() > 1.5:
-                result[col] = result[col] / 100.0
-        except Exception:
-            pass
+    # Normalize % columns to decimals
+    for col in result.columns:
+        if "%" in col or col in ("Hard%","Barrel%","K%","BB%","LD%","GB%","FB%","HardHit%"):
+            try:
+                vals = result[col].dropna()
+                if len(vals) > 0 and float(vals.max()) > 1.5:
+                    result[col] = result[col] / 100.0
+            except Exception:
+                pass
     
-    # Standardize name and ID columns for fast lookup
-    for name_try in ['Name', 'PlayerName', 'name', 'player']:
-        if name_try in result.columns:
-            result['_name'] = result[name_try].astype(str).str.strip()
+    # Standardize lookup columns
+    for n in ["Name", "PlayerName", "name"]:
+        if n in result.columns:
+            result["_name"] = result[n].astype(str).str.strip()
             break
-    for id_try in ['IDfg', 'mlbamid', 'MLBAMID', 'key_mlbam']:
-        if id_try in result.columns:
-            result['_mlb_id'] = result[id_try].astype(str)
+    for i in ["playerid", "PlayerID", "IDfg", "mlbamid"]:
+        if i in result.columns:
+            result["_mlb_id"] = result[i].astype(str)
             break
     
     return result
 
+
 @st.cache_data(ttl=7200)
 def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
-    """Load FanGraphs pitching stats — standard + advanced merged."""
-    from pybaseball import pitching_stats
+    """Load pitcher stats from FanGraphs JSON API — advanced + statcast merged."""
+    base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.fangraphs.com/leaders/major-league",
+        "Accept": "application/json",
+    }
+    common_params = {
+        "age": "", "pos": "all", "stats": "pit", "lg": "all",
+        "qual": "y", "season": season, "season1": season,
+        "ind": "0", "team": "0", "pageitems": "500", "pagenum": "1",
+        "sortdir": "default",
+    }
     
-    frames = []
-    for stat_type in [1, 2, 8]:
+    frames = {}
+    for stat_type, label in [("8", "advanced"), ("24", "statcast")]:
         try:
-            df = pitching_stats(season, qual=5, stat_columns=stat_type)
-            if df is not None and not df.empty:
-                frames.append(df)
+            params = {**common_params, "type": stat_type, "sortstat": "WAR" if stat_type == "8" else "xERA"}
+            r = requests.get(base_url, params=params, headers=headers, timeout=20)
+            if r.status_code == 200:
+                rows = r.json().get("data", [])
+                if rows:
+                    frames[label] = pd.DataFrame(rows)
         except Exception:
             pass
     
     if not frames:
         try:
+            from pybaseball import pitching_stats
             df = pitching_stats(season, qual=5)
             if df is not None and not df.empty:
-                frames.append(df)
+                frames["pybaseball"] = df
         except Exception:
-            return pd.DataFrame()
+            pass
     
     if not frames:
         return pd.DataFrame()
     
-    result = frames[0]
-    for extra in frames[1:]:
-        try:
-            for key in ['IDfg', 'Name']:
-                if key in result.columns and key in extra.columns:
-                    new_cols = [c for c in extra.columns if c not in result.columns]
+    if "advanced" in frames:
+        result = frames["advanced"].copy()
+        if "statcast" in frames:
+            sc = frames["statcast"]
+            for k in ["playerid", "PlayerID", "IDfg", "Name"]:
+                if k in result.columns and k in sc.columns:
+                    new_cols = [c for c in sc.columns if c not in result.columns]
                     if new_cols:
-                        result = result.merge(extra[[key] + new_cols], on=key, how='left')
+                        result = result.merge(sc[[k] + new_cols], on=k, how="left")
                     break
-        except Exception:
-            pass
+    else:
+        result = list(frames.values())[0].copy()
     
-    pct_cols = [c for c in result.columns if
-                c.endswith('%') or c in ('Hard%', 'Soft%', 'K%', 'BB%')]
-    for col in pct_cols:
-        try:
-            if result[col].dropna().max() > 1.5:
-                result[col] = result[col] / 100.0
-        except Exception:
-            pass
+    for col in result.columns:
+        if "%" in col or col in ("Hard%","Barrel%","K%","BB%","HardHit%"):
+            try:
+                vals = result[col].dropna()
+                if len(vals) > 0 and float(vals.max()) > 1.5:
+                    result[col] = result[col] / 100.0
+            except Exception:
+                pass
     
-    for name_try in ['Name', 'PlayerName', 'name']:
-        if name_try in result.columns:
-            result['_name'] = result[name_try].astype(str).str.strip()
+    for n in ["Name", "PlayerName", "name"]:
+        if n in result.columns:
+            result["_name"] = result[n].astype(str).str.strip()
             break
-    for id_try in ['IDfg', 'mlbamid', 'key_mlbam']:
-        if id_try in result.columns:
-            result['_mlb_id'] = result[id_try].astype(str)
+    for i in ["playerid", "PlayerID", "IDfg", "mlbamid"]:
+        if i in result.columns:
+            result["_mlb_id"] = result[i].astype(str)
             break
     
     return result
+
 
 def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str) -> Optional[pd.Series]:
     """
