@@ -425,427 +425,263 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
         return {"id": pitcher_id, "name": "Unknown", "hand": "R"}
 
 # ============================================================================
-# STATCAST DATA — via pybaseball (handles auth/bot protection properly)
+# DATA LAYER — pybaseball + FanGraphs
+# Strategy: load all players in 2-3 bulk calls, then do fast dict lookups
+# All column names auto-detected at runtime (no hardcoding)
 # ============================================================================
 
 @st.cache_data(ttl=7200)
-def load_season_batting_stats(season: int = 2025) -> pd.DataFrame:
+def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     """
-    Load full-season FanGraphs batting stats via pybaseball.
-    One call loads ALL batters — keyed by playerid for fast lookup.
-    Falls back to empty DataFrame on failure.
+    Load FanGraphs batting leaderboard via pybaseball.
+    Returns one row per qualified batter with all standard + advanced stats.
+    pybaseball returns K% and BB% as decimals (0.23), 
+    Hard% and Barrel% as percentages (34.0) — we normalize everything to decimals.
     """
     try:
         from pybaseball import batting_stats
-        df = batting_stats(season, qual=50)
+        df = batting_stats(season, qual=30)
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Auto-normalize percentage columns to decimals
+        pct_cols = [c for c in df.columns if c.endswith('%') or c in ('Hard%', 'Soft%', 'Med%')]
+        for col in pct_cols:
+            if col in df.columns:
+                # If values are 0-100 range, divide by 100
+                if df[col].dropna().max() > 1.5:
+                    df[col] = df[col] / 100.0
+        
+        # Standardize name column
+        for name_try in ['Name', 'PlayerName', 'name', 'player']:
+            if name_try in df.columns:
+                df['_name'] = df[name_try].str.strip()
+                break
+        
+        # Standardize ID column  
+        for id_try in ['IDfg', 'mlbamid', 'MLBAMID', 'key_mlbam', 'id', 'xMLBAMID']:
+            if id_try in df.columns:
+                df['_mlb_id'] = df[id_try].astype(str)
+                break
+        
         return df
     except Exception as e:
-        st.warning(f"⚠️ pybaseball batting_stats failed: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=7200)
-def load_season_pitching_stats(season: int = 2025) -> pd.DataFrame:
-    """Load full-season FanGraphs pitching stats via pybaseball."""
+def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
+    """Load FanGraphs pitching leaderboard, normalize % columns."""
     try:
         from pybaseball import pitching_stats
-        df = pitching_stats(season, qual=10)
+        df = pitching_stats(season, qual=5)
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Normalize percentage columns
+        pct_cols = [c for c in df.columns if c.endswith('%') or c in ('Hard%', 'Soft%', 'Med%')]
+        for col in pct_cols:
+            if col in df.columns:
+                if df[col].dropna().max() > 1.5:
+                    df[col] = df[col] / 100.0
+        
+        for name_try in ['Name', 'PlayerName', 'name']:
+            if name_try in df.columns:
+                df['_name'] = df[name_try].str.strip()
+                break
+        for id_try in ['IDfg', 'mlbamid', 'key_mlbam', 'id']:
+            if id_try in df.columns:
+                df['_mlb_id'] = df[id_try].astype(str)
+                break
+
         return df
     except Exception as e:
         return pd.DataFrame()
 
-@st.cache_data(ttl=7200)
-def load_statcast_leaderboard(season: int = 2025) -> pd.DataFrame:
+def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str) -> Optional[pd.Series]:
     """
-    Load Statcast batter leaderboard via pybaseball.
-    Returns barrel%, hard_hit%, exit_velocity, xSLG for all qualified batters.
+    Find a player row in a pre-processed DataFrame.
+    Uses _name and _mlb_id standardized columns created by load_all_batting_stats.
+    Falls back to raw column name detection if standardized cols don't exist.
     """
-    try:
-        from pybaseball import statcast_batter_exitvelo_barrels
-        df = statcast_batter_exitvelo_barrels(season, minBBE=20)
-        return df
-    except Exception:
+    if df is None or df.empty:
+        return None
+
+    cols = list(df.columns)
+
+    # Determine name and id columns — prefer standardized versions
+    name_col = "_name" if "_name" in cols else next(
+        (c for c in cols if c.lower() in ("name", "playername", "player_name", "player")), None)
+    id_col = "_mlb_id" if "_mlb_id" in cols else next(
+        (c for c in cols if c.lower() in ("mlbamid", "xmlbamid", "mlb_id", "key_mlbam")), None)
+
+    # 1. ID match (most reliable)
+    if mlb_id and id_col:
         try:
-            # Fallback: use pybaseball expected stats leaderboard
-            from pybaseball import batting_stats_bref
-            df = batting_stats_bref(season)
-            return df
-        except Exception:
-            return pd.DataFrame()
+            match = df[df[id_col].astype(str) == str(mlb_id)]
+            if not match.empty:
+                return match.iloc[0]
+        except:
+            pass
+
+    # 2. Name match
+    if player_name and name_col:
+        try:
+            parts = player_name.strip().split()
+            last = parts[-1].lower()
+            first = parts[0].lower() if len(parts) > 1 else ""
+
+            candidates = df[df[name_col].str.lower().str.contains(last, na=False, regex=False)]
+            if len(candidates) == 1:
+                return candidates.iloc[0]
+            elif len(candidates) > 1 and first:
+                refined = candidates[candidates[name_col].str.lower().str.contains(first, na=False, regex=False)]
+                if not refined.empty:
+                    return refined.iloc[0]
+            if not candidates.empty:
+                return candidates.iloc[0]
+        except:
+            pass
+
+    return None
+
+def safe_get(row: pd.Series, *col_names, default=0.0, as_pct=False) -> float:
+    """
+    Try multiple column names in order, return first non-null value.
+    as_pct=True: value is already normalized to decimal (0.23 not 23)
+    """
+    for col in col_names:
+        if col in row.index and pd.notna(row[col]):
+            try:
+                val = float(row[col])
+                return val
+            except:
+                pass
+    return default
 
 def get_batter_stats(player_name: str, mlb_id: str,
                      batting_df: pd.DataFrame,
-                     statcast_df: pd.DataFrame) -> Dict:
+                     statcast_df: pd.DataFrame = None) -> Dict:
     """
-    Look up a batter's stats from pre-loaded DataFrames.
-    Falls back to league averages if player not found.
+    Extract batter stats from pre-loaded DataFrames.
+    All percentages normalized to decimals (0.23 not 23%).
+    Falls back to MLB league averages if player not found.
     """
+    # 2025 MLB league averages (all as decimals)
     stats = {
-        # League average defaults (2025 MLB)
-        "slg_proxy": 0.380,
-        "iso_proxy": 0.155,
-        "k_rate": 0.228,
-        "bb_rate": 0.082,
-        "wrc_plus": 100,
-        "woba": 0.315,
-        "barrel_rate": 0.070,
-        "hard_hit_rate": 0.370,
-        "exit_velocity_avg": 88.5,
-        "sweet_spot_rate": 0.305,
-        "tb_per_game": 0.85,
-        "data_source": "league_avg",
+        "slg_proxy":        0.398,
+        "iso_proxy":        0.165,
+        "k_rate":           0.228,
+        "bb_rate":          0.082,
+        "wrc_plus":         100.0,
+        "woba":             0.315,
+        "barrel_rate":      0.070,
+        "hard_hit_rate":    0.370,
+        "soft_hit_rate":    0.155,
+        "exit_velocity_avg":88.5,
+        "sweet_spot_rate":  0.305,
+        "tb_per_game":      0.85,
+        "data_source":      "league_avg",
     }
+    
+    row = find_player_row(batting_df, player_name, mlb_id)
+    
+    if row is not None:
+        # SLG / power — prefer xSLG over SLG
+        xslg = safe_get(row, 'xSLG', default=None)
+        slg  = safe_get(row, 'SLG',  default=None)
+        if xslg and xslg > 0:
+            stats["slg_proxy"] = xslg
+        elif slg and slg > 0:
+            stats["slg_proxy"] = slg
 
-    # Try FanGraphs batting stats
-    if not batting_df.empty:
-        # Match by name (fuzzy) or MLBAMID
-        name_cols = [c for c in batting_df.columns if c.lower() in ("name", "playername", "player")]
-        id_cols = [c for c in batting_df.columns if "mlbamid" in c.lower() or c.lower() == "id"]
+        # ISO
+        iso = safe_get(row, 'ISO', default=None)
+        if iso and iso > 0:
+            stats["iso_proxy"] = iso
 
-        row = pd.DataFrame()
+        # K% and BB% — pybaseball returns as decimals (0.23)
+        k = safe_get(row, 'K%', default=None)
+        if k is not None and 0 < k < 1:
+            stats["k_rate"] = k
+        elif k is not None and k > 1:
+            stats["k_rate"] = k / 100  # handle if stored as pct
 
-        # Try ID match first
-        if mlb_id and id_cols:
-            try:
-                row = batting_df[batting_df[id_cols[0]].astype(str) == str(mlb_id)]
-            except:
-                pass
+        bb = safe_get(row, 'BB%', default=None)
+        if bb is not None and 0 < bb < 1:
+            stats["bb_rate"] = bb
+        elif bb is not None and bb > 1:
+            stats["bb_rate"] = bb / 100
 
-        # Fall back to name match
-        if row.empty and name_cols and player_name:
-            try:
-                last_name = player_name.split()[-1].lower()
-                row = batting_df[batting_df[name_cols[0]].str.lower().str.contains(last_name, na=False)]
-            except:
-                pass
+        # wRC+ — stored as integer 100 = average
+        wrc = safe_get(row, 'wRC+', default=None)
+        if wrc and wrc > 0:
+            stats["wrc_plus"] = wrc
 
-        if not row.empty:
-            r = row.iloc[0]
-            # FanGraphs column names (exact) -> our internal key
-            # K%, BB% come as decimals (0.23) in pybaseball
-            # Barrel%, Hard% come as percentages (34.0) — divide by 100
-            # SLG, ISO, wOBA come as decimals
-            col_map = {
-                # Core batting
-                "SLG": ("slg_proxy", 1.0),
-                "ISO": ("iso_proxy", 1.0),
-                "K%": ("k_rate", 1.0),
-                "BB%": ("bb_rate", 1.0),
-                "wRC+": ("wrc_plus", 1.0),
-                "wOBA": ("woba", 1.0),
-                # Expected stats (FanGraphs advanced)
-                "xSLG": ("slg_proxy", 1.0),       # prefer xSLG over SLG
-                "xwOBA": ("woba", 1.0),
-                # Contact quality — FanGraphs stores these as 0-100 percentages
-                "Barrel%": ("barrel_rate", 0.01),  # 8.5 -> 0.085
-                "Hard%": ("hard_hit_rate", 0.01),  # 34.0 -> 0.340
-                "Soft%": ("soft_rate", 0.01),
-                # Exit velo / launch
-                "EV": ("exit_velocity_avg", 1.0),
-                "LA": ("launch_angle_avg", 1.0),
-            }
-            for fg_col, (our_key, multiplier) in col_map.items():
-                if fg_col in r.index and pd.notna(r[fg_col]):
-                    try:
-                        val = float(r[fg_col]) * multiplier
-                        if val != 0:  # don't overwrite with zero
-                            stats[our_key] = val
-                    except:
-                        pass
-            stats["data_source"] = "fangraphs"
+        # wOBA — decimal
+        woba = safe_get(row, 'xwOBA', 'wOBA', default=None)
+        if woba and 0 < woba < 1:
+            stats["woba"] = woba
 
-    # Try Statcast leaderboard
-    if not statcast_df.empty:
-        sc_name_cols = [c for c in statcast_df.columns if "name" in c.lower()]
-        sc_id_cols = [c for c in statcast_df.columns if "id" in c.lower()]
+        # Barrel% — pybaseball normalizes to decimal after our fix (0.085)
+        barrel = safe_get(row, 'Barrel%', 'barrel_batted_rate', default=None)
+        if barrel is not None and barrel > 0:
+            stats["barrel_rate"] = barrel if barrel < 1 else barrel / 100
 
-        sc_row = pd.DataFrame()
-        if mlb_id and sc_id_cols:
-            try:
-                sc_row = statcast_df[statcast_df[sc_id_cols[0]].astype(str) == str(mlb_id)]
-            except:
-                pass
-        if sc_row.empty and sc_name_cols and player_name:
-            try:
-                last_name = player_name.split()[-1].lower()
-                sc_row = statcast_df[statcast_df[sc_name_cols[0]].str.lower().str.contains(last_name, na=False)]
-            except:
-                pass
+        # Hard% — normalized to decimal after our fix (0.34)
+        hard = safe_get(row, 'Hard%', 'hard_hit_percent', default=None)
+        if hard is not None and hard > 0:
+            stats["hard_hit_rate"] = hard if hard < 1 else hard / 100
 
-        if not sc_row.empty:
-            r = sc_row.iloc[0]
-            barrel_cols = [c for c in r.index if "barrel" in c.lower()]
-            hh_cols = [c for c in r.index if "hard_hit" in c.lower() or "hardhit" in c.lower()]
-            ev_cols = [c for c in r.index if "exit_velocity" in c.lower() or "ev" in c.lower()]
+        # EV — exit velocity in mph
+        ev = safe_get(row, 'EV', 'avg_exit_velocity', default=None)
+        if ev and ev > 50:  # sanity check
+            stats["exit_velocity_avg"] = ev
 
-            if barrel_cols:
-                val = float(r[barrel_cols[0]])
-                stats["barrel_rate"] = val / 100 if val > 1 else val
-            if hh_cols:
-                val = float(r[hh_cols[0]])
-                stats["hard_hit_rate"] = val / 100 if val > 1 else val
-            if ev_cols:
-                stats["exit_velocity_avg"] = float(r[ev_cols[0]])
-
-            if stats["data_source"] == "fangraphs":
-                stats["data_source"] = "fangraphs+statcast"
-            else:
-                stats["data_source"] = "statcast"
+        stats["data_source"] = "fangraphs"
 
     return stats
 
 def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
                       pitching_df: pd.DataFrame) -> Dict:
-    """Look up pitcher stats from pre-loaded DataFrame."""
+    """Extract pitcher vulnerability stats from pre-loaded DataFrame."""
     stats = {
-        # League average defaults
-        "k_rate_allowed": 0.228,
+        "k_rate_allowed":   0.228,
+        "bb_rate_allowed":  0.082,
         "hard_hit_allowed": 0.360,
-        "barrel_allowed": 0.065,
-        "era": 4.20,
-        "fip": 4.10,
-        "data_source": "league_avg",
+        "barrel_allowed":   0.065,
+        "era":              4.20,
+        "fip":              4.10,
+        "xfip":             4.10,
+        "data_source":      "league_avg",
     }
+    
+    row = find_player_row(pitching_df, pitcher_name, pitcher_mlb_id)
+    
+    if row is not None:
+        k = safe_get(row, 'K%', default=None)
+        if k is not None and k > 0:
+            stats["k_rate_allowed"] = k if k < 1 else k / 100
 
-    if pitching_df.empty or not pitcher_name:
-        return stats
+        hard = safe_get(row, 'Hard%', default=None)
+        if hard is not None and hard > 0:
+            stats["hard_hit_allowed"] = hard if hard < 1 else hard / 100
 
-    name_cols = [c for c in pitching_df.columns if c.lower() in ("name", "playername", "player")]
-    id_cols = [c for c in pitching_df.columns if "mlbamid" in c.lower()]
+        barrel = safe_get(row, 'Barrel%', default=None)
+        if barrel is not None and barrel > 0:
+            stats["barrel_allowed"] = barrel if barrel < 1 else barrel / 100
 
-    row = pd.DataFrame()
-    if pitcher_mlb_id and id_cols:
-        try:
-            row = pitching_df[pitching_df[id_cols[0]].astype(str) == str(pitcher_mlb_id)]
-        except:
-            pass
-    if row.empty and name_cols and pitcher_name:
-        try:
-            last_name = pitcher_name.split()[-1].lower()
-            row = pitching_df[pitching_df[name_cols[0]].str.lower().str.contains(last_name, na=False)]
-        except:
-            pass
+        era = safe_get(row, 'ERA', default=None)
+        if era and 0 < era < 20:
+            stats["era"] = era
 
-    if not row.empty:
-        r = row.iloc[0]
-        # FanGraphs pitching columns
-        # K% stored as decimal in pybaseball (0.23)
-        # ERA, FIP stored as floats
-        pitch_col_map = {
-            "K%":   ("k_rate_allowed", 1.0),
-            "BB%":  ("bb_rate_allowed", 1.0),
-            "ERA":  ("era", 1.0),
-            "FIP":  ("fip", 1.0),
-            "xFIP": ("xfip", 1.0),
-            "WHIP": ("whip", 1.0),
-            "Hard%": ("hard_hit_allowed", 0.01),  # 34.0 → 0.340
-            "Barrel%": ("barrel_allowed", 0.01),  # 8.5 → 0.085
-        }
-        for fg_col, (our_key, mult) in pitch_col_map.items():
-            if fg_col in r.index and pd.notna(r[fg_col]):
-                try:
-                    val = float(r[fg_col]) * mult
-                    if val != 0:
-                        stats[our_key] = val
-                except:
-                    pass
+        fip = safe_get(row, 'FIP', 'xFIP', default=None)
+        if fip and 0 < fip < 20:
+            stats["fip"] = fip
+
         stats["data_source"] = "fangraphs"
-
+    
     return stats
 
-# ============================================================================
-# WEATHER API
-# ============================================================================
-@st.cache_data(ttl=3600)
-def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool) -> Dict:
-    """Fetch weather from Open-Meteo for a given stadium."""
-    if is_dome:
-        return {
-            "wind_speed": 0, "wind_direction": 0, "wind_dir_label": "DOME",
-            "temperature": 72, "humidity": 50, "is_dome": True,
-            "wind_effect": "neutral", "temp_effect": "neutral"
-        }
-    
-    # Parse game time for hour
-    try:
-        game_dt = datetime.fromisoformat(game_time_utc.replace("Z", "+00:00"))
-        game_hour = game_dt.hour
-    except:
-        game_hour = 19  # 7pm default
-    
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,windspeed_10m,winddirection_10m,relativehumidity_2m",
-        "temperature_unit": "fahrenheit",
-        "windspeed_unit": "mph",
-        "timezone": "America/New_York",
-        "forecast_days": 2,
-    }
-    
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        hourly = data.get("hourly", {})
-        
-        # Find the closest hour to game time
-        times = hourly.get("time", [])
-        target_idx = 0
-        for i, t in enumerate(times):
-            try:
-                t_dt = datetime.fromisoformat(t)
-                if t_dt.hour == game_hour:
-                    target_idx = i
-                    break
-            except:
-                pass
-        
-        wind_speed = hourly.get("windspeed_10m", [5])[target_idx] if hourly.get("windspeed_10m") else 5
-        wind_dir = hourly.get("winddirection_10m", [180])[target_idx] if hourly.get("winddirection_10m") else 180
-        temperature = hourly.get("temperature_2m", [70])[target_idx] if hourly.get("temperature_2m") else 70
-        humidity = hourly.get("relativehumidity_2m", [50])[target_idx] if hourly.get("relativehumidity_2m") else 50
-        
-        # Wind direction label and effect
-        wind_dir_label, wind_effect = classify_wind(wind_dir, wind_speed)
-        
-        # Temperature effect
-        if temperature < 50:
-            temp_effect = "suppress"
-        elif temperature > 83:
-            temp_effect = "boost"
-        else:
-            temp_effect = "neutral"
-        
-        return {
-            "wind_speed": round(wind_speed, 1),
-            "wind_direction": wind_dir,
-            "wind_dir_label": wind_dir_label,
-            "temperature": round(temperature, 1),
-            "humidity": humidity,
-            "is_dome": False,
-            "wind_effect": wind_effect,
-            "temp_effect": temp_effect,
-        }
-    except Exception as e:
-        return {
-            "wind_speed": 5, "wind_direction": 180, "wind_dir_label": "N/A",
-            "temperature": 70, "humidity": 50, "is_dome": False,
-            "wind_effect": "neutral", "temp_effect": "neutral",
-            "error": str(e)
-        }
-
-def classify_wind(direction: float, speed: float) -> Tuple[str, str]:
-    """
-    Classify wind direction and effect on HR/TB.
-    Direction is meteorological (0=N, 90=E, 180=S, 270=W).
-    In most MLB parks, hitting to LF/CF = home plate facing ~NE-E.
-    """
-    if speed < 8:
-        return "Calm", "neutral"
-    
-    # Cardinal directions
-    if direction < 22.5 or direction >= 337.5:
-        label = "N"
-    elif direction < 67.5:
-        label = "NE"
-    elif direction < 112.5:
-        label = "E"
-    elif direction < 157.5:
-        label = "SE"
-    elif direction < 202.5:
-        label = "S"
-    elif direction < 247.5:
-        label = "SW"
-    elif direction < 292.5:
-        label = "W"
-    else:
-        label = "NW"
-    
-    # Most parks face northeast (batter looks toward NE outfield)
-    # Wind OUT = coming from SW (wind going toward outfield = helping HRs)
-    # Wind IN = coming from NE (wind going toward infield = suppressing HRs)
-    
-    if direction >= 180 and direction <= 270:  # SW/S/W wind = blowing OUT
-        if speed >= 12:
-            effect = "strong_out"   # +25-30% HR modifier
-        elif speed >= 8:
-            effect = "out"          # +15% HR modifier
-        else:
-            effect = "neutral"
-    elif direction >= 0 and direction <= 90:  # N/NE/E wind = blowing IN
-        if speed >= 10:
-            effect = "in"           # -20% HR modifier
-        else:
-            effect = "neutral"
-    else:
-        effect = "neutral"          # crosswind
-    
-    return label, effect
-
-# ============================================================================
-# ODDS API
-# ============================================================================
-@st.cache_data(ttl=1800)
-def fetch_odds(date_str: str) -> Dict:
-    """
-    Fetch MLB odds from The Odds API.
-    Returns implied team totals keyed by team abbreviation.
-    """
-    try:
-        api_key = st.secrets.get("odds_api", {}).get("api_key", "")
-        if not api_key:
-            return {}
-        
-        url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
-        params = {
-            "apiKey": api_key,
-            "regions": "us",
-            "markets": "totals,h2h",
-            "oddsFormat": "american",
-            "dateFormat": "iso",
-        }
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        games = r.json()
-        
-        implied_totals = {}
-        for game in games:
-            home_team = game.get("home_team", "")
-            away_team = game.get("away_team", "")
-            
-            game_total = None
-            for bookmaker in game.get("bookmakers", []):
-                for market in bookmaker.get("markets", []):
-                    if market.get("key") == "totals":
-                        for outcome in market.get("outcomes", []):
-                            if outcome.get("name") == "Over":
-                                game_total = outcome.get("point", 9.0)
-                                break
-                    if game_total:
-                        break
-                if game_total:
-                    break
-            
-            if game_total:
-                # Rough split: 50/50 implied
-                home_implied = game_total * 0.52  # home field slight advantage
-                away_implied = game_total * 0.48
-                
-                # Map team names to abbreviations
-                for full_name, abbr in TEAM_ABB_MAP.items():
-                    if full_name.lower() in home_team.lower() or abbr in home_team:
-                        implied_totals[abbr] = round(home_implied, 2)
-                    if full_name.lower() in away_team.lower() or abbr in away_team:
-                        implied_totals[abbr] = round(away_implied, 2)
-        
-        return implied_totals
-    except Exception as e:
-        return {}
-
-# ============================================================================
-# SCORING ENGINE
-# ============================================================================
 
 def compute_weather_score(weather: Dict) -> Tuple[float, str]:
     """
@@ -1266,16 +1102,31 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
     # ── 0. BULK STATS (one call loads all players) ───────
     log("Loading 2025 season batting stats...", "run")
-    batting_df = load_season_batting_stats(2025)
-    pitching_df = load_season_pitching_stats(2025)
-    statcast_df = load_statcast_leaderboard(2025)
+    batting_df = load_all_batting_stats(2025)
+    pitching_df = load_all_pitching_stats(2025)
+    statcast_df = pd.DataFrame()  # merged into batting_df now
 
     if not batting_df.empty:
         log(f"Batting stats: {len(batting_df)} players loaded", "ok")
+        # Store debug info
+        st.session_state.batting_cols = list(batting_df.columns[:30])
+        # Sample first player
+        if not batting_df.empty:
+            sample = batting_df.iloc[0]
+            st.session_state.sample_player = {
+                "name": sample.get("_name", sample.get("Name", "?")),
+                "SLG": sample.get("SLG", "?"),
+                "ISO": sample.get("ISO", "?"),
+                "K%": sample.get("K%", "?"),
+                "Barrel%": sample.get("Barrel%", "?"),
+                "Hard%": sample.get("Hard%", "?"),
+                "wRC+": sample.get("wRC+", "?"),
+            }
     else:
         log("Batting stats unavailable — all scores use league averages", "warn")
     if not pitching_df.empty:
         log(f"Pitching stats: {len(pitching_df)} pitchers loaded", "ok")
+        st.session_state.pitching_cols = list(pitching_df.columns[:20])
     else:
         log("Pitching stats unavailable — using league averages", "warn")
 
@@ -1366,6 +1217,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             all_batters.append(b)
 
         log(f"  Scoring {len(all_batters)} batters...", "run")
+        first_batter_logged = False
 
         for batter in all_batters:
             player_id = batter.get("player_id", "")
@@ -1385,6 +1237,15 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 batting_df=batting_df,
                 statcast_df=statcast_df,
             )
+
+            # Debug log first batter so we can see what's loading
+            if not first_batter_logged:
+                src = batter_statcast.get("data_source", "?")
+                hh = batter_statcast.get("hard_hit_rate", 0)
+                br = batter_statcast.get("barrel_rate", 0)
+                xslg = batter_statcast.get("slg_proxy", 0)
+                log(f"  Sample ({name}): source={src} xSLG={xslg:.3f} barrel={br*100:.1f}% HH={hh*100:.1f}%", "info")
+                first_batter_logged = True
 
             sp_id = str(sp_info.get("id", "") or "")
             pitcher_statcast = get_pitcher_stats(
@@ -2214,7 +2075,16 @@ def main():
             - ❌ Below 65: Fade
             """)
         
-        st.caption(f"v1.0 | {datetime.now(EST).strftime('%I:%M %p EST')}")
+        with st.expander("🔍 Debug: Data columns loaded"):
+            st.caption("Expand after running model to verify stats loaded correctly")
+            if "batting_cols" in st.session_state:
+                st.write("**Batting cols:**", st.session_state.batting_cols)
+            if "pitching_cols" in st.session_state:
+                st.write("**Pitching cols:**", st.session_state.pitching_cols)
+            if "sample_player" in st.session_state:
+                st.write("**Sample player stats:**", st.session_state.sample_player)
+
+        st.caption(f"v1.1 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
     # ── MAIN CONTENT ──────────────────────────────────────
     st.title("⚾ MLB Total Bases Analyzer V1.0")
