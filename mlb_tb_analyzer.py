@@ -1495,12 +1495,21 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         if "_name" in batting_df.columns:
             st.session_state.batting_df_sample = [str(x) for x in batting_df["_name"].head(10).tolist()]
         else:
-            # _name missing — show all columns so we know what we have
-            st.session_state.batting_df_sample = [f"NO _name COLUMN. All cols: {list(batting_df.columns[:20])}"]
+            # Dump ALL column names and first row values
+            cols = list(batting_df.columns)
+            first = batting_df.iloc[0] if not batting_df.empty else None
+            samples = [f"COLUMNS (first 40): {cols[:40]}"]
+            if first is not None:
+                # Show columns that have non-null string-looking values (potential name cols)
+                for c in cols[:60]:
+                    v = first.get(c)
+                    if v is not None and isinstance(v, str) and len(str(v)) > 2:
+                        samples.append(f"  col '{c}' = '{str(v)[:80]}'")
+            st.session_state.batting_df_sample = samples[:20]
         if "_norm_name" in batting_df.columns:
             st.session_state.norm_name_sample = [str(x) for x in batting_df["_norm_name"].head(10).tolist()]
         else:
-            st.session_state.norm_name_sample = ["NO _norm_name COLUMN — prepare_lookup_df failed"]
+            st.session_state.norm_name_sample = ["_norm_name NOT BUILT — _name column missing"]
         # Also show first row raw to see column names with data
         if not batting_df.empty:
             first_row = batting_df.iloc[0]
