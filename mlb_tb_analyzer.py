@@ -497,7 +497,11 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
 
 @st.cache_data(ttl=7200)
 def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
-    """Load pitcher stats from FanGraphs JSON API — advanced + statcast merged."""
+    """
+    Load pitcher stats from FanGraphs JSON API.
+    Uses qual=0 (no minimum) to capture all starters including early-season.
+    Merges advanced (K%, ERA, FIP) + statcast (Hard%, Barrel%, xERA) tables.
+    """
     base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -506,15 +510,19 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     }
     common_params = {
         "age": "", "pos": "all", "stats": "pit", "lg": "all",
-        "qual": "y", "season": season, "season1": season,
+        "qual": "0",   # No minimum — capture all starters
+        "season": season, "season1": season,
         "ind": "0", "team": "0", "pageitems": "500", "pagenum": "1",
-        "sortdir": "default",
+        "sortdir": "default", "minip": "1",
     }
-    
+
     frames = {}
-    for stat_type, label in [("8", "advanced"), ("24", "statcast")]:
+    for stat_type, label, sort in [
+        ("8",  "advanced", "ERA"),
+        ("24", "statcast", "xERA"),
+    ]:
         try:
-            params = {**common_params, "type": stat_type, "sortstat": "WAR" if stat_type == "8" else "xERA"}
+            params = {**common_params, "type": stat_type, "sortstat": sort}
             r = requests.get(base_url, params=params, headers=headers, timeout=20)
             if r.status_code == 200:
                 rows = r.json().get("data", [])
@@ -522,19 +530,20 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                     frames[label] = pd.DataFrame(rows)
         except Exception:
             pass
-    
+
+    # Pybaseball fallback
     if not frames:
         try:
             from pybaseball import pitching_stats
-            df = pitching_stats(season, qual=5)
+            df = pitching_stats(season, qual=1)
             if df is not None and not df.empty:
                 frames["pybaseball"] = df
         except Exception:
             pass
-    
+
     if not frames:
         return pd.DataFrame()
-    
+
     if "advanced" in frames:
         result = frames["advanced"].copy()
         if "statcast" in frames:
@@ -547,7 +556,15 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                     break
     else:
         result = list(frames.values())[0].copy()
-    
+
+    # Add K% alias — FanGraphs pitching sometimes uses "K%" or "K/9"
+    # Normalize to K% as rate (0-1)
+    if "K%" not in result.columns and "SO" in result.columns and "TBF" in result.columns:
+        try:
+            result["K%"] = result["SO"] / result["TBF"]
+        except Exception:
+            pass
+
     return clean_fangraphs_df(result)
 
 
@@ -617,42 +634,68 @@ def clean_fangraphs_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str) -> Optional[pd.Series]:
     """
-    Find a player row using _name and _mlb_id columns created by clean_fangraphs_df.
-    Priority: FanGraphs ID → MLB ID → last name → full name.
+    Find a player row using name matching (primary) or ID (secondary).
+    Tries multiple name variations to handle accents, suffixes, nicknames.
     """
-    if df is None or df.empty:
+    if df is None or df.empty or not player_name:
         return None
 
-    # 1. FanGraphs ID match via _mlb_id (most reliable — extracted from href)
-    if "_mlb_id" in df.columns:
-        for id_val in [mlb_id]:
-            if id_val:
-                try:
-                    match = df[df["_mlb_id"].astype(str) == str(id_val)]
-                    if not match.empty:
-                        return match.iloc[0]
-                except Exception:
-                    pass
+    import unicodedata
 
-    # 2. Name match via _name (HTML-stripped clean name)
+    def normalize(s: str) -> str:
+        """Lowercase, strip accents, remove punctuation."""
+        s = str(s).lower().strip()
+        s = ''.join(c for c in unicodedata.normalize('NFD', s)
+                    if unicodedata.category(c) != 'Mn')
+        s = s.replace('.', '').replace("'", '').replace('-', ' ')
+        return s
+
     name_col = "_name" if "_name" in df.columns else next(
         (c for c in df.columns if c.lower() in ("name", "playername")), None)
+    id_col = "_mlb_id" if "_mlb_id" in df.columns else None
 
-    if player_name and name_col:
+    # Pre-compute normalized names once (cached per call via the df)
+    if name_col and "_norm_name" not in df.columns:
         try:
-            parts = player_name.strip().split()
-            last  = parts[-1].lower()
-            first = parts[0].lower() if len(parts) > 1 else ""
+            df = df.copy()
+            df["_norm_name"] = df[name_col].apply(normalize)
+        except Exception:
+            pass
 
-            candidates = df[df[name_col].str.lower().str.contains(last, na=False, regex=False)]
-            if len(candidates) == 1:
-                return candidates.iloc[0]
-            elif len(candidates) > 1 and first:
-                refined = candidates[candidates[name_col].str.lower().str.contains(first, na=False, regex=False)]
+    norm_name = normalize(player_name)
+    parts = norm_name.split()
+    last  = parts[-1] if parts else ""
+    first = parts[0]  if len(parts) > 1 else ""
+
+    # 1. Exact normalized full name match
+    if "_norm_name" in df.columns:
+        match = df[df["_norm_name"] == norm_name]
+        if not match.empty:
+            return match.iloc[0]
+
+        # 2. Last name + first initial
+        if first and last:
+            cands = df[df["_norm_name"].str.contains(last, na=False, regex=False)]
+            if not cands.empty:
+                refined = cands[cands["_norm_name"].str.startswith(first[0], na=False)]
                 if not refined.empty:
                     return refined.iloc[0]
-            if not candidates.empty:
-                return candidates.iloc[0]
+                # 3. Just last name if unique
+                if len(cands) == 1:
+                    return cands.iloc[0]
+
+        # 4. Last name only (wider net)
+        if last and len(last) > 3:
+            cands = df[df["_norm_name"].str.contains(last, na=False, regex=False)]
+            if len(cands) == 1:
+                return cands.iloc[0]
+
+    # 5. ID fallback
+    if mlb_id and id_col:
+        try:
+            match = df[df[id_col].astype(str) == str(mlb_id)]
+            if not match.empty:
+                return match.iloc[0]
         except Exception:
             pass
 
@@ -1439,7 +1482,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         log("Batting stats unavailable — all scores use league averages", "warn")
     if not pitching_df.empty:
         log(f"Pitching stats: {len(pitching_df)} pitchers loaded", "ok")
-        st.session_state.pitching_cols = list(pitching_df.columns[:20])
+        st.session_state.pitching_cols = list(pitching_df.columns)
     else:
         log("Pitching stats unavailable — using league averages", "warn")
 
@@ -2415,11 +2458,12 @@ Free tier (500/mo) is more than enough.
                 st.caption(f"Total columns loaded: {len(cols)}")
             if "pitching_cols" in st.session_state:
                 cols = st.session_state.pitching_cols
-                critical_pit = ["K%", "ERA", "FIP", "xFIP", "Hard%", "Barrel%"]
+                critical_pit = ["K%", "ERA", "FIP", "xFIP", "Hard%", "Barrel%", "SO", "TBF", "xERA"]
                 st.markdown("**Pitching — critical columns:**")
                 for c in critical_pit:
                     found = c in cols
                     st.markdown(f"{'✅' if found else '❌'} `{c}`")
+                st.caption(f"Total pitching columns: {len(cols)}")
             if "sample_player" in st.session_state:
                 st.markdown("**Sample player (Judge):**")
                 st.json(st.session_state.sample_player)
