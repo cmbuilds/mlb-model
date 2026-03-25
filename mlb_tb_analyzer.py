@@ -447,50 +447,63 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     }
     common_params = {
         "age": "", "pos": "all", "stats": "bat", "lg": "all",
-        "qual": "y", "season": season, "season1": season,
-        "ind": "0", "team": "0", "pageitems": "500", "pagenum": "1",
+        "qual": "0",   # No minimum PA — load every MLB player including bench
+        "minpa": "1",  # At least 1 PA to filter out pure pitchers
+        "season": season, "season1": season,
+        "ind": "0", "team": "0", "pageitems": "1000", "pagenum": "1",
         "sortdir": "default",
     }
     
     frames = {}
-    for stat_type, label in [("8", "advanced"), ("24", "statcast")]:
-        try:
-            params = {**common_params, "type": stat_type, "sortstat": "WAR" if stat_type == "8" else "xSLG"}
-            r = requests.get(base_url, params=params, headers=headers, timeout=20)
-            if r.status_code == 200:
-                rows = r.json().get("data", [])
-                if rows:
-                    frames[label] = pd.DataFrame(rows)
-        except Exception:
-            pass
+    # Load 2025 full season (primary — large sample, reliable)
+    # and 2026 season start (recency signal)
+    for yr, label in [(season, "primary"), (season + 1, "recent")]:
+        for stat_type, slabel in [("8", "adv"), ("24", "sc")]:
+            key = f"{label}_{slabel}"
+            try:
+                params = {**common_params,
+                          "season": yr, "season1": yr,
+                          "type": stat_type,
+                          "sortstat": "WAR" if stat_type == "8" else "xSLG"}
+                r = requests.get(base_url, params=params, headers=headers, timeout=20)
+                if r.status_code == 200:
+                    rows = r.json().get("data", [])
+                    if rows:
+                        frames[key] = pd.DataFrame(rows)
+            except Exception:
+                pass
     
-    # Pybaseball fallback
+    # Pybaseball fallback if all API calls failed
     if not frames:
         try:
             from pybaseball import batting_stats
-            df = batting_stats(season, qual=30)
+            df = batting_stats(season, qual=1)
             if df is not None and not df.empty:
                 frames["pybaseball"] = df
         except Exception:
             pass
-    
+
     if not frames:
         return pd.DataFrame()
-    
-    # Use advanced as base, merge statcast
-    if "advanced" in frames:
-        result = frames["advanced"].copy()
-        if "statcast" in frames:
-            sc = frames["statcast"]
-            # Find join key
+
+    # Build result: start with 2025 advanced, merge in statcast + 2026 data
+    base_key = "primary_adv" if "primary_adv" in frames else list(frames.keys())[0]
+    result = frames[base_key].copy()
+
+    for key, df in frames.items():
+        if key == base_key:
+            continue
+        try:
             for k in ["playerid", "PlayerID", "IDfg", "Name"]:
-                if k in result.columns and k in sc.columns:
-                    new_cols = [c for c in sc.columns if c not in result.columns]
+                if k in result.columns and k in df.columns:
+                    # Suffix recent cols to distinguish
+                    suffix = "_2026" if "recent" in key else "_sc" if "_sc" in key else "_x"
+                    new_cols = [c for c in df.columns if c not in result.columns]
                     if new_cols:
-                        result = result.merge(sc[[k] + new_cols], on=k, how="left")
+                        result = result.merge(df[[k] + new_cols], on=k, how="left", suffixes=("", suffix))
                     break
-    else:
-        result = list(frames.values())[0].copy()
+        except Exception:
+            pass
     
     return clean_fangraphs_df(result)
 
