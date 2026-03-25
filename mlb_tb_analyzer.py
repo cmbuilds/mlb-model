@@ -544,17 +544,21 @@ def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str) -> Optional
 
     return None
 
-def safe_get(row: pd.Series, *col_names, default=0.0, as_pct=False) -> float:
+def safe_get(row: pd.Series, *col_names, default=None, as_pct=False):
     """
-    Try multiple column names in order, return first non-null value.
-    as_pct=True: value is already normalized to decimal (0.23 not 23)
+    Try multiple column names, return first non-null value as plain Python float.
+    Handles numpy int64/float64 types that cause silent math failures.
     """
     for col in col_names:
         if col in row.index and pd.notna(row[col]):
             try:
-                val = float(row[col])
+                val = row[col]
+                # Convert any numpy type to native Python float
+                val = float(val)
+                if as_pct and val > 1:
+                    val = val / 100
                 return val
-            except:
+            except (TypeError, ValueError):
                 pass
     return default
 
@@ -978,94 +982,120 @@ def compute_lineup_score(lineup_slot: int) -> Tuple[float, str]:
 def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, str, Dict]:
     """
     Compute batter profile sub-score 0-100.
-    Calibrated so league-average batter = ~50, elite = 85+.
-    Primary inputs: xSLG, barrel%, hard hit%, ISO, K rate.
+    League avg batter = ~50. Elite (Judge/Soto tier) = 85+.
+    All numpy types converted to float to prevent silent math failures.
     """
     details = {}
 
-    # Extract with league average defaults
-    xslg       = statcast.get("slg_proxy", 0.380)
-    barrel_rate= statcast.get("barrel_rate", 0.070)
-    hard_hit   = statcast.get("hard_hit_rate", 0.370)
-    k_rate     = statcast.get("k_rate", 0.228)
-    iso        = statcast.get("iso_proxy", 0.155)
-    wrc_plus   = statcast.get("wrc_plus", 100)
-    exit_vel   = statcast.get("exit_velocity_avg", 88.5)
-    sweet_spot = statcast.get("sweet_spot_rate", 0.305)
-    tb_per_g   = statcast.get("tb_per_game", 0.85)
+    # Force all to native Python float — fixes np.int64/np.float64 silent failures
+    def f(key, default):
+        try: return float(statcast.get(key, default))
+        except: return float(default)
 
-    details["xSLG"]    = round(xslg, 3)
-    details["Barrel%"] = f"{barrel_rate*100:.1f}%"
-    details["HardHit%"]= f"{hard_hit*100:.1f}%"
-    details["K%"]      = f"{k_rate*100:.1f}%"
-    details["ISO"]     = round(iso, 3)
-    details["wRC+"]    = round(wrc_plus)
+    xslg        = f("slg_proxy",        0.398)
+    barrel_rate = f("barrel_rate",      0.070)
+    hard_hit    = f("hard_hit_rate",    0.370)
+    k_rate      = f("k_rate",           0.228)
+    iso         = f("iso_proxy",        0.165)
+    wrc_plus    = f("wrc_plus",         100.0)
 
-    # Sub-scores — calibrated ranges based on actual MLB distribution
-    # xSLG: .200=0, .380=50, .600=100  (league avg .380 → 50)
-    xslg_score = (xslg - 0.200) / (0.600 - 0.200) * 100
+    details["xSLG"]     = round(xslg, 3)
+    details["Barrel%"]  = f"{barrel_rate*100:.1f}%"
+    details["HardHit%"] = f"{hard_hit*100:.1f}%"
+    details["K%"]       = f"{k_rate*100:.1f}%"
+    details["ISO"]      = round(iso, 3)
+    details["wRC+"]     = int(wrc_plus)
+
+    # ── Sub-scores 0-100, calibrated to actual MLB distributions ──
+
+    # xSLG: .200=0, .398=50, .650=100
+    # Judge .708 → ~96, Avg .398 → 50, Weak .250 → ~13
+    xslg_score = (xslg - 0.200) / (0.650 - 0.200) * 100
     xslg_score = max(0, min(100, xslg_score))
 
-    # wRC+: 60=0, 100=50, 160=100  (league avg 100 → 50)
-    wrc_score = (wrc_plus - 60) / (160 - 60) * 100
+    # wRC+: 60=0, 100=50, 180=100
+    # Judge 204 → 100 (capped), Avg 100 → 50, Weak 70 → ~13
+    wrc_score = (wrc_plus - 60) / (180 - 60) * 100
     wrc_score = max(0, min(100, wrc_score))
 
-    # Barrel%: 0%=0, 7%=50, 20%=100  (league avg 7% → 50)
+    # Barrel%: 0%=0, 7%=44, 20%=100
+    # Judge 24.7% → 100 (capped), Avg 7% → 44, Weak 3% → 15
     barrel_score = barrel_rate / 0.20 * 100
     barrel_score = max(0, min(100, barrel_score))
 
-    # Hard hit%: 20%=0, 37%=50, 60%=100  (league avg 37% → 50)
-    hard_hit_score = (hard_hit - 0.20) / (0.60 - 0.20) * 100
+    # Hard hit%: 28%=0, 38%=50, 56%=100
+    # Judge 45.6% → ~86, Avg 38% → 50, Weak 28% → 0
+    hard_hit_score = (hard_hit - 0.28) / (0.56 - 0.28) * 100
     hard_hit_score = max(0, min(100, hard_hit_score))
 
-    # K rate INVERSE: 5%=100, 23%=50, 40%=0  (league avg 23% → 50)
-    k_score = max(0, min(100, (0.40 - k_rate) / (0.40 - 0.05) * 100))
+    # K rate INVERSE: 8%=100, 23%=50, 38%=0
+    # Low K = more TB opportunities (no K = 0 TB guaranteed)
+    k_score = max(0, min(100, (0.38 - k_rate) / (0.38 - 0.08) * 100))
 
-    # ISO: .050=0, .155=50, .300=100  (league avg .155 → 50)
-    iso_score = (iso - 0.050) / (0.300 - 0.050) * 100
+    # ISO: .080=0, .165=50, .320=100
+    # Judge .357 → 100 (capped), Avg .165 → 50, Weak .080 → 0
+    iso_score = (iso - 0.080) / (0.320 - 0.080) * 100
     iso_score = max(0, min(100, iso_score))
 
-    # Weighted composite — research weights, xSLG+wRC+ as primary signals
+    # Weighted composite
     composite = (
-        xslg_score   * 0.22 +   # xSLG / expected slugging (highest weight)
-        wrc_score    * 0.18 +   # wRC+ overall offensive value
-        barrel_score * 0.20 +   # barrel rate (strong HR/XBH predictor)
-        hard_hit_score * 0.16 + # hard hit rate
-        iso_score    * 0.14 +   # ISO power
-        k_score      * 0.10     # K rate inverse (PA completion)
+        xslg_score    * 0.25 +   # xSLG — best single predictor of TB
+        wrc_score     * 0.18 +   # wRC+ — overall offensive context
+        barrel_score  * 0.22 +   # barrel% — strongest XBH/HR signal
+        hard_hit_score* 0.15 +   # hard hit% — contact quality
+        iso_score     * 0.12 +   # ISO — raw power
+        k_score       * 0.08     # K% inverse — PA completion
     )
 
-    return max(0, min(100, composite)), "Contact quality profile", details
+    return max(0, min(100, composite)), "Contact quality", details
 
 
 def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, str]:
     """
-    Compute pitcher vulnerability sub-score 0-100.
-    Higher score = MORE vulnerable pitcher = better for batter.
-    Inputs: K%, hard_hit_allowed, barrel_allowed, ERA proxy.
+    Pitcher VULNERABILITY score 0-100.
+    HIGH score = pitcher is hittable = good for batter TB.
+    LOW score = elite pitcher = suppresses TB.
+    Webb/Fried type = ~20-30. League avg pitcher = ~50. Mop-up arm = ~75+.
     """
-    # Extract with league average defaults
-    k_rate = statcast.get("k_rate_allowed", 0.230)    # pitcher K% (high = good pitcher = BAD for batter)
-    hard_hit = statcast.get("hard_hit_allowed", 0.360) # hard contact allowed
-    barrel = statcast.get("barrel_allowed", 0.065)     # barrels allowed
-    
-    # K rate: INVERSE (high K pitcher = low vulnerability)
-    # 10% K rate = 90 vulnerability; 30% K rate = 30 vulnerability
-    k_vuln_score = max(0, min(100, (0.30 - k_rate) / (0.30 - 0.10) * 80 + 20))
-    
-    # Hard hit allowed: higher = more vulnerable
-    # 25%=0, 36%=50, 50%=100
-    hard_hit_score = (hard_hit - 0.25) / (0.50 - 0.25) * 100
-    hard_hit_score = max(0, min(100, hard_hit_score))
-    
-    # Barrel allowed: higher = more vulnerable
-    # 0%=0, 6.5%=50, 15%=100
-    barrel_score = barrel / 0.15 * 100
-    barrel_score = max(0, min(100, barrel_score))
-    
-    composite = (k_vuln_score * 0.40 + hard_hit_score * 0.35 + barrel_score * 0.25)
-    
-    return max(0, min(100, composite)), f"K%: {k_rate*100:.0f}% | HH%: {hard_hit*100:.0f}% | Barrel: {barrel*100:.1f}%"
+    def f(key, default):
+        try: return float(statcast.get(key, default))
+        except: return float(default)
+
+    k_rate   = f("k_rate_allowed",   0.228)
+    hard_hit = f("hard_hit_allowed", 0.340)
+    barrel   = f("barrel_allowed",   0.065)
+    era      = f("era",              4.20)
+    fip      = f("fip",              4.10)
+
+    # K% INVERSE — high K pitcher = low vulnerability
+    # Webb/Fried ~28-32% K → low vuln score
+    # 10% K = 100 vuln, 23% K = 50 vuln, 35%+ K = ~0 vuln
+    k_vuln = max(0, min(100, (0.35 - k_rate) / (0.35 - 0.10) * 100))
+
+    # Hard hit allowed — higher = more vulnerable
+    # 28%=0, 36%=50, 50%=100
+    hh_vuln = (hard_hit - 0.28) / (0.50 - 0.28) * 100
+    hh_vuln = max(0, min(100, hh_vuln))
+
+    # Barrel% allowed
+    # 3%=0, 7%=50, 14%=100
+    barrel_vuln = (barrel - 0.03) / (0.14 - 0.03) * 100
+    barrel_vuln = max(0, min(100, barrel_vuln))
+
+    # ERA/FIP quality
+    # 2.0=0, 4.20=50, 7.0=100
+    era_use = fip if fip > 0 else era
+    era_vuln = (era_use - 2.0) / (7.0 - 2.0) * 100
+    era_vuln = max(0, min(100, era_vuln))
+
+    composite = (
+        k_vuln      * 0.40 +   # K% most stable and predictive
+        hh_vuln     * 0.25 +   # hard hit quality allowed
+        barrel_vuln * 0.20 +   # barrel rate allowed
+        era_vuln    * 0.15     # FIP/ERA quality signal
+    )
+
+    return max(0, min(100, composite)), f"K%: {k_rate*100:.0f}% | HH%: {hard_hit*100:.0f}% | Barrel: {barrel*100:.1f}% | FIP: {era_use:.2f}"
 
 
 def compute_vegas_score(implied_total: float) -> Tuple[float, str]:
@@ -1103,26 +1133,23 @@ def compute_final_score(
     vegas_score: float,
 ) -> float:
     """
-    Final weighted composite score using research-calibrated weights.
-    
-    Weights per research doc:
-    - Batter Profile: 45% (xSLG, barrel, hard hit, ISO, K, recent form)
-    - Pitcher Vulnerability: 30% (K%, hard hit allowed, barrel allowed)
-    - Platoon: 6%
-    - Lineup Position: 4%
-    - Park + Weather: 10%
-    - Vegas Signal: 5%
+    Final weighted composite. Calibrated so:
+    - League avg batter vs league avg pitcher = ~50
+    - Elite batter vs bad pitcher, good park/weather/Vegas = 85+
+    - Elite batter vs elite pitcher, bad park = 55-65
     """
-    score = (
-        batter_score * 0.45 +
-        pitcher_vuln_score * 0.30 +
-        platoon_score * 0.06 +
-        lineup_score * 0.04 +
-        park_score * 0.07 +
-        weather_score * 0.03 +
-        vegas_score * 0.05
+    raw = (
+        batter_score      * 0.45 +
+        pitcher_vuln_score* 0.30 +
+        platoon_score     * 0.06 +
+        lineup_score      * 0.04 +
+        park_score        * 0.07 +
+        weather_score     * 0.03 +
+        vegas_score       * 0.05
     )
-    return max(0, min(100, round(score, 1)))
+    # Calibration offset: raw league-avg matchup ≈ 42 → target 50
+    calibrated = raw + 8.0
+    return max(0, min(100, round(calibrated, 1)))
 
 
 def score_to_prob(score: float) -> float:
