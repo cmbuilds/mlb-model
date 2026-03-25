@@ -683,6 +683,174 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
     return stats
 
 
+# ============================================================================
+# WEATHER API — Open-Meteo (free, no key required)
+# ============================================================================
+@st.cache_data(ttl=3600)
+def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool) -> Dict:
+    """Fetch game-time weather from Open-Meteo. Returns neutral defaults for domes."""
+    NEUTRAL = {
+        "wind_speed": 0, "wind_direction": 0, "wind_dir_label": "DOME",
+        "temperature": 72, "humidity": 50, "is_dome": True,
+        "wind_effect": "neutral", "temp_effect": "neutral",
+    }
+    if is_dome:
+        return NEUTRAL
+
+    try:
+        game_hour = 19  # default 7pm
+        if game_time_utc:
+            try:
+                from dateutil import parser as dtparser
+                game_dt = dtparser.parse(game_time_utc)
+                game_hour = game_dt.hour
+            except Exception:
+                pass
+
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat, "longitude": lon,
+            "hourly": "temperature_2m,windspeed_10m,winddirection_10m,relativehumidity_2m",
+            "temperature_unit": "fahrenheit",
+            "windspeed_unit": "mph",
+            "timezone": "America/New_York",
+            "forecast_days": 2,
+        }
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+
+        target_idx = 0
+        for i, t in enumerate(times):
+            try:
+                t_dt = datetime.fromisoformat(t)
+                if t_dt.hour == game_hour:
+                    target_idx = i
+                    break
+            except Exception:
+                pass
+
+        def safe_idx(lst, idx, default):
+            try: return lst[idx]
+            except Exception: return default
+
+        wind_speed = safe_idx(hourly.get("windspeed_10m", []), target_idx, 5)
+        wind_dir   = safe_idx(hourly.get("winddirection_10m", []), target_idx, 180)
+        temperature= safe_idx(hourly.get("temperature_2m", []), target_idx, 70)
+        humidity   = safe_idx(hourly.get("relativehumidity_2m", []), target_idx, 50)
+
+        wind_dir_label, wind_effect = classify_wind(float(wind_dir), float(wind_speed))
+        temp_effect = "suppress" if temperature < 50 else "boost" if temperature > 83 else "neutral"
+
+        return {
+            "wind_speed": round(float(wind_speed), 1),
+            "wind_direction": float(wind_dir),
+            "wind_dir_label": wind_dir_label,
+            "temperature": round(float(temperature), 1),
+            "humidity": humidity,
+            "is_dome": False,
+            "wind_effect": wind_effect,
+            "temp_effect": temp_effect,
+        }
+    except Exception as e:
+        return {
+            "wind_speed": 5, "wind_direction": 180, "wind_dir_label": "N/A",
+            "temperature": 70, "humidity": 50, "is_dome": False,
+            "wind_effect": "neutral", "temp_effect": "neutral",
+        }
+
+def classify_wind(direction: float, speed: float) -> Tuple[str, str]:
+    """Classify wind direction and HR/TB effect. Direction = meteorological degrees."""
+    if speed < 8:
+        return "Calm", "neutral"
+    dirs = ["N","NE","E","SE","S","SW","W","NW"]
+    label = dirs[int((direction + 22.5) / 45) % 8]
+    # SW/S/W blowing OUT toward outfield = HR boost
+    if 157.5 <= direction <= 292.5:
+        effect = "strong_out" if speed >= 12 else "out"
+    elif direction <= 67.5 or direction >= 337.5:
+        effect = "in" if speed >= 10 else "neutral"
+    else:
+        effect = "neutral"
+    return label, effect
+
+# ============================================================================
+# ODDS API — The Odds API (free tier: 500 calls/month)
+# ============================================================================
+@st.cache_data(ttl=1800)
+def fetch_odds(date_str: str) -> Dict:
+    """
+    Fetch team implied run totals from The Odds API.
+    Returns dict keyed by team abbreviation -> implied runs.
+    Requires ODDS_API_KEY in Streamlit secrets.
+    Free tier: 500 calls/month at the-odds-api.com
+    """
+    try:
+        api_key = st.secrets.get("odds_api", {}).get("api_key", "")
+        if not api_key or api_key.strip() == "":
+            return {}
+
+        url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+        params = {
+            "apiKey": api_key,
+            "regions": "us",
+            "markets": "totals,h2h",
+            "oddsFormat": "american",
+        }
+        r = requests.get(url, params=params, timeout=12)
+
+        # Log remaining quota from headers
+        remaining = r.headers.get("x-requests-remaining", "?")
+        used = r.headers.get("x-requests-used", "?")
+
+        if r.status_code == 401:
+            st.warning("⚠️ Odds API: Invalid key. Check secrets.toml.")
+            return {}
+        if r.status_code == 422:
+            st.warning("⚠️ Odds API: No lines available yet for today.")
+            return {}
+        r.raise_for_status()
+
+        games = r.json()
+        implied = {}
+
+        for game in games:
+            home_name = game.get("home_team", "")
+            away_name = game.get("away_team", "")
+            game_total = None
+
+            # Find game total from first bookmaker
+            for bm in game.get("bookmakers", []):
+                for mkt in bm.get("markets", []):
+                    if mkt.get("key") == "totals":
+                        for outcome in mkt.get("outcomes", []):
+                            if outcome.get("name") == "Over":
+                                game_total = float(outcome.get("point", 9.0))
+                        break
+                if game_total:
+                    break
+
+            if not game_total:
+                game_total = 9.0  # MLB average
+
+            # Home team gets slight advantage (~52/48 split)
+            home_implied = round(game_total * 0.52, 2)
+            away_implied = round(game_total * 0.48, 2)
+
+            # Map full team names to abbreviations
+            for full_name, abbr in TEAM_ABB_MAP.items():
+                if full_name.lower() in home_name.lower():
+                    implied[abbr] = home_implied
+                if full_name.lower() in away_name.lower():
+                    implied[abbr] = away_implied
+
+        return implied
+
+    except Exception as e:
+        return {}
+
 def compute_weather_score(weather: Dict) -> Tuple[float, str]:
     """
     Compute weather sub-score 0-100.
@@ -902,25 +1070,26 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float,
 
 def compute_vegas_score(implied_total: float) -> Tuple[float, str]:
     """
-    Compute Vegas signal sub-score 0-100.
-    Team implied run total = strong proxy for run environment.
-    4.5+ = favorable; below 3.5 = bad.
+    Vegas signal sub-score 0-100.
+    Returns 0 with flag when no lines available (don't fake neutrality).
+    4.5 = neutral, 5.5+ = favorable, 3.5- = bad environment.
     """
     if not implied_total or implied_total <= 0:
-        return 50.0, "No lines ⚠️"
-    
+        return 0.0, "No lines ⚠️"
+
     # 3.0=0, 4.5=50, 6.5=100
     score = (implied_total - 3.0) / (6.5 - 3.0) * 100
     score = max(0, min(100, score))
-    
-    flag = ""
+
     if implied_total >= 5.5:
         flag = " 🔥"
     elif implied_total >= 4.5:
         flag = " ✅"
     elif implied_total < 3.5:
-        flag = " ⚠️"
-    
+        flag = " ❄️"
+    else:
+        flag = ""
+
     return score, f"{implied_total:.1f} implied runs{flag}"
 
 
@@ -1152,12 +1321,12 @@ def run_model(date_str: str, status_container) -> List[Dict]:
     implied_totals = {}
     try:
         implied_totals = fetch_odds(date_str)
-    except:
+    except Exception:
         pass
     if implied_totals:
-        log(f"Odds loaded for {len(implied_totals)} teams", "ok")
+        log(f"Live odds loaded for {len(implied_totals)} teams ✅", "ok")
     else:
-        log("No Odds API key — using neutral 4.5 implied runs for all teams", "warn")
+        log("⚠️ No Odds API key — Vegas signal (5% weight) zeroed out. Add key in sidebar for full model.", "warn")
 
     # ── 3. PROCESS EACH GAME ─────────────────────────────
     total_batters = 0
@@ -2033,23 +2202,36 @@ def main():
         # Data source status
         st.subheader("📡 Data Sources")
         
-        has_odds_key = bool(st.secrets.get("odds_api", {}).get("api_key", ""))
+        try:
+            odds_key = st.secrets.get("odds_api", {}).get("api_key", "")
+            has_odds_key = bool(odds_key and odds_key.strip())
+        except:
+            has_odds_key = False
+
+        st.markdown(f"✅ MLB Stats API")
+        st.markdown(f"✅ FanGraphs (pybaseball)")
+        st.markdown(f"✅ Open-Meteo Weather")
         
-        st.markdown(f"{'✅' if True else '❌'} MLB Stats API")
-        st.markdown(f"{'✅' if True else '❌'} Baseball Savant")
-        st.markdown(f"{'✅' if True else '❌'} Open-Meteo Weather")
-        st.markdown(f"{'✅' if has_odds_key else '⚠️'} The Odds API {'(configured)' if has_odds_key else '(no key)'}")
-        
-        if not has_odds_key:
-            with st.expander("Add Odds API Key"):
+        if has_odds_key:
+            st.markdown(f"✅ The Odds API *(live lines)*")
+        else:
+            st.markdown(f"⚠️ The Odds API *(no key — scores degraded)*")
+            with st.expander("🔑 Add Odds API Key (required for best scores)"):
                 st.markdown("""
-                1. Sign up free at [the-odds-api.com](https://the-odds-api.com)
-                2. Get your API key (500 free calls/month)
-                3. Add to Streamlit secrets:
-                ```toml
-                [odds_api]
-                api_key = "your_key_here"
-                ```
+**Step 1:** Sign up free at [the-odds-api.com](https://the-odds-api.com)
+— 500 calls/month free (~$0 for daily use all season)
+
+**Step 2:** Go to Streamlit Cloud → your app → **⋮ Settings → Secrets**
+
+**Step 3:** Paste this (replace with your real key):
+```toml
+[odds_api]
+api_key = "your_key_here"
+```
+**Step 4:** Save → app auto-restarts
+
+**Usage math:** 1 call per model run × ~180 game days = ~180 calls/season.
+Free tier (500/mo) is more than enough.
                 """)
         
         st.markdown("---")
