@@ -2996,6 +2996,102 @@ def display_hits_tab(plays: List[Dict]):
 # ============================================================================
 # MAIN APP
 # ============================================================================
+def display_results_tracker():
+    """Display performance tracking and historical results."""
+    st.header("📈 Results Tracker")
+
+    conn = sqlite3.connect(DB_PATH)
+
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("🔄 Refresh"):
+            st.rerun()
+
+    try:
+        picks_df = pd.read_sql("SELECT * FROM picks ORDER BY date DESC, model_score DESC", conn)
+        parlays_df = pd.read_sql("SELECT * FROM parlays ORDER BY date DESC", conn)
+    except Exception:
+        picks_df = pd.DataFrame()
+        parlays_df = pd.DataFrame()
+    conn.close()
+
+    if picks_df.empty:
+        st.info("📊 No data yet. Run the model and log results to start tracking.")
+        return
+
+    # Overall performance
+    resolved = picks_df[picks_df["result"].isin(["hit", "miss"])]
+    if not resolved.empty:
+        total_hits = len(resolved[resolved["result"] == "hit"])
+        total = len(resolved)
+        hit_rate = total_hits / total if total > 0 else 0
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1: st.metric("Overall Record", f"{total_hits}-{total - total_hits}")
+        with col2: st.metric("Hit Rate", f"{hit_rate*100:.1f}%")
+        with col3:
+            t1 = resolved[resolved["tier"] == "🔒 TIER 1"]
+            r = len(t1[t1["result"]=="hit"]) / len(t1) if len(t1) > 0 else 0
+            st.metric("Tier 1 Hit%", f"{r*100:.1f}%" if len(t1) > 0 else "—")
+        with col4:
+            t2 = resolved[resolved["tier"] == "✅ TIER 2"]
+            r = len(t2[t2["result"]=="hit"]) / len(t2) if len(t2) > 0 else 0
+            st.metric("Tier 2 Hit%", f"{r*100:.1f}%" if len(t2) > 0 else "—")
+
+    st.markdown("---")
+    st.subheader("📋 Pick Log")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        date_start = st.date_input("From", value=datetime.now(EST).date() - timedelta(days=30), key="rt_start")
+    with col2:
+        date_end = st.date_input("To", value=datetime.now(EST).date(), key="rt_end")
+
+    filtered = picks_df[
+        (picks_df["date"] >= str(date_start)) &
+        (picks_df["date"] <= str(date_end))
+    ]
+    if not filtered.empty:
+        display_cols = ["date","player_name","team","opponent","sp_name",
+                        "lineup_slot","model_score","tier","result","tb_actual","implied_total"]
+        avail = [c for c in display_cols if c in filtered.columns]
+        st.dataframe(filtered[avail], use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("✏️ Log Results")
+    st.caption("After games complete, log actual total bases here.")
+
+    pending = picks_df[picks_df["result"] == "pending"]
+    if not pending.empty:
+        opts = {f"{r['player_name']} ({r['team']}) - {r['date']}": r["pick_id"]
+                for _, r in pending.head(20).iterrows()}
+        sel = st.selectbox("Select pick:", list(opts.keys()))
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            tb = st.number_input("Actual TB", 0, 16, 0)
+        with col2:
+            result = "hit" if tb >= 2 else "miss"
+            st.metric("Result", result.upper())
+        with col3:
+            if st.button("💾 Save"):
+                update_pick_result(opts[sel], result, tb)
+                st.success(f"✅ {tb} TB = {result.upper()}")
+                st.rerun()
+    else:
+        st.caption("No pending picks.")
+
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        if not picks_df.empty:
+            st.download_button("📥 Export Picks", picks_df.to_csv(index=False),
+                               "mlb_picks.csv", "text/csv")
+    with col2:
+        if not parlays_df.empty:
+            st.download_button("📥 Export Parlays", parlays_df.to_csv(index=False),
+                               "mlb_parlays.csv", "text/csv")
+
+
 def main():
     # Initialize DB
     init_db()
