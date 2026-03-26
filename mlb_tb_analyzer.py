@@ -450,8 +450,9 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
         "qual": "0",   # No minimum PA — load every MLB player including bench
         "minpa": "1",  # At least 1 PA to filter out pure pitchers
         "season": season, "season1": season,
-        "ind": "0", "team": "0", "pageitems": "1000", "pagenum": "1",
+        "ind": "0", "team": "0", "pageitems": "2000", "pagenum": "1",
         "sortdir": "default",
+        "sortstat": "PA",  # Sort by PA so all batters with plate appearances are included
     }
     
     frames = {}
@@ -1346,8 +1347,8 @@ def compute_final_score(
         weather_score     * 0.03 +
         vegas_score       * 0.05
     )
-    # Calibration offset: raw league-avg matchup ≈ 42 → target 50
-    calibrated = raw + 8.0
+    # Calibration offset: raw league-avg matchup ≈ 42 → target 52
+    calibrated = raw + 10.0
     return max(0, min(100, round(calibrated, 1)))
 
 
