@@ -2282,8 +2282,8 @@ def display_parlay_builder(plays: List[Dict], unit_size: int = 25):
             except Exception:
                 pass
             batter_mock = {
-                "k_rate": p.get("k_rate", 0.228), "wrc_plus": 100.0, "avg": 0.255,
-                "bb_rate": 0.082, "woba": p.get("xslg", 0.315) * 0.75,
+                "k_rate": p.get("k_rate", 0.228), "wrc_plus": max(40,min(220,100+(p.get("xslg",0.398)-0.398)/0.005)), "avg": 0.255,
+                "bb_rate": p.get("bb_rate",0.082), "woba": p.get("xslg", 0.398) * 0.78,
                 "hard_hit_rate": p.get("hard_hit_rate", 0.370), "slg_proxy": p.get("xslg", 0.398),
             }
             h_score, h_prob, h_tier, _ = compute_hits_score_for_player(
@@ -2312,8 +2312,8 @@ def display_parlay_builder(plays: List[Dict], unit_size: int = 25):
             except Exception:
                 pass
             batter_mock = {
-                "k_rate": p.get("k_rate", 0.228), "wrc_plus": 100.0, "avg": 0.255,
-                "bb_rate": 0.082, "woba": p.get("xslg", 0.315) * 0.75,
+                "k_rate": p.get("k_rate", 0.228), "wrc_plus": max(40,min(220,100+(p.get("xslg",0.398)-0.398)/0.005)), "avg": 0.255,
+                "bb_rate": p.get("bb_rate",0.082), "woba": p.get("xslg", 0.398) * 0.78,
                 "hard_hit_rate": p.get("hard_hit_rate", 0.370), "slg_proxy": p.get("xslg", 0.398),
             }
             h_score, h_prob, h_tier, _ = compute_hits_score_for_player(
@@ -2629,12 +2629,12 @@ def score_to_prob_hits(score: float) -> float:
 
 
 def get_tier_hits(score: float) -> str:
-    """O0.5 tiers — higher thresholds since base rate is higher."""
-    if score >= 85:
+    """O0.5 tiers — calibrated to actual score distribution."""
+    if score >= 78:
         return "🔒 SAFE+"
-    elif score >= 75:
+    elif score >= 68:
         return "✅ SAFE"
-    elif score >= 65:
+    elif score >= 58:
         return "📊 LIKELY"
     else:
         return "❌ SKIP"
@@ -2655,8 +2655,15 @@ def compute_hits_score_for_player(
     """
     Compute O0.5 score, probability, tier, and details for a single player.
     Returns (score, prob, tier, details_dict).
+    Calibrated: avg batter vs avg pitcher = ~58, elite bat vs weak pitcher = 75+
     """
-    bat_score, _, bat_details = compute_batter_score_hits(batter_statcast)
+    # Inject wRC+ proxy from xSLG if not present (fixes default=100 issue)
+    enriched = dict(batter_statcast)
+    if enriched.get("wrc_plus", 100) == 100.0:
+        xslg = float(enriched.get("slg_proxy", 0.398))
+        enriched["wrc_plus"] = max(40, min(220, 100 + (xslg - 0.398) / 0.005))
+
+    bat_score, _, bat_details = compute_batter_score_hits(enriched)
     pit_score, pit_label = compute_pitcher_score_hits(pitcher_statcast)
     plat_score, plat_label = compute_platoon_score(batter_hand, sp_hand)
     lineup_sc, lineup_label = compute_lineup_score(lineup_slot)
@@ -2665,25 +2672,25 @@ def compute_hits_score_for_player(
     vegas_sc, _ = compute_vegas_score(implied)
     tto_sc, _ = compute_tto_bonus(lineup_slot)
 
-    # O0.5 weights: K% dominates, park matters less
+    # O0.5 weights: K% dominates, park matters less than O1.5
     raw = (
         bat_score  * 0.42 +
-        pit_score  * 0.32 +  # Pitcher K% more important for O0.5
+        pit_score  * 0.32 +
         plat_score * 0.05 +
-        lineup_sc  * 0.05 +  # PA volume more important
-        park_sc    * 0.04 +  # Park matters less for any hit
+        lineup_sc  * 0.05 +
+        park_sc    * 0.04 +
         weather_sc * 0.02 +
         vegas_sc   * 0.05 +
-        tto_sc     * 0.05    # TTO bonus larger — SP tires = more hits
+        tto_sc     * 0.05
     )
-    # Calibration: O0.5 base rate ~65% means scores are naturally higher
-    # Offset tuned so avg batter vs avg pitcher = ~62
-    score = max(0, min(100, round(raw + 12.0, 1)))
+    # Calibration offset: avg batter (bat=40) vs avg pitcher (pit=45) raw ~= 43
+    # Target: avg matchup = ~58, Tiers start at 58/68/78
+    score = max(0, min(100, round(raw + 15.0, 1)))
 
     if sp_tbd:
-        score = min(score, 78)
+        score = min(score, 74)
     if not lineup_confirmed:
-        score = min(score, 75)
+        score = min(score, 72)
 
     prob = score_to_prob_hits(score)
     tier = get_tier_hits(score)
@@ -2737,15 +2744,15 @@ def display_hits_tab(plays: List[Dict]):
 
         batter_mock = {
             "k_rate":        p.get("k_rate", 0.228),
-            "wrc_plus":      100.0,  # not stored currently, use default
-            "avg":           0.255,  # not stored, use default
-            "bb_rate":       0.082,
-            "woba":          p.get("xslg", 0.315) * 0.75,  # rough proxy
+            # Derive wRC+ from xSLG — compute_hits_score_for_player will also do this
+            # but we set it here so it's explicit
+            "wrc_plus":      max(40, min(220, 100 + (p.get("xslg", 0.398) - 0.398) / 0.005)),
+            "avg":           0.255,
+            "bb_rate":       p.get("bb_rate", 0.082),
+            "woba":          p.get("xslg", 0.398) * 0.78,  # xSLG → xwOBA proxy
             "hard_hit_rate": p.get("hard_hit_rate", 0.370),
             "slg_proxy":     p.get("xslg", 0.398),
         }
-        # Use wRC+ from original batter score sub-scores as proxy
-        # (not perfectly preserved but reasonable)
 
         h_score, h_prob, h_tier, h_details = compute_hits_score_for_player(
             batter_statcast=batter_mock,
@@ -2782,7 +2789,7 @@ def display_hits_tab(plays: List[Dict]):
     with col3: st.metric("📊 LIKELY", len(likely))
     with col4: st.metric("❌ SKIP", len(skip))
 
-    st.caption("Tier thresholds: SAFE+ 85+ | SAFE 75-84 | LIKELY 65-74 | SKIP <65")
+    st.caption("Tier thresholds: SAFE+ 78+ | SAFE 68-77 | LIKELY 58-67 | SKIP <58")
     st.markdown("---")
 
     # Filters
@@ -2996,6 +3003,822 @@ def display_hits_tab(plays: List[Dict]):
 # ============================================================================
 # MAIN APP
 # ============================================================================
+
+# ============================================================================
+# FAN DUEL DFS ENGINE
+# ============================================================================
+
+# FanDuel MLB Scoring (different from prop scoring — BB, SB, RBI, Runs all count)
+FD_SCORING = {
+    "single":    3.0,
+    "double":    6.0,
+    "triple":    9.0,
+    "hr":       12.0,
+    "rbi":       3.5,
+    "run":       3.2,
+    "bb":        3.0,   # KEY: walks count on FD, not in TB props
+    "hbp":       3.0,
+    "sb":        6.0,   # KEY: steals worth 6 pts — big differentiator
+    "cs":       -3.0,
+    "out":      -0.25,  # per out (AB - H - BB - HBP)
+}
+
+# FanDuel lineup structure
+FD_LINEUP = {
+    "P":  1,  # Pitcher (1 SP)
+    "C":  1,
+    "1B": 1,
+    "2B": 1,
+    "3B": 1,
+    "SS": 1,
+    "OF": 3,  # 3 outfielders
+    "UTIL": 1,  # any position except P
+}
+FD_SALARY_CAP = 35000
+FD_MIN_SALARY = 1000
+
+def compute_fd_projection(statcast: Dict, pitcher_statcast: Dict,
+                          lineup_slot: int, implied_total: float,
+                          batter_hand: str, sp_hand: str,
+                          park_team: str, weather: Dict) -> Dict:
+    """
+    Project FanDuel points for a batter.
+    Key differences from TB model:
+    - BB count (3 pts each)
+    - SB count (6 pts each)  
+    - RBI and Runs scored count
+    - Outs are slightly negative
+    """
+    def f(key, default):
+        try: return float(statcast.get(key, default))
+        except: return float(default)
+
+    # Plate appearance estimate by lineup slot
+    pa_by_slot = {1:4.8,2:4.7,3:4.6,4:4.5,5:4.3,6:4.2,7:4.1,8:3.9,9:3.8}
+    est_pa = pa_by_slot.get(lineup_slot, 4.2)
+
+    # Adjust PA for team implied total (high-scoring games = more AB)
+    if implied_total > 0:
+        pa_adj = (implied_total - 4.5) * 0.08  # ~0.08 extra PA per extra run
+        est_pa += pa_adj
+
+    # Key rates
+    k_rate    = f("k_rate",        0.228)
+    bb_rate   = f("bb_rate",       0.082)
+    slg       = f("slg_proxy",     0.398)
+    iso       = f("iso_proxy",     0.165)
+    woba      = f("woba",          0.315)
+    hard_hit  = f("hard_hit_rate", 0.370)
+    barrel    = f("barrel_rate",   0.070)
+
+    # Stolen base rate (proxy from speed — use sprint speed / 28 if available)
+    # Default ~0.05 SB per game for average runner
+    sb_rate = 0.05  # will be refined when sprint speed data added
+
+    # Estimate plate appearance outcomes
+    # Contact rate = 1 - K%
+    contact_rate = 1 - k_rate
+    # Hit rate estimate from wOBA and contact
+    hit_rate = max(0.180, woba * 0.85)  # rough proxy for AVG
+    # TB per hit
+    tb_per_hit = slg / max(0.01, hit_rate)
+    # Hit types
+    hr_per_pa  = barrel * 0.35  # barrels -> HRs
+    xbh_per_pa = (iso * 0.6) * contact_rate  # ISO -> XBH rate
+    single_per_pa = (hit_rate - hr_per_pa - xbh_per_pa) * max(0, 1)
+    single_per_pa = max(0, single_per_pa)
+
+    # Per PA estimates
+    hits_per_pa  = hit_rate
+    bb_per_pa    = bb_rate
+    sb_per_pa    = sb_rate
+    outs_per_pa  = max(0, 1 - hits_per_pa - bb_per_pa - 0.01)  # rough
+
+    # Apply park factor adjustment
+    park_hr  = PARK_HR_FACTORS.get(park_team, 1.0)
+    park_tb  = PARK_TB_FACTORS.get(park_team, 1.0)
+    hr_per_pa  *= park_hr
+    single_per_pa *= park_tb
+
+    # Apply weather adjustment
+    if not weather.get("is_dome"):
+        wind_effect = weather.get("wind_effect", "neutral")
+        if wind_effect == "strong_out":
+            hr_per_pa *= 1.25
+        elif wind_effect == "out":
+            hr_per_pa *= 1.15
+        elif wind_effect == "in":
+            hr_per_pa *= 0.80
+
+    # Pitcher quality adjustment
+    pit_k    = float(pitcher_statcast.get("k_rate_allowed", 0.228))
+    pit_hh   = float(pitcher_statcast.get("hard_hit_allowed", 0.340))
+    pit_fip  = float(pitcher_statcast.get("fip", 4.10))
+    pit_adj  = 1.0 + (pit_fip - 4.0) * 0.04  # FIP above 4 = better for batter
+    pit_k_adj = 1.0 - (pit_k - 0.228) * 1.5  # higher K = fewer hits
+    quality_adj = (pit_adj + pit_k_adj) / 2
+
+    hits_per_pa  *= quality_adj
+    hr_per_pa    *= quality_adj
+
+    # Scale to estimated PAs
+    proj_hits    = hits_per_pa * est_pa
+    proj_hr      = hr_per_pa * est_pa
+    proj_singles = max(0, single_per_pa * est_pa * quality_adj)
+    proj_xbh     = max(0, xbh_per_pa * est_pa * quality_adj)
+    proj_doubles = proj_xbh * 0.65
+    proj_triples = proj_xbh * 0.05
+    proj_bb      = bb_per_pa * est_pa
+    proj_sb      = sb_per_pa * est_pa
+    proj_outs    = outs_per_pa * est_pa
+
+    # RBI and Runs — function of team context and lineup slot
+    rbi_rate = 0.32 if lineup_slot <= 4 else 0.22
+    run_rate = 0.38 if lineup_slot <= 3 else 0.28 if lineup_slot <= 6 else 0.20
+    if implied_total > 0:
+        rbi_rate *= (implied_total / 4.5)
+        run_rate *= (implied_total / 4.5)
+    proj_rbi = proj_hits * rbi_rate + proj_hr * 1.0  # HR always = at least 1 RBI
+    proj_runs = proj_hits * run_rate + proj_hr * 1.0
+
+    # FanDuel points
+    fd_pts = (
+        proj_singles * FD_SCORING["single"] +
+        proj_doubles * FD_SCORING["double"] +
+        proj_triples * FD_SCORING["triple"] +
+        proj_hr      * FD_SCORING["hr"] +
+        proj_rbi     * FD_SCORING["rbi"] +
+        proj_runs    * FD_SCORING["run"] +
+        proj_bb      * FD_SCORING["bb"] +
+        proj_sb      * FD_SCORING["sb"] +
+        proj_outs    * FD_SCORING["out"]
+    )
+
+    # Ceiling (75th percentile) and floor (25th percentile)
+    variance = fd_pts * 0.45  # MLB has high variance
+    ceiling = fd_pts + variance
+    floor   = max(0, fd_pts - variance * 0.6)
+
+    return {
+        "fd_proj":    round(fd_pts, 1),
+        "fd_ceiling": round(ceiling, 1),
+        "fd_floor":   round(floor, 1),
+        "est_pa":     round(est_pa, 1),
+        "proj_hr":    round(proj_hr, 2),
+        "proj_hits":  round(proj_hits, 2),
+        "proj_bb":    round(proj_bb, 2),
+        "proj_sb":    round(proj_sb, 2),
+        "proj_rbi":   round(proj_rbi, 2),
+        "proj_runs":  round(proj_runs, 2),
+    }
+
+
+def compute_ownership_projection(
+    fd_proj: float, salary: int, implied_total: float,
+    lineup_slot: int, barrel_rate: float, name: str
+) -> float:
+    """
+    Project FanDuel ownership %.
+    Higher projection + lower salary = higher ownership.
+    Stars in high-total games are chalk.
+    """
+    if salary <= 0:
+        return 15.0  # default
+
+    # Value score (pts per $1000)
+    value = fd_proj / (salary / 1000)
+
+    # Base ownership from value
+    own = value * 4.5  # rough calibration
+
+    # Adjustments
+    if implied_total >= 5.5:
+        own *= 1.30  # high-total game = chalk
+    elif implied_total >= 5.0:
+        own *= 1.15
+    elif implied_total < 3.5:
+        own *= 0.70
+
+    if lineup_slot <= 2:
+        own *= 1.20  # leadoff/2-hole = more ownership
+    elif lineup_slot >= 7:
+        own *= 0.80
+
+    if barrel_rate > 0.15:
+        own *= 1.15  # power hitters owned more
+
+    # Cap
+    return round(min(60, max(3, own)), 1)
+
+
+def build_fd_lineups(
+    players: List[Dict],
+    num_lineups: int = 3,
+    mode: str = "gpp",  # "gpp" or "cash"
+    salary_cap: int = FD_SALARY_CAP
+) -> List[Dict]:
+    """
+    Build FanDuel lineups using a greedy optimizer.
+    GPP: maximize ceiling, differentiation, stacks
+    Cash: maximize floor/projection, avoid risk
+    """
+    if not players:
+        return []
+
+    # Filter players with salary
+    eligible = [p for p in players if p.get("fd_salary", 0) > 0]
+    if len(eligible) < 9:
+        return []
+
+    positions = ["P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"]
+
+    lineups = []
+    used_combos = set()
+
+    for lineup_num in range(num_lineups):
+        # Sort by target metric
+        if mode == "gpp":
+            # GPP: weight ceiling heavily, add differentiation
+            sort_key = lambda p: (
+                p["fd_ceiling"] * 0.6 +
+                p["fd_proj"] * 0.3 +
+                (1 / max(1, p.get("ownership", 15))) * 10  # leverage
+            )
+        else:
+            # Cash: pure floor + projection consistency
+            sort_key = lambda p: p["fd_floor"] * 0.4 + p["fd_proj"] * 0.6
+
+        sorted_players = sorted(eligible, key=sort_key, reverse=True)
+
+        lineup = {}
+        remaining_salary = salary_cap
+        filled_positions = set()
+        lineup_players = []
+        team_counts = {}
+
+        def can_play(player, pos):
+            player_pos = player.get("fd_position", "OF")
+            if pos == "UTIL":
+                return player_pos != "P"
+            if pos == "OF":
+                return player_pos in ("OF", "RF", "LF", "CF")
+            return player_pos == pos
+
+        # GPP: force a 4-man stack from a high-total game
+        if mode == "gpp" and lineup_num == 0:
+            # Find top game by implied total
+            top_games = {}
+            for p in eligible:
+                game = p.get("game_id", "")
+                team = p.get("team", "")
+                imp = p.get("implied_total", 0)
+                key = f"{game}_{team}"
+                if key not in top_games or imp > top_games[key]["implied"]:
+                    top_games[key] = {"implied": imp, "team": team, "game": game}
+
+            if top_games:
+                best_stack_team = max(top_games.values(), key=lambda x: x["implied"])["team"]
+                stack_players = [p for p in sorted_players
+                                 if p.get("team") == best_stack_team
+                                 and p.get("fd_position", "") != "P"][:4]
+                for sp in stack_players[:3]:
+                    # Add to lineup greedily
+                    for pos in ["OF", "1B", "2B", "3B", "SS", "C", "UTIL"]:
+                        if pos not in filled_positions and can_play(sp, pos):
+                            if remaining_salary - sp.get("fd_salary", 0) >= FD_MIN_SALARY * (9 - len(lineup_players) - 1):
+                                lineup_players.append({**sp, "slot": pos})
+                                filled_positions.add(pos)
+                                remaining_salary -= sp.get("fd_salary", 0)
+                                team_counts[sp["team"]] = team_counts.get(sp["team"], 0) + 1
+                                break
+
+        # Fill remaining slots
+        for pos in positions:
+            if pos in filled_positions:
+                continue
+            slots_left = len(positions) - len(lineup_players) - 1
+            min_remaining = FD_MIN_SALARY * slots_left
+
+            for p in sorted_players:
+                name = p["name"]
+                if any(lp["name"] == name for lp in lineup_players):
+                    continue
+                if not can_play(p, pos):
+                    continue
+                salary = p.get("fd_salary", 0)
+                if salary > remaining_salary - min_remaining:
+                    continue
+                # Ownership cap for GPP differentiation on lineups 2-3
+                if mode == "gpp" and lineup_num > 0:
+                    if p.get("ownership", 0) > 40:
+                        continue  # avoid mega-chalk on later lineups
+                lineup_players.append({**p, "slot": pos})
+                filled_positions.add(pos)
+                remaining_salary -= salary
+                team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
+                break
+
+        if len(lineup_players) >= 9:
+            total_sal = sum(p.get("fd_salary", 0) for p in lineup_players)
+            total_proj = sum(p["fd_proj"] for p in lineup_players)
+            total_ceil = sum(p["fd_ceiling"] for p in lineup_players)
+            total_floor = sum(p["fd_floor"] for p in lineup_players)
+
+            combo_key = tuple(sorted(p["name"] for p in lineup_players))
+            if combo_key not in used_combos:
+                used_combos.add(combo_key)
+                lineups.append({
+                    "players": lineup_players,
+                    "total_salary": total_sal,
+                    "total_proj": round(total_proj, 1),
+                    "total_ceiling": round(total_ceil, 1),
+                    "total_floor": round(total_floor, 1),
+                    "mode": mode,
+                    "stacks": {t: c for t, c in team_counts.items() if c >= 2},
+                })
+
+    return lineups
+
+
+def display_dfs_tab(plays: List[Dict]):
+    """
+    FanDuel DFS Optimizer tab.
+    GPP and Cash sections.
+    Salary input via text area (FD CSV paste or manual entry).
+    Auto-generates projections from prop model data.
+    """
+    st.header("🏆 FanDuel DFS Optimizer")
+    st.caption("FD scoring: 1B=3 | 2B=6 | 3B=9 | HR=12 | RBI=3.5 | R=3.2 | BB=3 | SB=6 | Out=-0.25")
+
+    if not plays:
+        st.info("Run the model first — DFS projections auto-generate from the same data.")
+        return
+
+    # ── SALARY INPUT ──────────────────────────────────────────────────────
+    st.subheader("💵 Salary Input")
+    st.caption("Paste FanDuel salary data below. Format: PlayerName,Position,Salary (one per line). Or upload FD CSV.")
+
+    col_sal, col_up = st.columns([3, 1])
+    with col_up:
+        uploaded = st.file_uploader("Upload FD CSV", type=["csv"], key="fd_csv_upload")
+
+    salary_data = {}
+
+    if uploaded:
+        try:
+            import io
+            df_upload = pd.read_csv(io.StringIO(uploaded.read().decode("utf-8")))
+            # FD CSV columns: Nickname, Position, Salary (or Name, Position, Salary)
+            name_col = next((c for c in df_upload.columns if c.lower() in ("nickname","name","player name","playername")), None)
+            pos_col  = next((c for c in df_upload.columns if c.lower() in ("position","pos")), None)
+            sal_col  = next((c for c in df_upload.columns if c.lower() in ("salary","sal")), None)
+            if name_col and sal_col:
+                for _, row in df_upload.iterrows():
+                    name = str(row[name_col]).strip()
+                    sal  = int(str(row[sal_col]).replace("$","").replace(",","").strip())
+                    pos  = str(row[pos_col]).strip().upper() if pos_col else "OF"
+                    salary_data[name] = {"salary": sal, "position": pos}
+                st.success(f"✅ Loaded {len(salary_data)} players from CSV")
+        except Exception as e:
+            st.error(f"CSV parse error: {e}")
+
+    with col_sal:
+        salary_text = st.text_area(
+            "Or paste manually (Name, Position, Salary):",
+            placeholder="Aaron Judge, OF, 4200\nPete Alonso, 1B, 3800\nFernando Tatis Jr, OF, 4000",
+            height=120,
+            key="fd_salary_text"
+        )
+        if salary_text.strip() and not salary_data:
+            for line in salary_text.strip().split("\n"):
+                parts = [x.strip() for x in line.split(",")]
+                if len(parts) >= 2:
+                    name = parts[0]
+                    try:
+                        if len(parts) == 3:
+                            pos = parts[1].upper()
+                            sal = int(parts[2].replace("$","").replace(",",""))
+                        else:
+                            pos = "OF"
+                            sal = int(parts[1].replace("$","").replace(",",""))
+                        salary_data[name] = {"salary": sal, "position": pos}
+                    except Exception:
+                        pass
+
+    has_salaries = len(salary_data) > 0
+    if has_salaries:
+        st.success(f"✅ {len(salary_data)} salaries loaded")
+    else:
+        st.warning("⚠️ No salaries loaded — projections will show without salary optimization")
+
+    st.markdown("---")
+
+    # ── COMPUTE FD PROJECTIONS ─────────────────────────────────────────────
+    fd_plays = []
+    for p in plays:
+        # Rebuild minimal stat dicts from stored play data
+        bat_mock = {
+            "k_rate":         p.get("k_rate",         0.228),
+            "bb_rate":        p.get("bb_rate",         0.082),
+            "slg_proxy":      p.get("xslg",            0.398),
+            "iso_proxy":      p.get("iso",             0.165),
+            "woba":           p.get("xslg", 0.398) * 0.78,
+            "hard_hit_rate":  p.get("hard_hit_rate",  0.370),
+            "barrel_rate":    p.get("barrel_rate",    0.070),
+            "sprint_speed":   p.get("sprint_speed",    27.0),
+        }
+        pit_mock = {
+            "k_rate_allowed":  0.228,
+            "hard_hit_allowed":0.340,
+            "fip":             4.10,
+        }
+        try:
+            pit_label = p.get("pitcher_label", "")
+            if "K%:" in pit_label:
+                pit_mock["k_rate_allowed"] = float(pit_label.split("K%:")[1].split("%")[0].strip()) / 100
+            if "FIP:" in pit_label:
+                pit_mock["fip"] = float(pit_label.split("FIP:")[1].strip().split()[0])
+        except Exception:
+            pass
+
+        fd_p = compute_fd_projection(
+            statcast=bat_mock,
+            pitcher_statcast=pit_mock,
+            lineup_slot=p.get("lineup_slot", 5),
+            implied_total=p.get("implied_total", 0),
+            batter_hand=p.get("batter_hand", "R"),
+            sp_hand=p.get("sp_hand", "R"),
+            park_team=p.get("park", p.get("team", "")),
+            weather=p.get("weather", {}),
+        )
+
+        # Match salary
+        salary = 0
+        position = "OF"
+        for sal_name, sal_data in salary_data.items():
+            if _norm(sal_name) == _norm(p["name"]) or _norm(p["name"]) in _norm(sal_name):
+                salary   = sal_data["salary"]
+                position = sal_data["position"]
+                break
+
+        value = round(fd_p["fd_proj"] / (salary / 1000), 2) if salary > 0 else 0.0
+        ownership = compute_ownership_projection(
+            fd_proj=fd_p["fd_proj"],
+            salary=salary,
+            implied_total=p.get("implied_total", 0),
+            lineup_slot=p.get("lineup_slot", 5),
+            barrel_rate=p.get("barrel_rate", 0.07),
+            name=p["name"],
+        )
+
+        fd_plays.append({
+            **p,
+            **fd_p,
+            "fd_salary":   salary,
+            "fd_position": position,
+            "fd_value":    value,
+            "ownership":   ownership,
+        })
+
+    fd_plays.sort(key=lambda x: x["fd_proj"], reverse=True)
+
+    # ── PROJECTIONS TABLE ─────────────────────────────────────────────────
+    st.subheader("📊 FD Projections — All Batters")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        min_proj = st.slider("Min projection", 0.0, 40.0, 5.0, 0.5, key="fd_min_proj")
+    with col_f2:
+        teams_fd = sorted(set(p["team"] for p in fd_plays))
+        team_fd_filter = st.multiselect("Filter team", teams_fd, default=[], key="fd_team_filter")
+
+    filtered_fd = [p for p in fd_plays
+                   if p["fd_proj"] >= min_proj
+                   and (not team_fd_filter or p["team"] in team_fd_filter)]
+
+    rows = []
+    for p in filtered_fd:
+        tbd = " ⚠️" if p.get("sp_tbd") else ""
+        rows.append({
+            "FD Proj": f"{p['fd_proj']:.1f}",
+            "Ceiling": f"{p['fd_ceiling']:.1f}",
+            "Floor":   f"{p['fd_floor']:.1f}",
+            "Player":  p["name"],
+            "Pos":     p.get("fd_position", "—"),
+            "Team":    p["team"],
+            "Sal":     f"${p['fd_salary']:,}" if p["fd_salary"] > 0 else "—",
+            "Value":   f"{p['fd_value']:.1f}x" if p["fd_value"] > 0 else "—",
+            "Own%":    f"{p['ownership']:.0f}%",
+            "Slot":    f"#{p['lineup_slot']}",
+            "Opp SP":  p["sp_name"][:16] + tbd,
+            "xSLG":    f"{p.get('xslg',0):.3f}" if p.get("xslg") else "—",
+            "K%":      f"{p.get('k_rate',0)*100:.1f}%" if p.get("k_rate") else "—",
+            "Park":    p.get("park",""),
+            "O1.5 Sc": f"{p['score']:.0f}",
+        })
+
+    if rows:
+        df_fd = pd.DataFrame(rows)
+
+        def color_proj(val):
+            try:
+                v = float(str(val))
+                if v >= 20: return "color: #00ff88; font-weight: bold"
+                elif v >= 14: return "color: #ffdd00; font-weight: bold"
+                elif v >= 9: return "color: #ff8800"
+                return ""
+            except: return ""
+
+        def color_own(val):
+            try:
+                v = float(str(val).replace("%",""))
+                if v <= 10: return "color: #00ff88"   # contrarian = green
+                elif v >= 35: return "color: #ff4444"  # chalk = red
+                return ""
+            except: return ""
+
+        def color_val(val):
+            try:
+                v = float(str(val).replace("x",""))
+                if v >= 4.0: return "color: #00ff88; font-weight: bold"
+                elif v >= 3.0: return "color: #ffdd00"
+                return ""
+            except: return ""
+
+        styled = (df_fd.style
+                  .applymap(color_proj, subset=["FD Proj","Ceiling"])
+                  .applymap(color_own,  subset=["Own%"])
+                  .applymap(color_val,  subset=["Value"]))
+        st.dataframe(styled, use_container_width=True, height=450)
+
+        csv_fd = df_fd.to_csv(index=False)
+        st.download_button("📥 Export FD Projections", csv_fd,
+                           f"fd_proj_{datetime.now(EST).strftime('%Y%m%d')}.csv", "text/csv")
+
+    st.markdown("---")
+
+    # ── GAME STACKS ───────────────────────────────────────────────────────
+    st.subheader("🔥 Top Game Stacks")
+    st.caption("GPP: stack 4-5 batters from the same high-total game for correlated upside")
+
+    # Group by game and score
+    game_groups = {}
+    for p in fd_plays:
+        gid = p.get("game_id", "")
+        team = p.get("team","")
+        key = f"{gid}_{team}"
+        if key not in game_groups:
+            game_groups[key] = {
+                "game":    f"{p.get('opponent','')}@{team}",
+                "team":    team,
+                "implied": p.get("implied_total", 0),
+                "players": [],
+            }
+        game_groups[key]["players"].append(p)
+
+    # Score each stack
+    stack_scores = []
+    for key, grp in game_groups.items():
+        players = sorted(grp["players"], key=lambda x: x["fd_proj"], reverse=True)
+        top4 = players[:4]
+        if len(top4) < 3:
+            continue
+        avg_proj = sum(p["fd_proj"] for p in top4) / len(top4)
+        avg_ceil = sum(p["fd_ceiling"] for p in top4) / len(top4)
+        stack_score = avg_proj * 0.5 + avg_ceil * 0.3 + grp["implied"] * 2
+        stack_scores.append({
+            "game":    grp["game"],
+            "team":    grp["team"],
+            "implied": grp["implied"],
+            "top4":    top4,
+            "avg_proj":  round(avg_proj, 1),
+            "avg_ceil":  round(avg_ceil, 1),
+            "score":     round(stack_score, 1),
+        })
+
+    stack_scores.sort(key=lambda x: x["score"], reverse=True)
+
+    for i, stack in enumerate(stack_scores[:3], 1):
+        imp_str = f"{stack['implied']:.1f}" if stack["implied"] > 0 else "—"
+        with st.expander(f"#{i} Stack: {stack['team']} ({stack['game']}) — Implied: {imp_str} runs | Avg Proj: {stack['avg_proj']:.1f} pts"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown(f"**4-man stack ({stack['team']}):**")
+                for p in stack["top4"][:4]:
+                    sal_str = f"${p['fd_salary']:,}" if p["fd_salary"] > 0 else "no salary"
+                    own_str = f"{p['ownership']:.0f}% own"
+                    st.write(f"• **{p['name']}** #{p['lineup_slot']} — {p['fd_proj']:.1f} proj | {sal_str} | {own_str}")
+            with col_b:
+                st.markdown("**Bring-back targets (opp team):**")
+                opp_team = stack["top4"][0].get("opponent","") if stack["top4"] else ""
+                bring_backs = [p for p in fd_plays if p["team"] == opp_team
+                               and p.get("implied_total", 0) > 3.5][:3]
+                for p in bring_backs:
+                    sal_str = f"${p['fd_salary']:,}" if p["fd_salary"] > 0 else "no salary"
+                    st.write(f"• {p['name']} — {p['fd_proj']:.1f} proj | {sal_str}")
+
+    st.markdown("---")
+
+    # ── GPP SECTION ──────────────────────────────────────────────────────
+    st.subheader("🎯 GPP Lineups (1-3 entries)")
+    st.caption("**GPP philosophy:** Maximize ceiling. Stack correlated batters. Leverage low-owned plays. Accept variance.")
+
+    # GPP strategy notes
+    with st.expander("📖 GPP Strategy Guide"):
+        st.markdown("""
+**Core GPP Principles:**
+- **Stack 4-5 batters** from same team in high-total game — correlated upside when team scores big
+- **Bring-back 1-2 batters** from the opposing team (wrap stack) — you win regardless of which team scores
+- **Avoid mega-chalk** (>35% owned) on lineups 2-3 — differentiation wins GPPs
+- **Target 15-25% owned** plays that have legit upside — the sweet spot
+
+**FanDuel vs DraftKings ownership gaps:**
+- High DK ownership players are often over-owned on FD — fade them
+- FD-specific value: contact hitters (BB count), speedsters (SB = 6 pts)
+- SP value: FD rewards Ks heavily — high-K SP in a weak lineup is GPP gold
+
+**SP fade triggers:**
+- Team implied total < 3.8 (low run environment)
+- Pitcher FIP > 5.0 (hittable, SP likely gets lit up)
+- Park with HR factor > 1.15 (against SP)
+- Heavy tailwind blowing out
+
+**Stack selection priority:**
+1. Game total > 9.5 (both teams score)
+2. Team implied > 5.0 (your stack team favored to score)
+3. Weak opposing SP (FIP > 4.5, K% < 20%)
+4. Hitter-friendly park (Coors, GABP, Camden)
+        """)
+
+    if has_salaries:
+        gpp_lineups = build_fd_lineups(fd_plays, num_lineups=3, mode="gpp")
+        if gpp_lineups:
+            for i, lu in enumerate(gpp_lineups, 1):
+                with st.expander(f"GPP Lineup #{i} — Proj: {lu['total_proj']:.1f} | Ceil: {lu['total_ceiling']:.1f} | Sal: ${lu['total_salary']:,}"):
+                    rows_lu = []
+                    for p in lu["players"]:
+                        rows_lu.append({
+                            "Slot": p.get("slot",""),
+                            "Player": p["name"],
+                            "Team": p["team"],
+                            "Pos": p.get("fd_position",""),
+                            "Salary": f"${p.get('fd_salary',0):,}",
+                            "Proj": f"{p['fd_proj']:.1f}",
+                            "Ceil": f"{p['fd_ceiling']:.1f}",
+                            "Own%": f"{p.get('ownership',0):.0f}%",
+                            "Opp SP": p.get("sp_name","")[:18],
+                        })
+                    st.dataframe(pd.DataFrame(rows_lu), use_container_width=True)
+                    stacks = lu.get("stacks", {})
+                    if stacks:
+                        stack_str = " | ".join([f"{t}: {c}-man" for t, c in stacks.items()])
+                        st.caption(f"🔗 Stacks: {stack_str}")
+                    # FD export format
+                    fd_export = ",".join(p["name"] for p in lu["players"])
+                    st.code(f"FD Import: {fd_export}", language=None)
+        else:
+            st.info("Need salaries loaded to build optimized lineups.")
+    else:
+        st.info("📥 Load FanDuel salaries above to generate optimized GPP lineups.")
+
+    st.markdown("---")
+
+    # ── CASH SECTION ─────────────────────────────────────────────────────
+    st.subheader("💵 Cash Lineups (50/50 & H2H)")
+    st.caption("**Cash philosophy:** Maximize floor. High-floor bats. Consistent SP. Avoid low-PA slots.")
+
+    with st.expander("📖 Cash Strategy Guide"):
+        st.markdown("""
+**Cash Game Rules:**
+- **Floor > ceiling** — you need 50th percentile, not 99th
+- **Target confirmed top-3 lineup slots** — guaranteed 4.5+ PA/game
+- **Avoid low-total games** — implied < 4.0 = fewer PA, fewer hits
+- **SP must be elite** — FIP < 3.5, K% > 25%, high strikeout game script
+- **No punt plays** — minimum viable salary on every spot (~$2,800+)
+- **Stack limit: 3 max** — correlation adds variance you don't want
+
+**High-floor indicators:**
+- wRC+ > 120 + low K% = almost always contributes
+- Leadoff/2-hole in high-implied lineup = most PA
+- RHB vs LHP platoon advantage = +33 SLG points
+- High BB% + low K% = PA completion = FD points even without hits
+        """)
+
+    if has_salaries:
+        cash_lineups = build_fd_lineups(fd_plays, num_lineups=1, mode="cash")
+        if cash_lineups:
+            lu = cash_lineups[0]
+            st.write(f"**Cash Lineup — Proj: {lu['total_proj']:.1f} | Floor: {lu['total_floor']:.1f} | Sal: ${lu['total_salary']:,}**")
+            rows_lu = []
+            for p in lu["players"]:
+                rows_lu.append({
+                    "Slot": p.get("slot",""),
+                    "Player": p["name"],
+                    "Team": p["team"],
+                    "Pos": p.get("fd_position",""),
+                    "Salary": f"${p.get('fd_salary',0):,}",
+                    "Proj": f"{p['fd_proj']:.1f}",
+                    "Floor": f"{p['fd_floor']:.1f}",
+                    "Own%": f"{p.get('ownership',0):.0f}%",
+                })
+            st.dataframe(pd.DataFrame(rows_lu), use_container_width=True)
+            fd_export = ",".join(p["name"] for p in lu["players"])
+            st.code(f"FD Import: {fd_export}", language=None)
+        else:
+            st.info("Need salaries loaded to build cash lineup.")
+    else:
+        st.info("📥 Load FanDuel salaries above to generate cash lineup.")
+
+    # ── SP TARGETS ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("⚾ SP Targets & Fades")
+    st.caption("FD SP scoring: W=6 | K=3 | IP=3 | ER=-3 | H=-0.6 | BB=-0.6")
+
+    # Get unique pitchers from plays
+    pitchers_seen = {}
+    for p in plays:
+        sp = p.get("sp_name","TBD")
+        if sp and sp != "TBD":
+            if sp not in pitchers_seen:
+                pitchers_seen[sp] = {
+                    "name": sp,
+                    "hand": p.get("sp_hand","R"),
+                    "team": p.get("opponent",""),
+                    "opp":  p.get("team",""),
+                    "park": p.get("park",""),
+                    "implied": p.get("implied_total",0),
+                    "pit_label": p.get("pitcher_label",""),
+                    "weather": p.get("weather",{}),
+                    "batters": [],
+                }
+            pitchers_seen[sp]["batters"].append(p)
+
+    sp_rows = []
+    for sp_name, sp_data in pitchers_seen.items():
+        batters = sp_data["batters"]
+        avg_opp_barrel = sum(b.get("barrel_rate",0.07) for b in batters) / max(1,len(batters))
+        avg_opp_k     = sum(b.get("k_rate",0.228) for b in batters) / max(1,len(batters))
+        opp_implied   = sum(b.get("implied_total",0) for b in batters) / max(1,len(batters))
+
+        # SP grade
+        grade = "✅ TARGET"
+        if opp_implied > 5.0: grade = "❌ FADE"
+        elif avg_opp_barrel > 0.12: grade = "⚠️ RISKY"
+        elif sp_data.get("weather",{}).get("wind_effect") == "strong_out": grade = "⚠️ RISKY"
+
+        # Extract FIP from pitcher label
+        fip_str = "—"
+        try:
+            pl = sp_data.get("pit_label","")
+            if "FIP:" in pl:
+                fip_str = pl.split("FIP:")[1].strip().split()[0]
+        except: pass
+
+        sp_rows.append({
+            "Grade": grade,
+            "SP": sp_name,
+            "Hand": sp_data["hand"],
+            "Opp": sp_data["opp"],
+            "Park": sp_data["park"],
+            "FIP": fip_str,
+            "Opp K%": f"{avg_opp_k*100:.0f}%",
+            "Opp Barrel%": f"{avg_opp_barrel*100:.1f}%",
+            "Opp Implied": f"{opp_implied:.1f}" if opp_implied > 0 else "—",
+        })
+
+    if sp_rows:
+        sp_df = pd.DataFrame(sp_rows).sort_values("Grade")
+        def color_sp_grade(val):
+            if "TARGET" in str(val): return "color: #00ff88; font-weight: bold"
+            elif "FADE" in str(val): return "color: #ff4444; font-weight: bold"
+            elif "RISKY" in str(val): return "color: #ffdd00"
+            return ""
+        styled_sp = sp_df.style.applymap(color_sp_grade, subset=["Grade"])
+        st.dataframe(styled_sp, use_container_width=True)
+
+    # ── VALUE PLAYS ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("💎 Value Plays (Under $2,500)")
+    st.caption("High projection relative to salary — GPP tournament differentiators")
+
+    if has_salaries:
+        values = [p for p in fd_plays
+                  if 0 < p["fd_salary"] <= 2500 and p["fd_proj"] >= 6.0]
+        values.sort(key=lambda x: x["fd_value"], reverse=True)
+
+        if values:
+            for p in values[:5]:
+                st.markdown(
+                    f"**{p['name']}** ({p['team']}, #{p['lineup_slot']}) — "
+                    f"${p['fd_salary']:,} | Proj: {p['fd_proj']:.1f} | "
+                    f"Value: {p['fd_value']:.1f}x | Own: {p['ownership']:.0f}%"
+                )
+        else:
+            st.info("No value plays found under $2,500 with proj ≥ 6.0. Load salaries to see values.")
+    else:
+        st.info("Load salaries to see value plays.")
+
+
 def display_results_tracker():
     """Display performance tracking and historical results."""
     st.header("📈 Results Tracker")
@@ -3239,12 +4062,13 @@ Free tier (500/mo) is more than enough.
     st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 O1.5 Leaderboard",
         "🎯 Tiered Breakdown",
         "💰 Parlay Builder",
         "🎯 O0.5 Any Hit",
         "💣 HR Plays",
+        "🏆 FanDuel DFS",
         "📈 Results Tracker",
     ])
     
@@ -3304,6 +4128,9 @@ Free tier (500/mo) is more than enough.
             st.info("Run the model first to see HR plays.")
 
     with tab6:
+        display_dfs_tab(st.session_state.plays if st.session_state.plays else [])
+
+    with tab7:
         display_results_tracker()
 
 
