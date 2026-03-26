@@ -391,11 +391,21 @@ def fetch_lineup(game_pk: int) -> Dict:
                 if position.get("abbreviation") == "P":
                     continue
                 
+                bat_hand = person.get("batSide", {}).get("code", "")
+                if not bat_hand or bat_hand == "?":
+                    # Boxscore sometimes omits batSide — try person details
+                    try:
+                        pr = requests.get(f"https://statsapi.mlb.com/api/v1/people/{player_id}",
+                                         params={"fields":"people,id,fullName,batSide"},
+                                         timeout=5)
+                        bat_hand = pr.json().get("people",[{}])[0].get("batSide",{}).get("code","R")
+                    except Exception:
+                        bat_hand = "R"  # fallback to R (most common)
                 batter = {
                     "player_id": str(player_id),
                     "name": person.get("fullName", f"Player {player_id}"),
                     "lineup_slot": slot_idx + 1,
-                    "batter_hand": person.get("batSide", {}).get("code", "?"),
+                    "batter_hand": bat_hand or "R",
                     "position": position.get("abbreviation", ""),
                 }
                 lineups[side].append(batter)
@@ -872,8 +882,34 @@ def get_batter_stats(player_name: str, mlb_id: str,
 
         # EV — exit velocity in mph
         ev = safe_get(row, 'EV', 'avg_exit_velocity', default=None)
-        if ev and ev > 50:  # sanity check
+        if ev and ev > 50:
             stats["exit_velocity_avg"] = ev
+
+        # Sweet spot% (launch angle 8-32 degrees) — key for HR model
+        sweet = safe_get(row, 'Sweetspot%', 'sweet_spot_percent', default=None)
+        if sweet is not None and sweet > 0:
+            stats["sweet_spot_rate"] = sweet if sweet < 1 else sweet / 100
+
+        # wRC+ — store explicitly for downstream O0.5/PP models
+        if wrc and wrc > 0:
+            stats["wrc_plus"] = float(wrc)
+
+        # 2026 recent form blending — if 2026 YTD stats available, blend 70/30
+        # 2026 columns have _2026 suffix after the outer join merge
+        xslg_2026 = safe_get(row, 'xSLG_2026', default=None)
+        if xslg_2026 and 0.100 < float(xslg_2026) < 1.000:
+            # 60% 2025 season + 40% 2026 YTD (recency weighted)
+            stats["slg_proxy"] = stats["slg_proxy"] * 0.60 + float(xslg_2026) * 0.40
+
+        barrel_2026 = safe_get(row, 'Barrel%_2026', default=None)
+        if barrel_2026 and float(barrel_2026) > 0:
+            b26 = float(barrel_2026) if float(barrel_2026) < 1 else float(barrel_2026) / 100
+            stats["barrel_rate"] = stats["barrel_rate"] * 0.65 + b26 * 0.35
+
+        k_2026 = safe_get(row, 'K%_2026', default=None)
+        if k_2026 and float(k_2026) > 0:
+            k26 = float(k_2026) if float(k_2026) < 1 else float(k_2026) / 100
+            stats["k_rate"] = stats["k_rate"] * 0.65 + k26 * 0.35
 
         stats["data_source"] = "fangraphs"
 
@@ -881,7 +917,9 @@ def get_batter_stats(player_name: str, mlb_id: str,
 
 def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
                       pitching_df: pd.DataFrame) -> Dict:
-    """Extract pitcher vulnerability stats from pre-loaded DataFrame."""
+    """Extract pitcher vulnerability stats from pre-loaded DataFrame.
+    Includes WHIP for O0.5 model and downstream parsing.
+    """
     stats = {
         "k_rate_allowed":   0.228,
         "bb_rate_allowed":  0.082,
@@ -890,15 +928,20 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         "era":              4.20,
         "fip":              4.10,
         "xfip":             4.10,
+        "whip":             1.30,
         "data_source":      "league_avg",
     }
-    
+
     row = find_player_row(pitching_df, pitcher_name, pitcher_mlb_id)
-    
+
     if row is not None:
         k = safe_get(row, 'K%', default=None)
         if k is not None and k > 0:
             stats["k_rate_allowed"] = k if k < 1 else k / 100
+
+        bb = safe_get(row, 'BB%', default=None)
+        if bb is not None and bb > 0:
+            stats["bb_rate_allowed"] = bb if bb < 1 else bb / 100
 
         hard = safe_get(row, 'Hard%', default=None)
         if hard is not None and hard > 0:
@@ -916,8 +959,12 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         if fip and 0 < fip < 20:
             stats["fip"] = fip
 
+        whip = safe_get(row, 'WHIP', default=None)
+        if whip and 0 < whip < 5:
+            stats["whip"] = whip
+
         stats["data_source"] = "fangraphs"
-    
+
     return stats
 
 
@@ -1167,29 +1214,30 @@ def compute_platoon_score(batter_hand: str, pitcher_hand: str) -> Tuple[float, s
     """
     Compute platoon matchup sub-score 0-100.
     Uses research-backed SLG adjustment values.
+    Handles L/R/B/S for batter (S = switch hitter from MLB API).
     """
-    if batter_hand == "L" and pitcher_hand == "R":
-        adj = PLATOON_ADJ["LHB_vs_RHP"]  # +56
-        score = 75.0
-        label = "LHB vs RHP (+56 SLG)"
-    elif batter_hand == "R" and pitcher_hand == "L":
-        adj = PLATOON_ADJ["RHB_vs_LHP"]  # +33
-        score = 65.0
-        label = "RHB vs LHP (+33 SLG)"
-    elif batter_hand == "L" and pitcher_hand == "L":
-        adj = PLATOON_ADJ["LHB_vs_LHP"]  # -35
-        score = 30.0
-        label = "LHB vs LHP (-35 wOBA)"
-    elif batter_hand == "B":  # Switch hitter
-        # Switch hitter always has platoon advantage
-        score = 65.0
-        label = "Switch hitter (platoon adv)"
+    # Normalize switch hitter codes (MLB API uses "S", some sources use "B")
+    bh = batter_hand.upper() if batter_hand else "R"
+    ph = pitcher_hand.upper() if pitcher_hand else "R"
+
+    if bh in ("B", "S"):  # Switch hitter — always bats opposite of pitcher
+        if ph == "R":
+            # Switch hitter bats LEFT vs RHP = best platoon advantage
+            return 75.0, "Switch hitter vs RHP (bats L, +56 SLG)"
+        elif ph == "L":
+            # Switch hitter bats RIGHT vs LHP = good platoon advantage
+            return 65.0, "Switch hitter vs LHP (bats R, +33 SLG)"
+        else:
+            return 60.0, "Switch hitter (platoon adv)"
+
+    if bh == "L" and ph == "R":
+        return 75.0, "LHB vs RHP (+56 SLG)"
+    elif bh == "R" and ph == "L":
+        return 65.0, "RHB vs LHP (+33 SLG)"
+    elif bh == "L" and ph == "L":
+        return 30.0, "LHB vs LHP (-35 wOBA)"
     else:
-        adj = 0
-        score = 50.0
-        label = "RHB vs RHP (neutral)"
-    
-    return score, label
+        return 50.0, "RHB vs RHP (neutral)"
 
 
 def compute_lineup_score(lineup_slot: int) -> Tuple[float, str]:
@@ -1290,6 +1338,8 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float,
     HIGH score = pitcher is hittable = good for batter TB.
     LOW score = elite pitcher = suppresses TB.
     Webb/Fried type = ~20-30. League avg pitcher = ~50. Mop-up arm = ~75+.
+    Blends SP stats (60%) with league-avg bullpen (40%) to account for
+    bullpen innings batters will face after SP exit.
     """
     def f(key, default):
         try: return float(statcast.get(key, default))
@@ -1300,36 +1350,41 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float,
     barrel   = f("barrel_allowed",   0.065)
     era      = f("era",              4.20)
     fip      = f("fip",              4.10)
+    whip     = f("whip",             1.30)
 
     # K% INVERSE — high K pitcher = low vulnerability
-    # Webb/Fried ~28-32% K → low vuln score
-    # 10% K = 100 vuln, 23% K = 50 vuln, 35%+ K = ~0 vuln
     k_vuln = max(0, min(100, (0.35 - k_rate) / (0.35 - 0.10) * 100))
 
-    # Hard hit allowed — higher = more vulnerable
-    # 28%=0, 36%=50, 50%=100
-    hh_vuln = (hard_hit - 0.28) / (0.50 - 0.28) * 100
-    hh_vuln = max(0, min(100, hh_vuln))
+    # Hard hit allowed
+    hh_vuln = max(0, min(100, (hard_hit - 0.28) / (0.50 - 0.28) * 100))
 
     # Barrel% allowed
-    # 3%=0, 7%=50, 14%=100
-    barrel_vuln = (barrel - 0.03) / (0.14 - 0.03) * 100
-    barrel_vuln = max(0, min(100, barrel_vuln))
+    barrel_vuln = max(0, min(100, (barrel - 0.03) / (0.14 - 0.03) * 100))
 
     # ERA/FIP quality
-    # 2.0=0, 4.20=50, 7.0=100
     era_use = fip if fip > 0 else era
-    era_vuln = (era_use - 2.0) / (7.0 - 2.0) * 100
-    era_vuln = max(0, min(100, era_vuln))
+    era_vuln = max(0, min(100, (era_use - 2.0) / (7.0 - 2.0) * 100))
 
-    composite = (
-        k_vuln      * 0.40 +   # K% most stable and predictive
-        hh_vuln     * 0.25 +   # hard hit quality allowed
-        barrel_vuln * 0.20 +   # barrel rate allowed
-        era_vuln    * 0.15     # FIP/ERA quality signal
+    # WHIP — contacts + walks per inning (new signal)
+    # 0.90=0, 1.30=50, 1.80=100
+    whip_vuln = max(0, min(100, (whip - 0.90) / (1.80 - 0.90) * 100))
+
+    # SP composite
+    sp_score = (
+        k_vuln      * 0.38 +
+        hh_vuln     * 0.22 +
+        barrel_vuln * 0.18 +
+        era_vuln    * 0.14 +
+        whip_vuln   * 0.08    # WHIP adds baserunner context
     )
 
-    return max(0, min(100, composite)), f"K%: {k_rate*100:.0f}% | HH%: {hard_hit*100:.0f}% | Barrel: {barrel*100:.1f}% | FIP: {era_use:.2f}"
+    # Bullpen blend: avg team bullpen FIP ~4.5, K% ~23%, WHIP ~1.35
+    # Batters see ~40% of PAs against bullpen (3-4 IP out of 9)
+    bp_vuln = 42.0  # league avg bullpen vulnerability
+    blended = sp_score * 0.60 + bp_vuln * 0.40
+
+    label = f"K%: {k_rate*100:.0f}% | WHIP: {whip:.2f} | FIP: {era_use:.2f}"
+    return max(0, min(100, blended)), label
 
 
 def compute_vegas_score(implied_total: float) -> Tuple[float, str]:
@@ -1880,6 +1935,8 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "barrel_rate": batter_statcast.get("barrel_rate", 0),
                 "hard_hit_rate": batter_statcast.get("hard_hit_rate", 0),
                 "k_rate": batter_statcast.get("k_rate", 0),
+                "bb_rate": batter_statcast.get("bb_rate", 0.082),
+                "wrc_plus": batter_statcast.get("wrc_plus", 100.0),
                 "iso": bat_details.get("ISO", 0),
                 "exit_velocity": batter_statcast.get("exit_velocity_avg", 0),
                 "sweet_spot_rate": batter_statcast.get("sweet_spot_rate", 0),
@@ -2779,12 +2836,11 @@ def display_hits_tab(plays: List[Dict]):
 
         batter_mock = {
             "k_rate":        p.get("k_rate", 0.228),
-            # Derive wRC+ from xSLG — compute_hits_score_for_player will also do this
-            # but we set it here so it's explicit
-            "wrc_plus":      max(40, min(220, 100 + (p.get("xslg", 0.398) - 0.398) / 0.005)),
+            # Use stored wRC+ if available, otherwise derive from xSLG
+            "wrc_plus":      p.get("wrc_plus") or max(40, min(220, 100 + (p.get("xslg", 0.398) - 0.398) / 0.005)),
             "avg":           0.255,
             "bb_rate":       p.get("bb_rate", 0.082),
-            "woba":          p.get("xslg", 0.398) * 0.78,  # xSLG → xwOBA proxy
+            "woba":          p.get("xslg", 0.398) * 0.78,
             "hard_hit_rate": p.get("hard_hit_rate", 0.370),
             "slg_proxy":     p.get("xslg", 0.398),
         }
@@ -4280,6 +4336,7 @@ def display_prizepicks_tab(plays: List[Dict]):
             "woba":          p.get("xslg", 0.398) * 0.78,
             "hard_hit_rate": p.get("hard_hit_rate",  0.370),
             "barrel_rate":   p.get("barrel_rate",    0.070),
+            "sweet_spot_rate": p.get("sweet_spot_rate", 0.305),
         }
         pit_mock = {"k_rate_allowed": 0.228, "fip": 4.10}
         try:
