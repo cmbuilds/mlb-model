@@ -88,9 +88,9 @@ DB_PATH = "mlb_tb_data.db"
 
 # Tier thresholds (calibrated for ~47% base rate)
 TIERS = {
-    "🔒 TIER 1": 85,
-    "✅ TIER 2": 75,
-    "📊 TIER 3": 65,
+    "🔒 TIER 1": 80,
+    "✅ TIER 2": 70,
+    "📊 TIER 3": 60,
     "❌ NO PLAY": 0,
 }
 
@@ -668,58 +668,77 @@ def _norm(s: str) -> str:
 def prepare_lookup_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Pre-process a DataFrame for fast player lookup.
-    Adds _norm_name column once. Call this ONCE before the scoring loop.
+    Adds _norm_name column. Converts xMLBAMID to string for fast matching.
+    Call this ONCE before the scoring loop.
     """
     if df is None or df.empty:
         return df
     df = df.copy()
+    
+    # Build normalized name index
     name_col = "_name" if "_name" in df.columns else next(
         (c for c in df.columns if c.lower() in ("name","playername")), None)
     if name_col and "_norm_name" not in df.columns:
         df["_norm_name"] = df[name_col].apply(_norm)
+    
+    # Pre-convert xMLBAMID to string int for fast matching
+    if "xMLBAMID" in df.columns:
+        df["xMLBAMID"] = df["xMLBAMID"].apply(
+            lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("", "nan", "None") else ""
+        )
+    
     return df
 
 def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str = "") -> Optional[pd.Series]:
     """
-    Fast player lookup using pre-built _norm_name index.
+    Fast player lookup. Priority:
+    1. xMLBAMID match (FanGraphs stores MLB MLBAM IDs — perfect crosswalk)
+    2. Exact normalized name match
+    3. Last name + first initial
     Requires prepare_lookup_df() to have been called first.
     """
     if df is None or df.empty or not player_name:
         return None
 
+    # 1. xMLBAMID match — most reliable (FanGraphs xMLBAMID = MLB MLBAM player_id)
+    if mlb_id and "xMLBAMID" in df.columns:
+        try:
+            m = df[df["xMLBAMID"].astype(str).str.split(".").str[0] == str(mlb_id)]
+            if not m.empty:
+                return m.iloc[0]
+        except Exception:
+            pass
+
+    # 2. _mlb_id fallback
+    if mlb_id and "_mlb_id" in df.columns:
+        try:
+            m = df[df["_mlb_id"].astype(str) == str(mlb_id)]
+            if not m.empty:
+                return m.iloc[0]
+        except Exception:
+            pass
+
+    # 3. Name match via pre-built _norm_name index
     norm = _norm(player_name)
     parts = norm.split()
     last  = parts[-1] if parts else ""
     first = parts[0]  if len(parts) > 1 else ""
 
     nc = "_norm_name" if "_norm_name" in df.columns else None
-    id_col = "_mlb_id" if "_mlb_id" in df.columns else None
-
     if nc:
-        # 1. Exact full name
         m = df[df[nc] == norm]
         if not m.empty:
             return m.iloc[0]
 
-        # 2. Last + first initial
         if last:
             cands = df[df[nc].str.contains(last, na=False, regex=False)]
             if not cands.empty:
                 if first:
-                    refined = cands[cands[nc].str.contains(first[:2], na=False, regex=False)]
+                    refined = cands[cands[nc].str.contains(first[:3], na=False, regex=False)]
                     if not refined.empty:
                         return refined.iloc[0]
                 if len(cands) == 1:
                     return cands.iloc[0]
-
-    # 3. ID fallback
-    if mlb_id and id_col:
-        try:
-            m = df[df[id_col].astype(str) == str(mlb_id)]
-            if not m.empty:
-                return m.iloc[0]
-        except Exception:
-            pass
 
     return None
 
@@ -1350,11 +1369,11 @@ def score_to_prob(score: float) -> float:
 
 def get_tier(score: float) -> str:
     """Map score to tier label."""
-    if score >= 85:
+    if score >= 80:
         return "🔒 TIER 1"
-    elif score >= 75:
+    elif score >= 70:
         return "✅ TIER 2"
-    elif score >= 65:
+    elif score >= 60:
         return "📊 TIER 3"
     else:
         return "❌ NO PLAY"
@@ -1653,14 +1672,17 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 sample_vals = []
                 if nc != "NONE":
                     sample_vals = batting_df[nc].head(3).tolist()
+                has_xmlbamid = "xMLBAMID" in batting_df.columns
+                xmlbam_sample = batting_df["xMLBAMID"].head(3).tolist() if has_xmlbamid else []
                 st.session_state["lookup_diag"] = {
-                    "searching_for": name,
+                    "searching_for": f"{name} (MLBAM id={player_id})",
                     "batting_df_rows": n_rows,
                     "name_col_used": nc,
-                    "first_3_vals": [str(v) for v in sample_vals],
-                    "_norm_name_exists": "_norm_name" in batting_df.columns,
-                    "_name_exists": "_name" in batting_df.columns,
+                    "first_3_norm_names": [str(v) for v in sample_vals],
+                    "xMLBAMID_exists": has_xmlbamid,
+                    "xMLBAMID_sample": [str(v) for v in xmlbam_sample],
                     "data_source": batter_statcast.get("data_source"),
+                    "matched": batter_statcast.get("data_source") == "fangraphs",
                 }
 
             # Store first 5 searched names for debug
@@ -1797,7 +1819,7 @@ def build_parlays(
     plays: List[Dict],
     num_legs: int = 3,
     max_same_team: int = 2,
-    min_score: float = 75.0
+    min_score: float = 70.0
 ) -> List[Dict]:
     """
     Build optimal parlays from eligible plays.
@@ -2598,7 +2620,7 @@ Free tier (500/mo) is more than enough.
             st.session_state.model_ran = True
             if plays:
                 save_picks_to_db(plays, date_str)
-                best_parlays = build_parlays(plays, 3, 1, 75.0)
+                best_parlays = build_parlays(plays, 3, 1, 70.0)
                 if best_parlays:
                     save_parlay_to_db(best_parlays[0], date_str)
                 st.rerun()
