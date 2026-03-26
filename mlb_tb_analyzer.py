@@ -1646,6 +1646,23 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 statcast_df=statcast_df,
             )
 
+            # DIAGNOSTIC: on first batter, show exactly what find_player_row sees
+            if not first_batter_logged:
+                nc = "_norm_name" if "_norm_name" in batting_df.columns else "_name" if "_name" in batting_df.columns else "NONE"
+                n_rows = len(batting_df)
+                sample_vals = []
+                if nc != "NONE":
+                    sample_vals = batting_df[nc].head(3).tolist()
+                st.session_state["lookup_diag"] = {
+                    "searching_for": name,
+                    "batting_df_rows": n_rows,
+                    "name_col_used": nc,
+                    "first_3_vals": [str(v) for v in sample_vals],
+                    "_norm_name_exists": "_norm_name" in batting_df.columns,
+                    "_name_exists": "_name" in batting_df.columns,
+                    "data_source": batter_statcast.get("data_source"),
+                }
+
             # Store first 5 searched names for debug
             if "_search_names" not in st.session_state:
                 st.session_state["_search_names"] = []
@@ -2522,7 +2539,9 @@ Free tier (500/mo) is more than enough.
                     st.warning("Low match rate — scores using league averages for unmatched players")
             
             # Show raw name samples from DataFrame so we can diagnose lookup failures
-            if "batting_df_sample" in st.session_state:
+            if "lookup_diag" in st.session_state:
+                st.markdown("**🔬 Live lookup diagnostic (first batter):**")
+                st.json(st.session_state.lookup_diag)
                 st.markdown("**Raw _name values in batting DataFrame (first 10):**")
                 st.code("\n".join(st.session_state.batting_df_sample))
             if "norm_name_sample" in st.session_state:
