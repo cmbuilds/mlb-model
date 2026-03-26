@@ -1522,6 +1522,48 @@ def compute_vegas_score(implied_total: float) -> Tuple[float, str]:
     return score, f"{implied_total:.1f} implied runs{flag}"
 
 
+def compute_weather_score(weather: Dict) -> Tuple[float, str]:
+    """
+    Compute weather sub-score 0-100.
+    Wind out = boost, Wind in = suppress, Dome = neutral baseline.
+    """
+    if not weather or weather.get("is_dome"):
+        return 50.0, "🏟️ Dome"
+
+    score = 50.0
+    notes = []
+
+    wind_effect = weather.get("wind_effect", "neutral")
+    wind_speed  = weather.get("wind_speed", 0)
+    temp        = weather.get("temperature", 70)
+    wind_label  = weather.get("wind_dir_label", "")
+
+    if wind_effect == "strong_out":
+        score += 25
+        notes.append(f"💨 {wind_speed}mph Out (+25)")
+    elif wind_effect == "out":
+        score += 15
+        notes.append(f"💨 {wind_speed}mph Out (+15)")
+    elif wind_effect == "in":
+        score -= 20
+        notes.append(f"💨 {wind_speed}mph In (-20)")
+    else:
+        notes.append(f"💨 {wind_speed}mph {wind_label}" if wind_speed else "💨 Calm")
+
+    if temp < 50:
+        adj = max(-15, -8 * (50 - temp) / 10)
+        score += adj
+        notes.append(f"🌡️ {temp:.0f}°F Cold ({adj:.0f})")
+    elif temp > 83:
+        adj = min(10, 5 * (temp - 83) / 10)
+        score += adj
+        notes.append(f"🌡️ {temp:.0f}°F Hot (+{adj:.0f})")
+    else:
+        notes.append(f"🌡️ {temp:.0f}°F")
+
+    return max(0, min(100, score)), " | ".join(notes)
+
+
 def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[float, str]:
     """
     Times Through Order (TTO) bonus.
@@ -1553,34 +1595,6 @@ def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[fl
     return score, label
 
 
-def compute_market_edge(model_prob: float, implied_total: float, team: str) -> Tuple[float, str]:
-    """
-    Calculate edge vs market.
-    Only actionable when model probability > implied probability by ≥5%.
-    Implied probability derived from team total and typical -115 vig.
-    """
-    # Typical O1.5 TB prop is priced at -115 to -140 implied
-    # Without specific prop odds, estimate from team total
-    # Higher team implied run total → books shade TB props toward higher prices
-    if implied_total >= 5.5:
-        market_implied = 0.56  # -127 equivalent
-    elif implied_total >= 4.5:
-        market_implied = 0.53  # -113 equivalent  
-    else:
-        market_implied = 0.50  # -100 equivalent (weak offense)
-    
-    edge = model_prob - market_implied
-    
-    if edge >= 0.10:
-        label = f"🔥 +{edge*100:.0f}% EDGE vs market"
-    elif edge >= 0.05:
-        label = f"✅ +{edge*100:.0f}% edge vs market"
-    elif edge >= 0:
-        label = f"~{edge*100:.0f}% edge (thin)"
-    else:
-        label = f"❌ {edge*100:.0f}% (model below market)"
-    
-    return edge, label
 
 
 def compute_final_score(
