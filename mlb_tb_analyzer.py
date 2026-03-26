@@ -3796,69 +3796,229 @@ Cal Raleigh, C, 3200
 
     # ── SP TARGETS ────────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("⚾ SP Targets & Fades")
-    st.caption("FD SP scoring: W=6 | K=3 | IP=3 | ER=-3 | H=-0.6 | BB=-0.6")
+    st.subheader("⚾ SP Targets & Projections")
+    st.caption("FD SP scoring: W=6 | QS=4 | K=3 | IP×3 | ER×-3 | H×-0.6 | BB×-0.6")
 
-    # Get unique pitchers from plays
+    # SP salary input
+    with st.expander("💵 SP Salary Input (paste Name, Salary)"):
+        sp_sal_text = st.text_area(
+            "SP salaries from FD CSV:",
+            placeholder="Paul Skenes, 10500\nGarrett Crochet, 9800\nCade Cavalli, 7200",
+            height=100, key="fd_sp_salary_text"
+        )
+    sp_salary_data = {}
+    if sp_sal_text.strip():
+        for line in sp_sal_text.strip().split("\n"):
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    sp_salary_data[_norm(parts[0])] = {"name": parts[0], "salary": int(parts[1].replace("$","").replace(",",""))}
+                except Exception:
+                    pass
+
+    # Build SP projections from pitching data
     pitchers_seen = {}
     for p in plays:
-        sp = p.get("sp_name","TBD")
+        sp = p.get("sp_name", "TBD")
         if sp and sp != "TBD":
             if sp not in pitchers_seen:
                 pitchers_seen[sp] = {
-                    "name": sp,
-                    "hand": p.get("sp_hand","R"),
-                    "team": p.get("opponent",""),
-                    "opp":  p.get("team",""),
-                    "park": p.get("park",""),
-                    "implied": p.get("implied_total",0),
+                    "name": sp, "hand": p.get("sp_hand","R"),
+                    "team": p.get("opponent",""), "opp": p.get("team",""),
+                    "park": p.get("park",""), "implied": p.get("implied_total",0),
                     "pit_label": p.get("pitcher_label",""),
-                    "weather": p.get("weather",{}),
-                    "batters": [],
+                    "weather": p.get("weather",{}), "batters": [],
                 }
             pitchers_seen[sp]["batters"].append(p)
 
-    sp_rows = []
-    for sp_name, sp_data in pitchers_seen.items():
-        batters = sp_data["batters"]
-        avg_opp_barrel = sum(b.get("barrel_rate",0.07) for b in batters) / max(1,len(batters))
-        avg_opp_k     = sum(b.get("k_rate",0.228) for b in batters) / max(1,len(batters))
-        opp_implied   = sum(b.get("implied_total",0) for b in batters) / max(1,len(batters))
+    def project_fd_sp(sp_data: Dict) -> Dict:
+        """
+        Project FanDuel SP fantasy points.
+        FD scoring: W=6, QS=4, K=3, IP×3, ER×-3, H×-0.6, BB×-0.6
+        Typical SP: 5-6 IP, 5-7 K, 2-3 ER → ~20-30 FD pts
+        Elite SP: 7+ IP, 8+ K, 0-1 ER → 40-55 FD pts
+        """
+        pl = sp_data.get("pit_label", "")
+        batters = sp_data.get("batters", [])
 
-        # SP grade
-        grade = "✅ TARGET"
-        if opp_implied > 5.0: grade = "❌ FADE"
-        elif avg_opp_barrel > 0.12: grade = "⚠️ RISKY"
-        elif sp_data.get("weather",{}).get("wind_effect") == "strong_out": grade = "⚠️ RISKY"
-
-        # Extract FIP from pitcher label
-        fip_str = "—"
+        # Extract stats from pitcher label
+        k_rate, fip, whip = 0.228, 4.10, 1.30
         try:
-            pl = sp_data.get("pit_label","")
+            if "K%:" in pl:
+                k_rate = float(pl.split("K%:")[1].split("%")[0].strip()) / 100
             if "FIP:" in pl:
-                fip_str = pl.split("FIP:")[1].strip().split()[0]
-        except: pass
+                fip = float(pl.split("FIP:")[1].strip().split()[0])
+            if "WHIP:" in pl:
+                whip = float(pl.split("WHIP:")[1].strip().split()[0])
+        except Exception:
+            pass
 
-        sp_rows.append({
-            "Grade": grade,
-            "SP": sp_name,
-            "Hand": sp_data["hand"],
-            "Opp": sp_data["opp"],
-            "Park": sp_data["park"],
-            "FIP": fip_str,
-            "Opp K%": f"{avg_opp_k*100:.0f}%",
-            "Opp Barrel%": f"{avg_opp_barrel*100:.1f}%",
-            "Opp Implied": f"{opp_implied:.1f}" if opp_implied > 0 else "—",
+        opp_implied = sum(b.get("implied_total",0) for b in batters) / max(1,len(batters))
+        opp_k = sum(b.get("k_rate",0.228) for b in batters) / max(1,len(batters))
+
+        # Project IP: elite pitchers go deeper
+        # FIP <3.0 → 6.5 IP avg, FIP 3-4 → 5.8 IP, FIP 4-5 → 5.2 IP, FIP 5+ → 4.5 IP
+        if fip < 3.0:   proj_ip = 6.5
+        elif fip < 3.5: proj_ip = 6.2
+        elif fip < 4.0: proj_ip = 5.8
+        elif fip < 4.5: proj_ip = 5.4
+        else:           proj_ip = 4.8
+
+        # Adjust for opponent implied total (weak opp = deeper outing)
+        if opp_implied > 0:
+            proj_ip *= max(0.85, 1.0 - (opp_implied - 4.5) * 0.04)
+
+        # Project Ks: k_rate × batters faced (≈ IP × 3.3)
+        bf = proj_ip * 3.3
+        proj_k = k_rate * bf
+
+        # Project ER from FIP (FIP is an ERA estimator)
+        proj_er = (fip / 9) * proj_ip
+        proj_er = max(0, proj_er)
+
+        # Project H and BB from WHIP
+        proj_h_bb = whip * proj_ip
+        proj_h  = proj_h_bb * 0.70
+        proj_bb = proj_h_bb * 0.30
+
+        # Win probability (rough — home pitcher, low FIP, low opp implied)
+        win_prob = 0.50
+        if fip < 3.5 and opp_implied < 4.0: win_prob = 0.65
+        elif fip > 4.5 or opp_implied > 5.0: win_prob = 0.35
+
+        # QS probability (6+ IP, ≤3 ER)
+        qs_prob = 0.70 if proj_ip >= 5.8 and proj_er <= 3.0 else 0.35
+
+        # FD points
+        fd_pts = (
+            proj_k    * 3.0 +
+            proj_ip   * 3.0 +
+            proj_er   * -3.0 +
+            proj_h    * -0.6 +
+            proj_bb   * -0.6 +
+            win_prob  * 6.0 +
+            qs_prob   * 4.0
+        )
+
+        # Ceiling and floor
+        variance = fd_pts * 0.40
+        ceiling  = fd_pts + variance
+        floor    = max(0, fd_pts - variance * 0.6)
+
+        # FD grade
+        if fip < 3.2 and opp_implied < 4.0:
+            grade = "🔒 ACE"
+        elif fip < 3.8 and opp_implied < 4.5:
+            grade = "✅ TARGET"
+        elif opp_implied > 5.0 or fip > 4.8:
+            grade = "❌ FADE"
+        else:
+            grade = "⚠️ RISKY"
+
+        return {
+            "fd_sp_proj":    round(fd_pts, 1),
+            "fd_sp_ceiling": round(ceiling, 1),
+            "fd_sp_floor":   round(floor, 1),
+            "proj_ip":       round(proj_ip, 1),
+            "proj_k":        round(proj_k, 1),
+            "proj_er":       round(proj_er, 1),
+            "win_prob":      round(win_prob * 100, 0),
+            "qs_prob":       round(qs_prob * 100, 0),
+            "fip":           fip,
+            "k_rate":        k_rate,
+            "opp_implied":   opp_implied,
+            "grade":         grade,
+        }
+
+    sp_data_list = []
+    for sp_name, sp_data in pitchers_seen.items():
+        proj = project_fd_sp(sp_data)
+        sal_match = sp_salary_data.get(_norm(sp_name), {})
+        salary = sal_match.get("salary", 0)
+        value  = round(proj["fd_sp_proj"] / (salary / 1000), 2) if salary > 0 else 0.0
+        sp_data_list.append({
+            **sp_data, **proj,
+            "fd_sp_salary": salary,
+            "fd_sp_value":  value,
         })
 
-    if sp_rows:
-        sp_df = pd.DataFrame(sp_rows).sort_values("Grade")
+    sp_data_list.sort(key=lambda x: x["fd_sp_proj"], reverse=True)
+
+    if sp_data_list:
+        # Top pick and value pick callouts
+        top_sp    = sp_data_list[0]
+        value_sp  = max([s for s in sp_data_list if s["fd_sp_salary"] > 0],
+                        key=lambda x: x["fd_sp_value"]) if any(s["fd_sp_salary"] > 0 for s in sp_data_list) else None
+        targets   = [s for s in sp_data_list if "ACE" in s["grade"] or "TARGET" in s["grade"]]
+        fades     = [s for s in sp_data_list if "FADE" in s["grade"]]
+
+        col_ts1, col_ts2 = st.columns(2)
+        with col_ts1:
+            st.markdown(f"**⭐ Top SP Target:** {top_sp['name']} ({top_sp['team']}) "
+                        f"— {top_sp['fd_sp_proj']:.1f} proj | Ceil: {top_sp['fd_sp_ceiling']:.1f} | "
+                        f"FIP: {top_sp['fip']:.2f} | {top_sp['proj_k']:.0f} proj K")
+        with col_ts2:
+            if value_sp:
+                st.markdown(f"**💎 Top Value SP:** {value_sp['name']} ({value_sp['team']}) "
+                            f"— {value_sp['fd_sp_proj']:.1f} proj | ${value_sp['fd_sp_salary']:,} | "
+                            f"Value: {value_sp['fd_sp_value']:.1f}x")
+            else:
+                if fades:
+                    st.markdown(f"**❌ Top Fade:** {fades[0]['name']} — opp implied {fades[0]['opp_implied']:.1f}, FIP {fades[0]['fip']:.2f}")
+
+        # Full SP table
+        sp_rows = []
+        for s in sp_data_list:
+            sp_rows.append({
+                "Grade":    s["grade"],
+                "SP":       s["name"],
+                "Hand":     s["hand"],
+                "Opp":      s["opp"],
+                "Park":     s["park"],
+                "FD Proj":  f"{s['fd_sp_proj']:.1f}",
+                "Ceiling":  f"{s['fd_sp_ceiling']:.1f}",
+                "Floor":    f"{s['fd_sp_floor']:.1f}",
+                "FIP":      f"{s['fip']:.2f}",
+                "K%":       f"{s['k_rate']*100:.0f}%",
+                "Proj K":   f"{s['proj_k']:.0f}",
+                "Proj IP":  f"{s['proj_ip']:.1f}",
+                "Win%":     f"{s['win_prob']:.0f}%",
+                "QS%":      f"{s['qs_prob']:.0f}%",
+                "Opp Imp":  f"{s['opp_implied']:.1f}" if s['opp_implied'] > 0 else "—",
+                "Salary":   f"${s['fd_sp_salary']:,}" if s["fd_sp_salary"] > 0 else "—",
+                "Value":    f"{s['fd_sp_value']:.1f}x" if s["fd_sp_value"] > 0 else "—",
+            })
+
+        sp_df = pd.DataFrame(sp_rows)
+
         def color_sp_grade(val):
-            if "TARGET" in str(val): return "color: #00ff88; font-weight: bold"
-            elif "FADE" in str(val): return "color: #ff4444; font-weight: bold"
-            elif "RISKY" in str(val): return "color: #ffdd00"
+            if "ACE" in str(val):    return "color: #00ff88; font-weight: bold"
+            if "TARGET" in str(val): return "color: #66dd88; font-weight: bold"
+            if "FADE" in str(val):   return "color: #ff4444; font-weight: bold"
+            if "RISKY" in str(val):  return "color: #ffdd00"
             return ""
-        styled_sp = sp_df.style.applymap(color_sp_grade, subset=["Grade"])
+
+        def color_sp_proj(val):
+            try:
+                v = float(str(val))
+                if v >= 35: return "color: #00ff88; font-weight: bold"
+                elif v >= 25: return "color: #ffdd00"
+                elif v < 15: return "color: #ff4444"
+                return ""
+            except: return ""
+
+        def color_sp_val(val):
+            try:
+                v = float(str(val).replace("x",""))
+                if v >= 4.0: return "color: #00ff88; font-weight: bold"
+                elif v >= 3.0: return "color: #ffdd00"
+                return ""
+            except: return ""
+
+        styled_sp = (sp_df.style
+                     .applymap(color_sp_grade, subset=["Grade"])
+                     .applymap(color_sp_proj,  subset=["FD Proj","Ceiling"])
+                     .applymap(color_sp_val,   subset=["Value"]))
         st.dataframe(styled_sp, use_container_width=True)
 
     # ── VALUE PLAYS ───────────────────────────────────────────────────────
@@ -3882,6 +4042,7 @@ Cal Raleigh, C, 3200
             st.info("No value plays found under $2,500 with proj ≥ 6.0. Load salaries to see values.")
     else:
         st.info("Load salaries to see value plays.")
+
 
 
 # ============================================================================
