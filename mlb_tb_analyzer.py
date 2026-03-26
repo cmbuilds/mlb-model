@@ -1323,6 +1323,67 @@ def compute_vegas_score(implied_total: float) -> Tuple[float, str]:
     return score, f"{implied_total:.1f} implied runs{flag}"
 
 
+def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[float, str]:
+    """
+    Times Through Order (TTO) bonus.
+    Research-backed: 2nd TTO +8 wOBA, 3rd TTO +17-20 wOBA vs 1st TTO.
+    Estimate TTO based on lineup slot and typical SP innings.
+    
+    Typical SP: 6 IP = 18 batters faced = ~2 times through
+    Slot 1-3: likely 3 TTO (top order faces SP most)
+    Slot 4-6: likely 2-3 TTO
+    Slot 7-9: likely 2 TTO
+    """
+    # Estimate TTO based on lineup position and typical SP workload
+    if lineup_slot <= 3:
+        # Top of order: 3 PA = 3rd TTO territory
+        tto_boost = 0.60  # Normalized boost (3rd TTO = +20 wOBA)
+        label = "3rd TTO boost (+20 wOBA)"
+    elif lineup_slot <= 6:
+        # Middle: 2-3 TTO
+        tto_boost = 0.45
+        label = "2-3rd TTO (~+12 wOBA)"
+    else:
+        # Bottom: mostly 2nd TTO
+        tto_boost = 0.25
+        label = "2nd TTO (+8 wOBA)"
+    
+    # Convert wOBA boost to 0-100 score contribution
+    # +20 wOBA ≈ +15 points on our 0-100 scale for top of order
+    score = tto_boost * 25  # 0-15 point bonus
+    return score, label
+
+
+def compute_market_edge(model_prob: float, implied_total: float, team: str) -> Tuple[float, str]:
+    """
+    Calculate edge vs market.
+    Only actionable when model probability > implied probability by ≥5%.
+    Implied probability derived from team total and typical -115 vig.
+    """
+    # Typical O1.5 TB prop is priced at -115 to -140 implied
+    # Without specific prop odds, estimate from team total
+    # Higher team implied run total → books shade TB props toward higher prices
+    if implied_total >= 5.5:
+        market_implied = 0.56  # -127 equivalent
+    elif implied_total >= 4.5:
+        market_implied = 0.53  # -113 equivalent  
+    else:
+        market_implied = 0.50  # -100 equivalent (weak offense)
+    
+    edge = model_prob - market_implied
+    
+    if edge >= 0.10:
+        label = f"🔥 +{edge*100:.0f}% EDGE vs market"
+    elif edge >= 0.05:
+        label = f"✅ +{edge*100:.0f}% edge vs market"
+    elif edge >= 0:
+        label = f"~{edge*100:.0f}% edge (thin)"
+    else:
+        label = f"❌ {edge*100:.0f}% (model below market)"
+    
+    return edge, label
+
+
 def compute_final_score(
     batter_score: float,
     pitcher_vuln_score: float,
@@ -1331,23 +1392,23 @@ def compute_final_score(
     park_score: float,
     weather_score: float,
     vegas_score: float,
+    tto_bonus: float = 0.0,
 ) -> float:
     """
-    Final weighted composite. Calibrated so:
-    - League avg batter vs league avg pitcher = ~50
-    - Elite batter vs bad pitcher, good park/weather/Vegas = 85+
-    - Elite batter vs elite pitcher, bad park = 55-65
+    Final weighted composite. Research-calibrated weights.
+    TTO bonus added as additional signal on top of base score.
     """
     raw = (
-        batter_score      * 0.45 +
-        pitcher_vuln_score* 0.30 +
+        batter_score      * 0.43 +   # Slightly reduced to make room for TTO
+        pitcher_vuln_score* 0.28 +   # Slightly reduced
         platoon_score     * 0.06 +
         lineup_score      * 0.04 +
         park_score        * 0.07 +
         weather_score     * 0.03 +
-        vegas_score       * 0.05
+        vegas_score       * 0.05 +
+        tto_bonus         * 0.04    # TTO: 4% weight — research-backed signal
     )
-    # Calibration offset: raw league-avg matchup ≈ 42 → target 52
+    # Calibration offset: raw league-avg matchup → target ~52
     calibrated = raw + 10.0
     return max(0, min(100, round(calibrated, 1)))
 
@@ -1722,12 +1783,13 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             lineup_sc, lineup_label = compute_lineup_score(lineup_slot)
             park_sc, park_label = compute_park_score(park_team, True)
             weather_sc, weather_label = compute_weather_score(weather)
-            implied = implied_totals.get(team, 4.5)
+            implied = implied_totals.get(team, 0)
             vegas_sc, vegas_label = compute_vegas_score(implied)
+            tto_sc, tto_label = compute_tto_bonus(lineup_slot)
 
             final_score = compute_final_score(
                 bat_score, pit_score, plat_score, lineup_sc,
-                park_sc, weather_sc, vegas_sc
+                park_sc, weather_sc, vegas_sc, tto_sc
             )
 
             # Caps & flags
@@ -1739,6 +1801,9 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
             prob = score_to_prob(final_score)
             tier = get_tier(final_score)
+
+            # Market edge calculation
+            market_edge, edge_label = compute_market_edge(prob, implied, team)
 
             hr_score = compute_hr_score(
                 barrel_rate=batter_statcast.get("barrel_rate", 0.07),
@@ -1769,6 +1834,9 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "weather": weather,
                 "weather_label": weather_label,
                 "implied_total": implied,
+                "market_edge": round(market_edge * 100, 1),  # as percentage
+                "edge_label": edge_label,
+                "tto_label": tto_label,
                 "platoon_label": plat_label,
                 "lineup_label": lineup_label,
                 "pitcher_label": pit_label,
@@ -1987,6 +2055,7 @@ def display_leaderboard(plays: List[Dict]):
             "Opp SP": p["sp_name"][:20] + tbd_flag,
             "SP 🤚": p["sp_hand"],
             "Prob": f"{p['prob']*100:.0f}%",
+            "Edge": f"{p.get('market_edge', 0):+.0f}%" if p.get('implied_total', 0) > 0 else "—",
             "xSLG": f"{p['xslg']:.3f}" if p["xslg"] else "—",
             "Barrel%": f"{p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "—",
             "HH%": f"{p['hard_hit_rate']*100:.1f}%" if p["hard_hit_rate"] else "—",
@@ -1995,7 +2064,7 @@ def display_leaderboard(plays: List[Dict]):
             "Park": p["park"],
             f"Wind{wind_icon}": p["weather_label"].split("|")[0].strip() if "|" in p["weather_label"] else p["weather_label"],
             "°F": f"{p['temperature']:.0f}°",
-            "Imp.Runs": f"{p['implied_total']:.1f}",
+            "Imp.Runs": f"{p['implied_total']:.1f}" if p.get('implied_total', 0) > 0 else "—",
             "HR Score": f"{p['hr_score']:.0f}",
         })
     
@@ -2015,14 +2084,26 @@ def display_leaderboard(plays: List[Dict]):
         def color_score(val):
             try:
                 v = float(str(val))
-                if v >= 85: return "color: #00ff88; font-weight: bold"
-                elif v >= 75: return "color: #ffdd00; font-weight: bold"
-                elif v >= 65: return "color: #ff8800"
+                if v >= 80: return "color: #00ff88; font-weight: bold"
+                elif v >= 70: return "color: #ffdd00; font-weight: bold"
+                elif v >= 60: return "color: #ff8800"
                 return "color: #888888"
             except:
                 return ""
-        
+
+        def color_edge(val):
+            try:
+                v = float(str(val).replace("%","").replace("+",""))
+                if v >= 10: return "color: #ff4444; font-weight: bold"
+                elif v >= 5: return "color: #00ff88; font-weight: bold"
+                elif v >= 0: return "color: #ffdd00"
+                return "color: #888888"
+            except:
+                return ""
+
         styled = df.style.applymap(color_tier, subset=["Tier"]).applymap(color_score, subset=["Score"])
+        if "Edge" in df.columns:
+            styled = styled.applymap(color_edge, subset=["Edge"])
         st.dataframe(styled, use_container_width=True, height=500)
         
         # Export button
