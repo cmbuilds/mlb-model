@@ -3884,6 +3884,572 @@ Cal Raleigh, C, 3200
         st.info("Load salaries to see value plays.")
 
 
+# ============================================================================
+# PRIZEPICKS ENGINE
+# ============================================================================
+
+# PrizePicks MLB Hitter Fantasy Score (confirmed from official scoring)
+PP_SCORING = {
+    "single":  3.0,
+    "double":  5.0,
+    "triple":  8.0,
+    "hr":     10.0,   # Note: 10 on PP vs 12 on FD
+    "run":     2.0,   # Note: 2 on PP vs 3.2 on FD
+    "rbi":     2.0,   # Note: 2 on PP vs 3.5 on FD
+    "bb":      2.0,   # Note: 2 on PP vs 3 on FD
+    "hbp":     2.0,
+    "sb":      5.0,   # Note: 5 on PP vs 6 on FD
+    # No out penalty on PP (vs -0.25 on FD)
+}
+
+# PP payout multipliers
+PP_PAYOUTS = {
+    "power": {2: 3.0, 3: 5.0, 4: 10.0, 5: 20.0, 6: 25.0},
+    "flex":  {2: 3.0, 3: 2.25, 4: 5.0, 5: 10.0, 6: 25.0},  # flex allows 1-2 misses
+}
+
+
+def compute_pp_projection(statcast: Dict, pitcher_statcast: Dict,
+                          lineup_slot: int, implied_total: float,
+                          batter_hand: str, sp_hand: str,
+                          park_team: str, weather: Dict) -> Dict:
+    """
+    Project PrizePicks hitter fantasy score.
+    Identical pipeline to FD but uses PP scoring values.
+    Key differences: no out penalty, lower HR/RBI/Run/BB/SB values.
+    """
+    def f(key, default):
+        try: return float(statcast.get(key, default))
+        except: return float(default)
+
+    # PA estimate by slot
+    pa_by_slot = {1:4.8,2:4.7,3:4.6,4:4.5,5:4.3,6:4.2,7:4.1,8:3.9,9:3.8}
+    est_pa = pa_by_slot.get(lineup_slot, 4.2)
+    if implied_total > 0:
+        est_pa += (implied_total - 4.5) * 0.08
+
+    k_rate   = f("k_rate",        0.228)
+    bb_rate  = f("bb_rate",       0.082)
+    slg      = f("slg_proxy",     0.398)
+    iso      = f("iso_proxy",     0.165)
+    woba     = f("woba",          0.315)
+    hard_hit = f("hard_hit_rate", 0.370)
+    barrel   = f("barrel_rate",   0.070)
+    # Sprint speed proxy for SB (default avg runner ~0.05 SB/game)
+    # Will be refined when sprint speed data added; power hitters ~0.02, speedsters ~0.15
+    sb_rate  = max(0, min(0.20, (iso - 0.100) * -0.3 + 0.05))  # inverse of ISO = more speed
+
+    hit_rate   = max(0.180, woba * 0.85)
+    hr_per_pa  = barrel * 0.35
+    xbh_per_pa = iso * 0.6 * (1 - k_rate)
+    single_per_pa = max(0, hit_rate - hr_per_pa - xbh_per_pa)
+    doubles_per_pa = xbh_per_pa * 0.65
+    triples_per_pa = xbh_per_pa * 0.05
+
+    # Park adjustments
+    park_hr = PARK_HR_FACTORS.get(park_team, 1.0)
+    park_tb = PARK_TB_FACTORS.get(park_team, 1.0)
+    hr_per_pa  *= park_hr
+    single_per_pa *= park_tb
+
+    # Weather
+    if not weather.get("is_dome"):
+        we = weather.get("wind_effect", "neutral")
+        if we == "strong_out": hr_per_pa *= 1.25
+        elif we == "out":      hr_per_pa *= 1.15
+        elif we == "in":       hr_per_pa *= 0.80
+
+    # Pitcher quality
+    pit_k   = float(pitcher_statcast.get("k_rate_allowed", 0.228))
+    pit_fip = float(pitcher_statcast.get("fip", 4.10))
+    quality_adj = 1.0 + (pit_fip - 4.0) * 0.04
+    k_adj       = 1.0 - (pit_k - 0.228) * 1.5
+    adj = (quality_adj + k_adj) / 2
+
+    # Scale to PA
+    proj_hr      = hr_per_pa * est_pa * adj
+    proj_singles = single_per_pa * est_pa * adj
+    proj_doubles = doubles_per_pa * est_pa * adj
+    proj_triples = triples_per_pa * est_pa * adj
+    proj_bb      = bb_rate * est_pa
+    proj_sb      = sb_rate * est_pa
+
+    # RBI and Runs
+    rbi_rate = (0.32 if lineup_slot <= 4 else 0.22) * (implied_total / 4.5 if implied_total > 0 else 1.0)
+    run_rate = (0.38 if lineup_slot <= 3 else 0.28 if lineup_slot <= 6 else 0.20) * (implied_total / 4.5 if implied_total > 0 else 1.0)
+    proj_rbi  = proj_singles * rbi_rate + proj_doubles * rbi_rate * 1.3 + proj_hr * 1.0
+    proj_runs = (proj_singles + proj_doubles + proj_hr) * run_rate + proj_hr * 1.0
+
+    # PrizePicks fantasy score
+    pp_pts = (
+        proj_singles * PP_SCORING["single"] +
+        proj_doubles * PP_SCORING["double"] +
+        proj_triples * PP_SCORING["triple"] +
+        proj_hr      * PP_SCORING["hr"] +
+        proj_rbi     * PP_SCORING["rbi"] +
+        proj_runs    * PP_SCORING["run"] +
+        proj_bb      * PP_SCORING["bb"] +
+        proj_sb      * PP_SCORING["sb"]
+        # No out penalty on PrizePicks
+    )
+
+    # Ceiling (high game) and floor (low game)
+    variance = pp_pts * 0.55  # PP has high game-to-game variance
+    ceiling  = pp_pts + variance
+    floor    = max(0, pp_pts - variance * 0.55)
+
+    return {
+        "pp_proj":    round(pp_pts, 1),
+        "pp_ceiling": round(ceiling, 1),
+        "pp_floor":   round(floor, 1),
+        "est_pa":     round(est_pa, 1),
+        "proj_hr":    round(proj_hr, 2),
+        "proj_hits":  round(proj_singles + proj_doubles + proj_triples + proj_hr, 2),
+        "proj_bb":    round(proj_bb, 2),
+        "proj_sb":    round(proj_sb, 2),
+    }
+
+
+def compute_pp_ev(proj: float, line: float, mode: str = "power", legs: int = 2) -> Dict:
+    """
+    Calculate EV for a PrizePicks More/Less pick.
+    Uses normal approximation for win probability given projection vs line.
+    """
+    import math
+    # Win probability: how often does player exceed the line?
+    # Use logistic approximation: larger edge = higher win prob
+    edge = proj - line
+    # Scale: 1 point edge ~ 8% win probability shift from 50%
+    z = edge / max(0.5, proj * 0.25)  # normalize by projection scale
+    win_prob = 1 / (1 + math.exp(-z * 1.5))
+    win_prob = max(0.30, min(0.78, win_prob))  # realistic MLB prop range
+
+    payout = PP_PAYOUTS.get(mode, PP_PAYOUTS["power"]).get(legs, 3.0)
+    # EV = win_prob * payout - (1 - win_prob) * 1.0
+    ev = win_prob * payout - (1 - win_prob)
+    ev_pct = (ev - 1) * 100  # as % above breakeven
+
+    direction = "MORE" if proj > line else "LESS"
+    if proj < line:
+        win_prob = 1 - win_prob  # flip for LESS
+
+    return {
+        "direction": direction,
+        "win_prob":  round(win_prob * 100, 1),
+        "ev_pct":    round(ev_pct, 1),
+        "edge_pts":  round(edge, 1),
+        "payout":    payout,
+    }
+
+
+def display_prizepicks_tab(plays: List[Dict]):
+    """
+    PrizePicks Hitter Fantasy Score tab.
+    Projects PP score for every batter, compares to posted PP lines.
+    Shows MORE/LESS recommendation with EV calculation.
+    """
+    st.header("🎯 PrizePicks — Hitter Fantasy Score")
+    st.caption(
+        "PP Scoring: 1B=3 | 2B=5 | 3B=8 | HR=10 | R=2 | RBI=2 | BB=2 | SB=5 | No out penalty"
+    )
+
+    if not plays:
+        st.info("Run the model first — PP projections auto-generate from the same data.")
+        return
+
+    # ── PP LINE INPUT ─────────────────────────────────────────────────────
+    st.subheader("📋 PrizePicks Lines Input")
+    col_up, col_txt = st.columns([1, 3])
+
+    pp_lines = {}
+
+    with col_up:
+        st.caption("Upload PP board screenshot data")
+        uploaded_pp = st.file_uploader("Upload CSV (Name, Line)", type=["csv"], key="pp_csv_upload")
+        if uploaded_pp:
+            try:
+                import io
+                df_pp = pd.read_csv(io.StringIO(uploaded_pp.read().decode("utf-8")), header=None)
+                for _, row in df_pp.iterrows():
+                    if len(row) >= 2:
+                        name = str(row[0]).strip()
+                        try:
+                            line = float(str(row[1]).strip())
+                            pp_lines[_norm(name)] = {"name": name, "line": line}
+                        except Exception:
+                            pass
+                st.success(f"✅ {len(pp_lines)} PP lines loaded")
+            except Exception as e:
+                st.error(f"Parse error: {e}")
+
+    with col_txt:
+        pp_text = st.text_area(
+            "Or paste PP lines (Name, Line — one per line):",
+            placeholder="Oneil Cruz, 7.5\nJuan Soto, 5.5\nBrandon Lowe, 5.0\nFrancisco Lindor, 5.0\nBo Bichette, 5.5",
+            height=130,
+            key="pp_lines_text",
+        )
+        if pp_text.strip() and not pp_lines:
+            for line_str in pp_text.strip().split("\n"):
+                parts = [x.strip() for x in line_str.split(",")]
+                if len(parts) >= 2:
+                    try:
+                        name = parts[0]
+                        val  = float(parts[1])
+                        pp_lines[_norm(name)] = {"name": name, "line": val}
+                    except Exception:
+                        pass
+
+    has_lines = len(pp_lines) > 0
+    if has_lines:
+        st.success(f"✅ {len(pp_lines)} PP lines loaded — edge comparison active")
+    else:
+        st.info("💡 Paste PP lines above to activate edge comparison. Projections show without lines too.")
+
+    st.markdown("---")
+
+    # ── COMPUTE PP PROJECTIONS ────────────────────────────────────────────
+    pp_plays = []
+    for p in plays:
+        bat_mock = {
+            "k_rate":        p.get("k_rate",        0.228),
+            "bb_rate":       p.get("bb_rate",        0.082),
+            "slg_proxy":     p.get("xslg",           0.398),
+            "iso_proxy":     p.get("iso",            0.165),
+            "woba":          p.get("xslg", 0.398) * 0.78,
+            "hard_hit_rate": p.get("hard_hit_rate",  0.370),
+            "barrel_rate":   p.get("barrel_rate",    0.070),
+        }
+        pit_mock = {"k_rate_allowed": 0.228, "fip": 4.10}
+        try:
+            pl = p.get("pitcher_label", "")
+            if "K%:" in pl:
+                pit_mock["k_rate_allowed"] = float(pl.split("K%:")[1].split("%")[0].strip()) / 100
+            if "FIP:" in pl:
+                pit_mock["fip"] = float(pl.split("FIP:")[1].strip().split()[0])
+        except Exception:
+            pass
+
+        pp_p = compute_pp_projection(
+            statcast=bat_mock, pitcher_statcast=pit_mock,
+            lineup_slot=p.get("lineup_slot", 5),
+            implied_total=p.get("implied_total", 0),
+            batter_hand=p.get("batter_hand", "R"),
+            sp_hand=p.get("sp_hand", "R"),
+            park_team=p.get("park", p.get("team", "")),
+            weather=p.get("weather", {}),
+        )
+
+        # Match PP line
+        pp_line = None
+        norm_name = _norm(p["name"])
+        if norm_name in pp_lines:
+            pp_line = pp_lines[norm_name]["line"]
+        else:
+            # Fuzzy: last name match
+            for k, v in pp_lines.items():
+                if norm_name.split()[-1] in k or k.split()[-1] in norm_name:
+                    pp_line = v["line"]
+                    break
+
+        # Edge calculation
+        ev_data = compute_pp_ev(pp_p["pp_proj"], pp_line) if pp_line else None
+
+        pp_plays.append({
+            **p,
+            **pp_p,
+            "pp_line":   pp_line,
+            "pp_ev":     ev_data,
+            "pp_edge":   round(pp_p["pp_proj"] - pp_line, 1) if pp_line else None,
+        })
+
+    # Sort: plays with lines first (by edge), then by projection
+    pp_plays_with_lines = sorted(
+        [p for p in pp_plays if p["pp_line"] is not None],
+        key=lambda x: abs(x["pp_edge"] or 0), reverse=True
+    )
+    pp_plays_no_lines = sorted(
+        [p for p in pp_plays if p["pp_line"] is None],
+        key=lambda x: x["pp_proj"], reverse=True
+    )
+    pp_plays_sorted = pp_plays_with_lines + pp_plays_no_lines
+
+    # ── EDGE SUMMARY ──────────────────────────────────────────────────────
+    if has_lines:
+        more_plays = [p for p in pp_plays_with_lines if p.get("pp_ev", {}) and p["pp_ev"]["direction"] == "MORE" and p["pp_ev"]["ev_pct"] > 0]
+        less_plays = [p for p in pp_plays_with_lines if p.get("pp_ev", {}) and p["pp_ev"]["direction"] == "LESS" and p["pp_ev"]["ev_pct"] > 0]
+        strong     = [p for p in pp_plays_with_lines if p.get("pp_ev", {}) and p["pp_ev"]["ev_pct"] >= 15]
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1: st.metric("⬆️ MORE plays", len(more_plays))
+        with col2: st.metric("⬇️ LESS plays", len(less_plays))
+        with col3: st.metric("🔥 Strong edge (15%+ EV)", len(strong))
+        with col4: st.metric("📋 Lines loaded", len(pp_lines))
+
+        if strong:
+            st.success(f"🔥 **{len(strong)} strong edge plays** — model projection significantly differs from PP line")
+
+        # Power play EV calculator
+        with st.expander("💰 Power Play vs Flex Play EV Calculator"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                num_legs_pp = st.radio("Legs", [2, 3, 4, 5, 6], index=1, horizontal=True, key="pp_legs")
+                play_mode   = st.radio("Mode", ["Power Play", "Flex Play"], horizontal=True, key="pp_mode")
+            with col_b:
+                mode_key = "power" if "Power" in play_mode else "flex"
+                payout   = PP_PAYOUTS[mode_key].get(num_legs_pp, 3.0)
+                break_even = 1 / payout
+                st.metric("Payout multiplier", f"{payout}x")
+                st.metric("Breakeven win% per leg", f"{break_even*100:.1f}%")
+                st.caption(f"Each leg needs >{break_even*100:.0f}% win probability to be +EV")
+
+    st.markdown("---")
+
+    # ── FILTERS ────────────────────────────────────────────────────────────
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        show_mode = st.radio("Show", ["All players", "Lines matched only", "MORE only", "LESS only"],
+                             horizontal=False, key="pp_show_mode")
+    with col_f2:
+        teams_pp = sorted(set(p["team"] for p in pp_plays_sorted))
+        team_pp_filter = st.multiselect("Filter team", teams_pp, default=[], key="pp_team_f")
+    with col_f3:
+        min_proj = st.slider("Min PP projection", 0.0, 20.0, 2.0, 0.5, key="pp_min_proj")
+
+    filtered_pp = pp_plays_sorted
+    if show_mode == "Lines matched only":
+        filtered_pp = [p for p in filtered_pp if p["pp_line"] is not None]
+    elif show_mode == "MORE only":
+        filtered_pp = [p for p in filtered_pp if p.get("pp_ev") and p["pp_ev"]["direction"] == "MORE"]
+    elif show_mode == "LESS only":
+        filtered_pp = [p for p in filtered_pp if p.get("pp_ev") and p["pp_ev"]["direction"] == "LESS"]
+
+    filtered_pp = [p for p in filtered_pp
+                   if p["pp_proj"] >= min_proj
+                   and (not team_pp_filter or p["team"] in team_pp_filter)]
+
+    st.markdown(f"**Showing {len(filtered_pp)} players**")
+
+    # ── PROJECTIONS TABLE ─────────────────────────────────────────────────
+    rows = []
+    for p in filtered_pp:
+        ev = p.get("pp_ev")
+        tbd = " ⚠️" if p.get("sp_tbd") else ""
+
+        rows.append({
+            "PP Proj":   f"{p['pp_proj']:.1f}",
+            "Ceiling":   f"{p['pp_ceiling']:.1f}",
+            "Floor":     f"{p['pp_floor']:.1f}",
+            "Player":    p["name"],
+            "Team":      p["team"],
+            "Slot":      f"#{p['lineup_slot']}",
+            "Opp SP":    p["sp_name"][:16] + tbd,
+            "PP Line":   f"{p['pp_line']:.1f}" if p["pp_line"] else "—",
+            "Edge":      f"{p['pp_edge']:+.1f}" if p["pp_edge"] is not None else "—",
+            "Pick":      ev["direction"] if ev else "—",
+            "Win%":      f"{ev['win_prob']:.0f}%" if ev else "—",
+            "EV%":       f"{ev['ev_pct']:+.0f}%" if ev else "—",
+            "xSLG":      f"{p.get('xslg',0):.3f}" if p.get("xslg") else "—",
+            "K%":        f"{p.get('k_rate',0)*100:.1f}%" if p.get("k_rate") else "—",
+            "Park":      p.get("park",""),
+            "O1.5 Sc":   f"{p['score']:.0f}",
+        })
+
+    if rows:
+        df_pp = pd.DataFrame(rows)
+
+        def color_pick(val):
+            if val == "MORE": return "color: #00ff88; font-weight: bold"
+            if val == "LESS": return "color: #ff6666; font-weight: bold"
+            return ""
+
+        def color_pp_edge(val):
+            try:
+                v = float(str(val).replace("+",""))
+                if v >= 1.5:  return "color: #00ff88; font-weight: bold"
+                elif v >= 0.5: return "color: #66dd88"
+                elif v >= 0:   return "color: #ffdd00"
+                elif v >= -0.5: return "color: #ff9944"
+                return "color: #ff4444"
+            except: return ""
+
+        def color_ev(val):
+            try:
+                v = float(str(val).replace("+","").replace("%",""))
+                if v >= 20:  return "color: #00ff88; font-weight: bold"
+                elif v >= 10: return "color: #66dd88"
+                elif v >= 0:  return "color: #ffdd00"
+                return "color: #ff4444"
+            except: return ""
+
+        def color_pp_proj(val):
+            try:
+                v = float(str(val))
+                if v >= 10:   return "color: #00ff88; font-weight: bold"
+                elif v >= 7:  return "color: #ffdd00; font-weight: bold"
+                elif v >= 5:  return "color: #ff8800"
+                return ""
+            except: return ""
+
+        styled = (df_pp.style
+                  .applymap(color_pick,    subset=["Pick"])
+                  .applymap(color_pp_edge, subset=["Edge"])
+                  .applymap(color_ev,      subset=["EV%"])
+                  .applymap(color_pp_proj, subset=["PP Proj", "Ceiling"]))
+
+        st.dataframe(styled, use_container_width=True, height=500)
+
+        csv_pp = df_pp.to_csv(index=False)
+        st.download_button("📥 Export PP Analysis", csv_pp,
+                           f"pp_picks_{datetime.now(EST).strftime('%Y%m%d')}.csv", "text/csv")
+
+    # ── TOP EDGE PLAYS DETAIL ─────────────────────────────────────────────
+    if has_lines:
+        st.markdown("---")
+        st.subheader("🔥 Top Edge Plays — Full Breakdown")
+        top_edge = sorted(
+            [p for p in filtered_pp if p.get("pp_ev") and abs(p["pp_edge"] or 0) >= 0.5],
+            key=lambda x: x["pp_ev"]["ev_pct"], reverse=True
+        )[:6]
+
+        for p in top_edge:
+            ev = p["pp_ev"]
+            arrow = "⬆️" if ev["direction"] == "MORE" else "⬇️"
+            with st.expander(
+                f"{arrow} **{p['name']}** ({p['team']}) — {ev['direction']} {p['pp_line']:.1f} | "
+                f"Our proj: {p['pp_proj']:.1f} | Edge: {p['pp_edge']:+.1f} | EV: {ev['ev_pct']:+.0f}%"
+            ):
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    st.markdown("**PP Projection**")
+                    st.metric("Our projection", f"{p['pp_proj']:.1f}")
+                    st.metric("PP line", f"{p['pp_line']:.1f}")
+                    st.metric("Edge", f"{p['pp_edge']:+.1f} pts")
+                with col_b:
+                    st.markdown("**Range**")
+                    st.metric("Ceiling", f"{p['pp_ceiling']:.1f}")
+                    st.metric("Floor", f"{p['pp_floor']:.1f}")
+                    st.metric("Win prob", f"{ev['win_prob']:.0f}%")
+                with col_c:
+                    st.markdown("**Context**")
+                    st.write(f"• SP: {p['sp_name']} ({p['sp_hand']}HP)")
+                    st.write(f"• Lineup: #{p['lineup_slot']}, {p['batter_hand']}HB")
+                    st.write(f"• Park: {p.get('park_label', p.get('park',''))}")
+                    st.write(f"• Implied: {p.get('implied_total',0):.1f} runs" if p.get('implied_total',0) > 0 else "• Implied: —")
+                    st.write(f"• O1.5 TB Score: {p['score']:.0f}")
+                st.info(f"📱 **PP Pick:** {ev['direction']} {p['pp_line']:.1f} Hitter Fantasy Score — {ev['win_prob']:.0f}% win prob | {ev['ev_pct']:+.0f}% EV")
+
+    # ── LINEUP BUILDER ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📱 PP Lineup Builder (2-6 picks)")
+    st.caption("PrizePicks: pick 2-6 players More/Less. Power Play = all correct. Flex = can miss 1-2.")
+
+    col_lb1, col_lb2 = st.columns(2)
+    with col_lb1:
+        lineup_legs = st.radio("Lineup size", [2, 3, 4, 5, 6], index=1, horizontal=True, key="pp_lu_legs")
+        lineup_mode = st.radio("Play type", ["Power Play", "Flex Play"], horizontal=True, key="pp_lu_mode")
+    with col_lb2:
+        mode_k = "power" if "Power" in lineup_mode else "flex"
+        payout_lu = PP_PAYOUTS[mode_k].get(lineup_legs, 3.0)
+        st.metric("Payout if win", f"{payout_lu}x your entry")
+        breakeven_lu = round(100 / payout_lu, 1)
+        st.caption(f"Need >{breakeven_lu}% on each leg to be +EV")
+
+    # Auto-suggest best lineup
+    if has_lines:
+        best_pp = sorted(
+            [p for p in filtered_pp if p.get("pp_ev") and p["pp_ev"]["ev_pct"] > 0],
+            key=lambda x: x["pp_ev"]["ev_pct"], reverse=True
+        )
+        # Diversify: max 2 per team
+        suggested, team_ct = [], {}
+        for p in best_pp:
+            if len(suggested) >= lineup_legs:
+                break
+            if team_ct.get(p["team"], 0) >= 2:
+                continue
+            suggested.append(p)
+            team_ct[p["team"]] = team_ct.get(p["team"], 0) + 1
+
+        if len(suggested) >= 2:
+            st.markdown(f"**⭐ Auto-suggested {lineup_legs}-pick {lineup_mode}:**")
+            combined_wp = 1.0
+            for p in suggested:
+                ev = p["pp_ev"]
+                combined_wp *= ev["win_prob"] / 100
+                arrow = "⬆️ MORE" if ev["direction"] == "MORE" else "⬇️ LESS"
+                st.markdown(
+                    f"• **{p['name']}** ({p['team']}) — {arrow} **{p['pp_line']:.1f}** | "
+                    f"Proj: {p['pp_proj']:.1f} | Win%: {ev['win_prob']:.0f}%"
+                )
+            combined_pct = combined_wp * 100
+            ev_total = combined_wp * payout_lu - (1 - combined_wp)
+            col_r1, col_r2, col_r3 = st.columns(3)
+            with col_r1: st.metric("Combined win prob", f"{combined_pct:.1f}%")
+            with col_r2: st.metric("Expected payout", f"{payout_lu}x")
+            with col_r3: st.metric("EV", f"{(ev_total-1)*100:+.0f}%")
+            # PP formatted output
+            pp_out = " | ".join([f"{p['name']} {p['pp_ev']['direction']} {p['pp_line']:.1f}" for p in suggested])
+            st.code(f"PrizePicks: {pp_out}", language=None)
+    else:
+        st.info("Load PP lines above to get auto-suggested lineups with EV calculations.")
+
+    # Manual picker
+    with st.expander("🔧 Manual Lineup Builder"):
+        all_opts = [
+            f"{p['name']} ({p['team']}) — Proj: {p['pp_proj']:.1f}" +
+            (f" | {p['pp_ev']['direction']} {p['pp_line']:.1f}" if p.get("pp_ev") else "")
+            for p in filtered_pp
+        ]
+        selected_manual = st.multiselect("Pick 2-6 players:", all_opts, key="pp_manual_select")
+        if len(selected_manual) >= 2:
+            manual_plays = []
+            for sel in selected_manual:
+                name_part = sel.split(" (")[0]
+                match = next((p for p in pp_plays if p["name"] == name_part), None)
+                if match:
+                    manual_plays.append(match)
+            if len(manual_plays) >= 2:
+                direction_choices = {}
+                for p in manual_plays:
+                    default_dir = p["pp_ev"]["direction"] if p.get("pp_ev") else "MORE"
+                    direction_choices[p["name"]] = st.radio(
+                        f"{p['name']} ({p.get('pp_proj',0):.1f} proj):",
+                        ["MORE", "LESS"], index=0 if default_dir == "MORE" else 1,
+                        horizontal=True, key=f"pp_dir_{p['name']}"
+                    )
+                pp_manual_out = " | ".join([
+                    f"{p['name']} {direction_choices[p['name']]} {p['pp_line']:.1f}"
+                    if p.get("pp_line") else f"{p['name']} {direction_choices[p['name']]}"
+                    for p in manual_plays
+                ])
+                st.code(f"PrizePicks: {pp_manual_out}", language=None)
+
+    # ── HOW TO GET PP LINES ───────────────────────────────────────────────
+    with st.expander("📱 How to get PrizePicks lines (30 seconds)"):
+        st.markdown("""
+**Fastest method:**
+1. Open PrizePicks app → MLB → Hitter Fantasy Score
+2. Screenshot the board
+3. Manually note: `PlayerName, Line` for your targets
+4. Paste above ↑
+
+**What you see in the screenshots:**
+- Oneil Cruz: 7.5 | Juan Soto: 5.5 | Brandon Lowe: 5.0
+- Francisco Lindor: 5.0 | Bo Bichette: 5.5 | Ryan O'Hearn: 4.5
+
+**PrizePicks line-setting logic:**
+PP sets lines based on Vegas implied totals + their own model. They're not always sharp — 
+that's where our edge comes from. When our projection differs by 1.0+ points, that's meaningful.
+
+**Power Play vs Flex Play:**
+- **Power Play:** All picks correct → higher payout (3x for 2 picks, 5x for 3)
+- **Flex Play:** Can miss 1-2 → lower payout but safer
+- For 2-3 leg plays with strong edge: Power Play is better EV
+- For 4-6 legs: Flex Play reduces variance significantly
+        """)
+
+
 def display_results_tracker():
     """Display performance tracking and historical results."""
     st.header("📈 Results Tracker")
@@ -4127,13 +4693,14 @@ Free tier (500/mo) is more than enough.
     st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 O1.5 Leaderboard",
         "🎯 Tiered Breakdown",
         "💰 Parlay Builder",
         "🎯 O0.5 Any Hit",
         "💣 HR Plays",
         "🏆 FanDuel DFS",
+        "🎯 PrizePicks",
         "📈 Results Tracker",
     ])
     
@@ -4196,6 +4763,9 @@ Free tier (500/mo) is more than enough.
         display_dfs_tab(st.session_state.plays if st.session_state.plays else [])
 
     with tab7:
+        display_prizepicks_tab(st.session_state.plays if st.session_state.plays else [])
+
+    with tab8:
         display_results_tracker()
 
 
