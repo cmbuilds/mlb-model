@@ -1823,6 +1823,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "lineup_slot": lineup_slot,
                 "lineup_confirmed": batter.get("lineup_confirmed", True),
                 "batter_hand": batter_hand,
+                "batter_position": batter.get("position", ""),
                 "sp_name": sp_name,
                 "sp_hand": sp_hand,
                 "sp_tbd": sp_tbd,
@@ -2094,10 +2095,10 @@ def display_leaderboard(plays: List[Dict]):
         def color_edge(val):
             try:
                 v = float(str(val).replace("%","").replace("+",""))
-                if v >= 10: return "color: #ff4444; font-weight: bold"
-                elif v >= 5: return "color: #00ff88; font-weight: bold"
-                elif v >= 0: return "color: #ffdd00"
-                return "color: #888888"
+                if v >= 10: return "color: #00ff88; font-weight: bold"   # strong positive = green
+                elif v >= 5: return "color: #66dd88; font-weight: bold"  # moderate positive = light green
+                elif v >= 0: return "color: #ffdd00"                     # thin edge = yellow
+                return "color: #ff4444"                                  # negative edge = red
             except:
                 return ""
 
@@ -3410,6 +3411,27 @@ def display_dfs_tab(plays: List[Dict]):
         st.success(f"✅ {len(salary_data)} salaries loaded")
     else:
         st.warning("⚠️ No salaries loaded — projections will show without salary optimization")
+        with st.expander("📥 How to get FanDuel salaries (3 options)"):
+            st.markdown("""
+**Option 1 — FD Contest Lobby CSV (Recommended, 30 seconds):**
+1. Go to FanDuel → Lobby → MLB → click any contest
+2. Click **"Export to CSV"** or **"Download Salaries"** button
+3. Upload that CSV file above ↑
+
+**Option 2 — RotoWire / FantasyPros (free):**
+- [RotoWire FD Salaries](https://www.rotogrinders.com/lineups/mlb) → Export CSV
+- Format: `Name, Position, Salary`
+
+**Option 3 — Manual paste (quick for small slates):**
+```
+Aaron Judge, OF, 4200
+Pete Alonso, 1B, 3800
+Juan Soto, OF, 4000
+Cal Raleigh, C, 3200
+```
+
+**Why no auto-pull?** FanDuel has no public salary API. Any scraper would be fragile and violate FD ToS. The CSV export from the contest lobby is the cleanest path and takes ~30 seconds.
+            """)
 
     st.markdown("---")
 
@@ -3452,12 +3474,21 @@ def display_dfs_tab(plays: List[Dict]):
             weather=p.get("weather", {}),
         )
 
-        # Match salary
+        # Match salary — also use stored batter position as fallback
         salary = 0
-        position = "OF"
+        # Map MLB position abbreviations to FD positions
+        pos_map = {
+            "C":"C","1B":"1B","2B":"2B","3B":"3B","SS":"SS",
+            "LF":"OF","CF":"OF","RF":"OF","OF":"OF","DH":"UTIL",
+            "P":"P","SP":"P","RP":"P",
+        }
+        raw_pos = p.get("batter_position", "") or "OF"
+        position = pos_map.get(raw_pos.upper(), "OF")
+
         for sal_name, sal_data in salary_data.items():
             if _norm(sal_name) == _norm(p["name"]) or _norm(p["name"]) in _norm(sal_name):
                 salary   = sal_data["salary"]
+                # FD salary CSV position takes precedence over stored position
                 position = sal_data["position"]
                 break
 
