@@ -457,16 +457,21 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     
     frames = {}
     # Load 2025 full season (primary — large sample, reliable)
-    # and 2026 season start (recency signal)
+    # and 2026 season start (recency signal for hot/cold players + covers returning injured)
     for yr, label in [(season, "primary"), (season + 1, "recent")]:
         for stat_type, slabel in [("8", "adv"), ("24", "sc")]:
             key = f"{label}_{slabel}"
             try:
-                params = {**common_params,
-                          "season": yr, "season1": yr,
-                          "type": stat_type,
-                          "sortstat": "WAR" if stat_type == "8" else "xSLG"}
-                r = requests.get(base_url, params=params, headers=headers, timeout=20)
+                # For 2026 (recent): use minpa=0 to catch returning injured players
+                # who may have only 1-5 PA in opening week
+                yr_params = {**common_params,
+                             "season": yr, "season1": yr,
+                             "type": stat_type,
+                             "sortstat": "WAR" if stat_type == "8" else "xSLG"}
+                if label == "recent":
+                    yr_params["minpa"] = "0"  # no PA floor for 2026 — catch everyone on roster
+                    yr_params["qual"]  = "0"
+                r = requests.get(base_url, params=yr_params, headers=headers, timeout=20)
                 if r.status_code == 200:
                     rows = r.json().get("data", [])
                     if rows:
@@ -487,25 +492,54 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
 
-    # Build result: start with 2025 advanced, merge in statcast + 2026 data
-    base_key = "primary_adv" if "primary_adv" in frames else list(frames.keys())[0]
-    result = frames[base_key].copy()
+    # Strategy: prefer 2026 data where available (recency), supplement with 2025
+    # If 2026 advanced data loaded, use it as base (covers returning injured players)
+    if "recent_adv" in frames and len(frames["recent_adv"]) > 100:
+        # 2026 has meaningful data — use as primary, supplement with 2025 for players missing
+        base_key = "recent_adv"
+        fallback_key = "primary_adv"
+        # Union merge: 2026 players get 2026 stats, 2025-only players still included
+        if fallback_key in frames:
+            try:
+                for k in ["playerid", "PlayerID", "IDfg", "xMLBAMID"]:
+                    if k in frames[base_key].columns and k in frames[fallback_key].columns:
+                        # Outer join: keeps all players from both seasons
+                        result = frames[fallback_key].copy()
+                        new_cols_2026 = [c for c in frames[base_key].columns
+                                         if c not in result.columns or c == k]
+                        merged = result.merge(
+                            frames[base_key][[k] + [c for c in new_cols_2026 if c != k]],
+                            on=k, how="outer", suffixes=("_2025", "_2026")
+                        )
+                        result = merged
+                        break
+                else:
+                    result = frames[base_key].copy()
+            except Exception:
+                result = frames.get("primary_adv", frames[base_key]).copy()
+        else:
+            result = frames[base_key].copy()
+    else:
+        # No meaningful 2026 data yet — use 2025 as primary
+        base_key = "primary_adv" if "primary_adv" in frames else list(frames.keys())[0]
+        result = frames[base_key].copy()
 
+    # Merge in remaining frames (statcast columns etc)
     for key, df in frames.items():
-        if key == base_key:
+        if df is result or key in ("primary_adv", "recent_adv"):
             continue
         try:
-            for k in ["playerid", "PlayerID", "IDfg", "Name"]:
+            for k in ["playerid", "PlayerID", "IDfg", "xMLBAMID", "Name"]:
                 if k in result.columns and k in df.columns:
-                    # Suffix recent cols to distinguish
                     suffix = "_2026" if "recent" in key else "_sc" if "_sc" in key else "_x"
                     new_cols = [c for c in df.columns if c not in result.columns]
                     if new_cols:
-                        result = result.merge(df[[k] + new_cols], on=k, how="left", suffixes=("", suffix))
+                        result = result.merge(df[[k] + new_cols], on=k, how="left",
+                                              suffixes=("", suffix))
                     break
         except Exception:
             pass
-    
+
     return clean_fangraphs_df(result)
 
 
