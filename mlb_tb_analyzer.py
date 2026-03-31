@@ -443,11 +443,16 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
 @st.cache_data(ttl=10800)
 def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     """
-    Load batter stats from FanGraphs JSON API directly.
-    type=8 = advanced stats (SLG, ISO, K%, BB%, wRC+, wOBA)
-    type=24 = statcast stats (Barrel%, HardHit%, EV, xSLG, xwOBA)
-    Merges both tables for complete picture.
-    Falls back to pybaseball if API fails.
+    Load batter stats from FanGraphs JSON API.
+    V1.3 REWRITE: Simplified, robust pipeline that avoids the complex multi-frame
+    merge logic that caused all-league-average scores.
+
+    Strategy:
+    - Fetch 2025 type=8 (advanced: K%, SLG, ISO, wRC+, BB%, wOBA) -> primary_adv
+    - Fetch 2025 type=24 (statcast: xSLG, Barrel%, Hard%, EV, xwOBA) -> primary_sc
+    - Merge them on playerid (clean join, no outer/suffix confusion)
+    - Fetch 2026 type=8 and type=24 separately -> blend key stats at player level
+    - Single clean_fangraphs_df call on final result
     """
     base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
     headers = {
@@ -455,100 +460,111 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
         "Referer": "https://www.fangraphs.com/leaders/major-league",
         "Accept": "application/json",
     }
-    common_params = {
-        "age": "", "pos": "all", "stats": "bat", "lg": "all",
-        "qual": "0",   # No minimum PA — load every MLB player including bench
-        "minpa": "1",  # At least 1 PA to filter out pure pitchers
-        "season": season, "season1": season,
-        "ind": "0", "team": "0", "pageitems": "2000", "pagenum": "1",
-        "sortdir": "default",
-        "sortstat": "PA",  # Sort by PA so all batters with plate appearances are included
-    }
-    
-    frames = {}
-    # Load 2025 full season (primary — large sample, reliable)
-    # and 2026 season start (recency signal for hot/cold players + covers returning injured)
-    for yr, label in [(season, "primary"), (season + 1, "recent")]:
-        for stat_type, slabel in [("8", "adv"), ("24", "sc")]:
-            key = f"{label}_{slabel}"
-            try:
-                # For 2026 (recent): use minpa=0 to catch returning injured players
-                # who may have only 1-5 PA in opening week
-                yr_params = {**common_params,
-                             "season": yr, "season1": yr,
-                             "type": stat_type,
-                             "sortstat": "WAR" if stat_type == "8" else "xSLG"}
-                if label == "recent":
-                    yr_params["minpa"] = "0"  # no PA floor for 2026 — catch everyone on roster
-                    yr_params["qual"]  = "0"
-                r = requests.get(base_url, params=yr_params, headers=headers, timeout=20)
-                if r.status_code == 200:
-                    rows = r.json().get("data", [])
-                    if rows:
-                        frames[key] = pd.DataFrame(rows)
-            except Exception:
-                pass
-    
-    # Pybaseball fallback if all API calls failed
-    if not frames:
+
+    def _fetch_fg(season_yr: int, stat_type: str, minpa: str = "1") -> pd.DataFrame:
+        """Fetch one FanGraphs leaderboard page. Returns empty DataFrame on any error."""
+        try:
+            params = {
+                "age": "", "pos": "all", "stats": "bat", "lg": "all",
+                "qual": "0", "minpa": minpa,
+                "season": season_yr, "season1": season_yr,
+                "ind": "0", "team": "0", "pageitems": "2000", "pagenum": "1",
+                "sortdir": "default", "type": stat_type,
+                "sortstat": "WAR" if stat_type == "8" else "xSLG",
+            }
+            r = requests.get(base_url, params=params, headers=headers, timeout=20)
+            if r.status_code == 200:
+                rows = r.json().get("data", [])
+                if rows:
+                    return pd.DataFrame(rows)
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    # ── Fetch all four frames ──────────────────────────────────────────────
+    adv_2025 = _fetch_fg(season,     "8",  minpa="1")   # full season advanced
+    sc_2025  = _fetch_fg(season,     "24", minpa="1")   # full season statcast
+    adv_2026 = _fetch_fg(season + 1, "8",  minpa="0")   # current year advanced
+    sc_2026  = _fetch_fg(season + 1, "24", minpa="0")   # current year statcast
+
+    # ── Pybaseball fallback if ALL FanGraphs calls failed ─────────────────
+    if adv_2025.empty and adv_2026.empty:
         try:
             from pybaseball import batting_stats
             df = batting_stats(season, qual=1)
             if df is not None and not df.empty:
-                frames["pybaseball"] = df
+                return clean_fangraphs_df(df)
         except Exception:
             pass
-
-    if not frames:
         return pd.DataFrame()
 
-    # Strategy: prefer 2026 data where available (recency), supplement with 2025
-    # If 2026 advanced data loaded, use it as base (covers returning injured players)
-    if "recent_adv" in frames and len(frames["recent_adv"]) > 100:
-        # 2026 has meaningful data — use as primary, supplement with 2025 for players missing
-        base_key = "recent_adv"
-        fallback_key = "primary_adv"
-        # Union merge: 2026 players get 2026 stats, 2025-only players still included
-        if fallback_key in frames:
-            try:
-                for k in ["playerid", "PlayerID", "IDfg", "xMLBAMID"]:
-                    if k in frames[base_key].columns and k in frames[fallback_key].columns:
-                        # Outer join: keeps all players from both seasons
-                        result = frames[fallback_key].copy()
-                        new_cols_2026 = [c for c in frames[base_key].columns
-                                         if c not in result.columns or c == k]
-                        merged = result.merge(
-                            frames[base_key][[k] + [c for c in new_cols_2026 if c != k]],
-                            on=k, how="outer", suffixes=("_2025", "_2026")
-                        )
-                        result = merged
-                        break
-                else:
-                    result = frames[base_key].copy()
-            except Exception:
-                result = frames.get("primary_adv", frames[base_key]).copy()
-        else:
-            result = frames[base_key].copy()
-    else:
-        # No meaningful 2026 data yet — use 2025 as primary
-        base_key = "primary_adv" if "primary_adv" in frames else list(frames.keys())[0]
-        result = frames[base_key].copy()
+    # ── Find the best join key across frames ──────────────────────────────
+    JOIN_KEYS = ["playerid", "PlayerID", "IDfg", "xMLBAMID"]
 
-    # Merge in remaining frames (statcast columns etc)
-    for key, df in frames.items():
-        if df is result or key in ("primary_adv", "recent_adv"):
+    def _find_key(df_a: pd.DataFrame, df_b: pd.DataFrame) -> Optional[str]:
+        for k in JOIN_KEYS:
+            if not df_a.empty and not df_b.empty and k in df_a.columns and k in df_b.columns:
+                return k
+        return None
+
+    # ── Build 2025 base: merge advanced + statcast ─────────────────────────
+    # Start from 2025 advanced (most complete: K%, SLG, ISO, wRC+, BB%, wOBA)
+    if not adv_2025.empty:
+        result = adv_2025.copy()
+        # Merge in 2025 statcast columns (xSLG, Barrel%, Hard%, EV)
+        if not sc_2025.empty:
+            jk = _find_key(result, sc_2025)
+            if jk:
+                # Only add columns that don't already exist
+                sc_new_cols = [c for c in sc_2025.columns if c not in result.columns]
+                if sc_new_cols:
+                    result = result.merge(sc_2025[[jk] + sc_new_cols],
+                                          on=jk, how="left")
+    elif not sc_2025.empty:
+        result = sc_2025.copy()
+    else:
+        result = pd.DataFrame()
+
+    # ── Blend in 2026 YTD stats at the PLAYER level ───────────────────────
+    # Rather than complex outer merges, we store 2026 stats with _2026 suffix
+    # and blend them in get_batter_stats() at scoring time.
+    # This avoids any column collision or NaN propagation issues.
+    for df_2026, suffix in [(adv_2026, "_2026"), (sc_2026, "_2026sc")]:
+        if df_2026.empty or result.empty:
             continue
-        try:
-            for k in ["playerid", "PlayerID", "IDfg", "xMLBAMID", "Name"]:
-                if k in result.columns and k in df.columns:
-                    suffix = "_2026" if "recent" in key else "_sc" if "_sc" in key else "_x"
-                    new_cols = [c for c in df.columns if c not in result.columns]
-                    if new_cols:
-                        result = result.merge(df[[k] + new_cols], on=k, how="left",
-                                              suffixes=("", suffix))
-                    break
-        except Exception:
-            pass
+        jk = _find_key(result, df_2026)
+        if not jk:
+            continue
+        # Add 2026 columns with suffix (only stat columns, not id/name columns)
+        id_like = {"playerid", "PlayerID", "IDfg", "xMLBAMID", "Name", "name",
+                   "PlayerName", "Team", "team", "Age", "age", "Season", "season"}
+        cols_to_add = [c for c in df_2026.columns
+                       if c not in id_like and c != jk]
+        if not cols_to_add:
+            continue
+        rename_map = {c: f"{c}{suffix}" for c in cols_to_add}
+        df_renamed = df_2026[[jk] + cols_to_add].rename(columns=rename_map)
+        # Remove any renamed cols that already exist to avoid duplicate suffix stacking
+        new_renamed = [v for v in rename_map.values() if v not in result.columns]
+        if new_renamed:
+            result = result.merge(
+                df_renamed[[jk] + new_renamed],
+                on=jk, how="left"
+            )
+
+    # ── Add 2026-only players (new callups not in 2025) ───────────────────
+    if not adv_2026.empty and not result.empty:
+        jk = _find_key(result, adv_2026)
+        if jk and jk in result.columns:
+            existing_ids = set(result[jk].dropna().astype(str).str.split(".").str[0])
+            new_players = adv_2026[
+                ~adv_2026[jk].astype(str).str.split(".").str[0].isin(existing_ids)
+            ]
+            if not new_players.empty:
+                result = pd.concat([result, new_players], ignore_index=True, sort=False)
+
+    if result.empty:
+        return pd.DataFrame()
 
     return clean_fangraphs_df(result)
 
@@ -557,8 +573,9 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
 def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     """
     Load pitcher stats from FanGraphs JSON API.
-    Uses qual=0 (no minimum) to capture all starters including early-season.
-    Merges advanced (K%, ERA, FIP) + statcast (Hard%, Barrel%, xERA) tables.
+    Merges advanced (K%, ERA, FIP, WHIP, G, GS, Team) + statcast (Hard%, Barrel%).
+    pageitems=1000 ensures all relievers are captured (30 teams × ~25 pitchers = 750).
+    Also loads 2026 YTD for relievers active this season.
     """
     base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
     headers = {
@@ -566,57 +583,69 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
         "Referer": "https://www.fangraphs.com/leaders/major-league",
         "Accept": "application/json",
     }
-    common_params = {
-        "age": "", "pos": "all", "stats": "pit", "lg": "all",
-        "qual": "0",   # No minimum — capture all starters
-        "season": season, "season1": season,
-        "ind": "0", "team": "0", "pageitems": "500", "pagenum": "1",
-        "sortdir": "default", "minip": "1",
-    }
 
-    frames = {}
-    for stat_type, label, sort in [
-        ("8",  "advanced", "ERA"),
-        ("24", "statcast", "xERA"),
-    ]:
+    def _fetch_pit(season_yr: int, stat_type: str) -> pd.DataFrame:
         try:
-            params = {**common_params, "type": stat_type, "sortstat": sort}
+            params = {
+                "age": "", "pos": "all", "stats": "pit", "lg": "all",
+                "qual": "0", "season": season_yr, "season1": season_yr,
+                "ind": "0", "team": "0", "pageitems": "1000", "pagenum": "1",
+                "sortdir": "default", "minip": "0",
+                "type": stat_type,
+                "sortstat": "ERA" if stat_type == "8" else "xERA",
+            }
             r = requests.get(base_url, params=params, headers=headers, timeout=20)
             if r.status_code == 200:
                 rows = r.json().get("data", [])
                 if rows:
-                    frames[label] = pd.DataFrame(rows)
+                    return pd.DataFrame(rows)
         except Exception:
             pass
+        return pd.DataFrame()
+
+    adv_2025 = _fetch_pit(season,     "8")
+    sc_2025  = _fetch_pit(season,     "24")
+    adv_2026 = _fetch_pit(season + 1, "8")
 
     # Pybaseball fallback
-    if not frames:
+    if adv_2025.empty and adv_2026.empty:
         try:
             from pybaseball import pitching_stats
             df = pitching_stats(season, qual=1)
             if df is not None and not df.empty:
-                frames["pybaseball"] = df
+                return clean_fangraphs_df(df)
         except Exception:
             pass
-
-    if not frames:
         return pd.DataFrame()
 
-    if "advanced" in frames:
-        result = frames["advanced"].copy()
-        if "statcast" in frames:
-            sc = frames["statcast"]
-            for k in ["playerid", "PlayerID", "IDfg", "Name"]:
-                if k in result.columns and k in sc.columns:
-                    new_cols = [c for c in sc.columns if c not in result.columns]
-                    if new_cols:
-                        result = result.merge(sc[[k] + new_cols], on=k, how="left")
+    # Build result: prefer 2026 if meaningful (active season), else 2025
+    if not adv_2026.empty and len(adv_2026) > 50:
+        result = adv_2026.copy()
+        # Supplement with 2025 players not yet in 2026 (returning from IL etc)
+        if not adv_2025.empty:
+            for k in ["playerid", "PlayerID", "IDfg"]:
+                if k in result.columns and k in adv_2025.columns:
+                    existing = set(result[k].dropna().astype(str).str.split(".").str[0])
+                    extras = adv_2025[~adv_2025[k].astype(str).str.split(".").str[0].isin(existing)]
+                    if not extras.empty:
+                        result = pd.concat([result, extras], ignore_index=True, sort=False)
                     break
+    elif not adv_2025.empty:
+        result = adv_2025.copy()
     else:
-        result = list(frames.values())[0].copy()
+        return pd.DataFrame()
 
-    # Add K% alias — FanGraphs pitching sometimes uses "K%" or "K/9"
-    # Normalize to K% as rate (0-1)
+    # Merge statcast columns (Hard%, Barrel%, xERA)
+    sc_frame = sc_2025 if not sc_2025.empty else pd.DataFrame()
+    if not sc_frame.empty:
+        for k in ["playerid", "PlayerID", "IDfg", "Name"]:
+            if k in result.columns and k in sc_frame.columns:
+                new_cols = [c for c in sc_frame.columns if c not in result.columns]
+                if new_cols:
+                    result = result.merge(sc_frame[[k] + new_cols], on=k, how="left")
+                break
+
+    # Add K% alias if missing
     if "K%" not in result.columns and "SO" in result.columns and "TBF" in result.columns:
         try:
             result["K%"] = result["SO"] / result["TBF"]
@@ -813,6 +842,7 @@ def get_batter_stats(player_name: str, mlb_id: str,
     Extract batter stats from pre-loaded DataFrames.
     All percentages normalized to decimals (0.23 not 23%).
     Falls back to MLB league averages if player not found.
+    V1.3: Handles _2026 / _2026sc suffixes from new merge strategy.
     """
     # 2025 MLB league averages (all as decimals)
     stats = {
@@ -830,88 +860,90 @@ def get_batter_stats(player_name: str, mlb_id: str,
         "tb_per_game":      0.85,
         "data_source":      "league_avg",
     }
-    
+
     row = find_player_row(batting_df, player_name, mlb_id)
-    
+
     if row is not None:
-        # SLG / power — prefer xSLG over SLG
-        xslg = safe_get(row, 'xSLG', default=None)
-        slg  = safe_get(row, 'SLG',  default=None)
-        if xslg and xslg > 0:
+        # ── SLG / power — prefer xSLG over SLG ───────────────────────────
+        xslg = safe_get(row, 'xSLG', 'xslg', default=None)
+        slg  = safe_get(row, 'SLG',  'slg',  default=None)
+        if xslg and 0.050 < xslg < 1.200:
             stats["slg_proxy"] = xslg
-        elif slg and slg > 0:
+        elif slg and 0.050 < slg < 1.200:
             stats["slg_proxy"] = slg
 
-        # ISO
-        iso = safe_get(row, 'ISO', default=None)
-        if iso and iso > 0:
+        # ── ISO ────────────────────────────────────────────────────────────
+        iso = safe_get(row, 'ISO', 'iso', default=None)
+        if iso and 0 < iso < 0.700:
             stats["iso_proxy"] = iso
 
-        # K% and BB% — pybaseball returns as decimals (0.23)
-        k = safe_get(row, 'K%', default=None)
-        if k is not None and 0 < k < 1:
-            stats["k_rate"] = k
-        elif k is not None and k > 1:
-            stats["k_rate"] = k / 100  # handle if stored as pct
+        # ── K% ────────────────────────────────────────────────────────────
+        k = safe_get(row, 'K%', 'k_percent', default=None)
+        if k is not None and k > 0:
+            stats["k_rate"] = k if k < 1 else k / 100
 
-        bb = safe_get(row, 'BB%', default=None)
-        if bb is not None and 0 < bb < 1:
-            stats["bb_rate"] = bb
-        elif bb is not None and bb > 1:
-            stats["bb_rate"] = bb / 100
+        # ── BB% ───────────────────────────────────────────────────────────
+        bb = safe_get(row, 'BB%', 'bb_percent', default=None)
+        if bb is not None and bb > 0:
+            stats["bb_rate"] = bb if bb < 1 else bb / 100
 
-        # wRC+ — stored as integer 100 = average
-        wrc = safe_get(row, 'wRC+', default=None)
-        if wrc and wrc > 0:
-            stats["wrc_plus"] = wrc
-
-        # wOBA — decimal
-        woba = safe_get(row, 'xwOBA', 'wOBA', default=None)
-        if woba and 0 < woba < 1:
-            stats["woba"] = woba
-
-        # Barrel% — pybaseball normalizes to decimal after our fix (0.085)
-        barrel = safe_get(row, 'Barrel%', 'barrel_batted_rate', default=None)
-        if barrel is not None and barrel > 0:
-            stats["barrel_rate"] = barrel if barrel < 1 else barrel / 100
-
-        # Hard% — normalized to decimal after our fix (0.34)
-        hard = safe_get(row, 'Hard%', 'hard_hit_percent', default=None)
-        if hard is not None and hard > 0:
-            stats["hard_hit_rate"] = hard if hard < 1 else hard / 100
-
-        # EV — exit velocity in mph
-        ev = safe_get(row, 'EV', 'avg_exit_velocity', default=None)
-        if ev and ev > 50:
-            stats["exit_velocity_avg"] = ev
-
-        # Sweet spot% (launch angle 8-32 degrees) — key for HR model
-        sweet = safe_get(row, 'Sweetspot%', 'sweet_spot_percent', default=None)
-        if sweet is not None and sweet > 0:
-            stats["sweet_spot_rate"] = sweet if sweet < 1 else sweet / 100
-
-        # wRC+ — store explicitly for downstream O0.5/PP models
+        # ── wRC+ ──────────────────────────────────────────────────────────
+        wrc = safe_get(row, 'wRC+', 'wRC', default=None)
         if wrc and wrc > 0:
             stats["wrc_plus"] = float(wrc)
 
-        # 2026 recent form blending — if 2026 YTD stats available, blend 70/30
-        # 2026 columns have _2026 suffix after the outer join merge
-        xslg_2026 = safe_get(row, 'xSLG_2026', default=None)
-        if xslg_2026 and 0.100 < float(xslg_2026) < 1.000:
-            # 60% 2025 season + 40% 2026 YTD (recency weighted)
-            stats["slg_proxy"] = stats["slg_proxy"] * 0.60 + float(xslg_2026) * 0.40
+        # ── wOBA ──────────────────────────────────────────────────────────
+        woba = safe_get(row, 'xwOBA', 'wOBA', 'xwoba', 'woba', default=None)
+        if woba and 0.100 < woba < 0.700:
+            stats["woba"] = woba
 
-        barrel_2026 = safe_get(row, 'Barrel%_2026', default=None)
-        if barrel_2026 and float(barrel_2026) > 0:
-            b26 = float(barrel_2026) if float(barrel_2026) < 1 else float(barrel_2026) / 100
-            stats["barrel_rate"] = stats["barrel_rate"] * 0.65 + b26 * 0.35
+        # ── Barrel% ───────────────────────────────────────────────────────
+        barrel = safe_get(row, 'Barrel%', 'Barrel', 'barrel_batted_rate',
+                          'barrel_rate', default=None)
+        if barrel is not None and barrel > 0:
+            stats["barrel_rate"] = barrel if barrel < 1 else barrel / 100
 
-        k_2026 = safe_get(row, 'K%_2026', default=None)
-        if k_2026 and float(k_2026) > 0:
-            k26 = float(k_2026) if float(k_2026) < 1 else float(k_2026) / 100
-            stats["k_rate"] = stats["k_rate"] * 0.65 + k26 * 0.35
+        # ── Hard Hit% ─────────────────────────────────────────────────────
+        hard = safe_get(row, 'Hard%', 'HardHit%', 'hard_hit_percent',
+                        'hard_hit_rate', default=None)
+        if hard is not None and hard > 0:
+            stats["hard_hit_rate"] = hard if hard < 1 else hard / 100
+
+        # ── Exit Velocity ─────────────────────────────────────────────────
+        ev = safe_get(row, 'EV', 'avg_exit_velocity', 'exit_velocity_avg', default=None)
+        if ev and ev > 50:
+            stats["exit_velocity_avg"] = ev
+
+        # ── Sweet Spot% ───────────────────────────────────────────────────
+        sweet = safe_get(row, 'Sweetspot%', 'sweet_spot_percent',
+                         'sweet_spot_rate', 'LA Sweet-Spot%', default=None)
+        if sweet is not None and sweet > 0:
+            stats["sweet_spot_rate"] = sweet if sweet < 1 else sweet / 100
 
         stats["data_source"] = "fangraphs"
+
+        # ── 2026 YTD blending (_2026 suffix from new merge strategy) ──────
+        # Advanced stats blend (K%, SLG, ISO, wRC+)
+        xslg_26  = safe_get(row, 'xSLG_2026', 'xSLG_2026sc', default=None)
+        if xslg_26 and 0.100 < xslg_26 < 1.200:
+            stats["slg_proxy"] = stats["slg_proxy"] * 0.60 + xslg_26 * 0.40
+
+        barrel_26 = safe_get(row, 'Barrel%_2026', 'Barrel%_2026sc',
+                             'Barrel_2026', 'Barrel_2026sc', default=None)
+        if barrel_26 and barrel_26 > 0:
+            b26 = barrel_26 if barrel_26 < 1 else barrel_26 / 100
+            stats["barrel_rate"] = stats["barrel_rate"] * 0.65 + b26 * 0.35
+
+        k_26 = safe_get(row, 'K%_2026', default=None)
+        if k_26 and k_26 > 0:
+            k26 = k_26 if k_26 < 1 else k_26 / 100
+            stats["k_rate"] = stats["k_rate"] * 0.65 + k26 * 0.35
+
+        hard_26 = safe_get(row, 'Hard%_2026', 'Hard%_2026sc',
+                           'HardHit%_2026', 'HardHit%_2026sc', default=None)
+        if hard_26 and hard_26 > 0:
+            h26 = hard_26 if hard_26 < 1 else hard_26 / 100
+            stats["hard_hit_rate"] = stats["hard_hit_rate"] * 0.65 + h26 * 0.35
 
     return stats
 
@@ -1929,6 +1961,15 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         batting_df = prepare_lookup_df(batting_df)  # build _norm_name index ONCE
         # Store debug info
         st.session_state.batting_cols = list(batting_df.columns)
+        # Log which key stat columns actually loaded
+        key_cols = ["xSLG", "SLG", "ISO", "K%", "BB%", "wRC+", "wOBA",
+                    "Barrel%", "Hard%", "EV", "xMLBAMID"]
+        present = [c for c in key_cols if c in batting_df.columns]
+        missing = [c for c in key_cols if c not in batting_df.columns]
+        if missing:
+            log(f"  ⚠️ Missing stat cols: {missing}", "warn")
+        else:
+            log(f"  Key cols present: {present[:6]}... ✅", "ok")
         # Store raw name samples to diagnose lookup failures
         if "_name" in batting_df.columns:
             st.session_state.batting_df_sample = [str(x) for x in batting_df["_name"].head(10).tolist()]
@@ -2506,9 +2547,9 @@ def display_leaderboard(plays: List[Dict]):
             except:
                 return ""
 
-        styled = df.style.applymap(color_tier, subset=["Tier"]).applymap(color_score, subset=["Score"])
+        styled = df.style.map(color_tier, subset=["Tier"]).map(color_score, subset=["Score"])
         if "Edge" in df.columns:
-            styled = styled.applymap(color_edge, subset=["Edge"])
+            styled = styled.map(color_edge, subset=["Edge"])
         st.dataframe(styled, use_container_width=True, height=500)
         
         # Export button
@@ -2879,7 +2920,7 @@ def display_hr_plays(plays: List[Dict]):
             except:
                 return ""
         
-        styled = df.style.applymap(color_hr, subset=["HR Score"])
+        styled = df.style.map(color_hr, subset=["HR Score"])
         st.dataframe(styled, use_container_width=True)
     
     # Top 3 HR plays detailed
@@ -3261,7 +3302,7 @@ def display_hits_tab(plays: List[Dict]):
                 return "color: #888888"
             except: return ""
 
-        styled = df.style.applymap(color_htier, subset=["Tier"]).applymap(color_hscore, subset=["H-Score"])
+        styled = df.style.map(color_htier, subset=["Tier"]).map(color_hscore, subset=["H-Score"])
         st.dataframe(styled, use_container_width=True, height=500)
 
         csv = df.to_csv(index=False)
@@ -3983,9 +4024,9 @@ Cal Raleigh, C, 3200
             except: return ""
 
         styled = (df_fd.style
-                  .applymap(color_proj, subset=["FD Proj","Ceiling"])
-                  .applymap(color_own,  subset=["Own%"])
-                  .applymap(color_val,  subset=["Value"]))
+                  .map(color_proj, subset=["FD Proj","Ceiling"])
+                  .map(color_own,  subset=["Own%"])
+                  .map(color_val,  subset=["Value"]))
         st.dataframe(styled, use_container_width=True, height=450)
 
         csv_fd = df_fd.to_csv(index=False)
@@ -4388,9 +4429,9 @@ Cal Raleigh, C, 3200
             except: return ""
 
         styled_sp = (sp_df.style
-                     .applymap(color_sp_grade, subset=["Grade"])
-                     .applymap(color_sp_proj,  subset=["FD Proj","Ceiling"])
-                     .applymap(color_sp_val,   subset=["Value"]))
+                     .map(color_sp_grade, subset=["Grade"])
+                     .map(color_sp_proj,  subset=["FD Proj","Ceiling"])
+                     .map(color_sp_val,   subset=["Value"]))
         st.dataframe(styled_sp, use_container_width=True)
 
     # ── VALUE PLAYS ───────────────────────────────────────────────────────
@@ -4711,8 +4752,8 @@ def display_prizepicks_tab(plays: List[Dict]):
             return ""  # handled in platoon column
 
         styled = (df_pp.style
-                  .applymap(color_proj, subset=["PP Proj","Ceiling"])
-                  .applymap(color_conf, subset=["Conf"]))
+                  .map(color_proj, subset=["PP Proj","Ceiling"])
+                  .map(color_conf, subset=["Conf"]))
         st.dataframe(styled, use_container_width=True, height=520)
 
         csv_pp = df_pp.to_csv(index=False)
@@ -5107,7 +5148,7 @@ Free tier (500/mo) is more than enough.
                         return "color: #ff4444; font-weight: bold"
                     except: return ""
 
-                styled_bp = bp_df.style.applymap(color_bp, subset=["Bullpen Vuln Score"])
+                styled_bp = bp_df.style.map(color_bp, subset=["Bullpen Vuln Score"])
                 st.dataframe(styled_bp, use_container_width=True)
                 st.caption(f"✅ {len(bp_scores)} teams scored | League avg baseline: 42.0")
 
