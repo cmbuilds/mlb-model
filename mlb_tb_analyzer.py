@@ -40,7 +40,7 @@ import pytz
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="⚾ MLB TB Analyzer V1.0",
+    page_title="⚾ MLB TB Analyzer V1.3",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="auto"
@@ -280,7 +280,7 @@ def update_pick_result(pick_id: str, result: str, tb_actual: int):
     c = conn.cursor()
     c.execute("UPDATE picks SET result=?, tb_actual=? WHERE pick_id=?",
               (result, tb_actual, pick_id))
-    conn.commit()()
+    conn.commit()
     conn.close()
 
 def save_parlay_to_db(parlay: Dict, date_str: str):
@@ -1442,14 +1442,146 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     return max(0, min(100, composite)), "Contact quality", details
 
 
-def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, str]:
+# ============================================================================
+# BULLPEN QUALITY — Per-team vulnerability from loaded pitching_df
+# V1.3: replaces fixed league-average (42.0) with real per-team scores
+# ============================================================================
+def compute_team_bullpen_scores(pitching_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Build per-team bullpen vulnerability scores (0-100) from the already-loaded
+    FanGraphs pitching DataFrame. Runs ONCE before the scoring loop.
+
+    Filters to relievers (GS == 0 or GS/G < 30%), groups by team, computes
+    a weighted K%/FIP/WHIP/HH% composite using the same formula as the SP
+    sub-score in compute_pitcher_score().
+
+    Returns dict keyed by UPPERCASE team abbreviation:
+        {"NYY": 38.2, "ATH": 61.4, "COL": 58.0, ...}
+    Falls back to league average (42.0) for any missing team at scoring time.
+    """
+    LEAGUE_AVG_BP_VULN = 42.0
+
+    if pitching_df is None or pitching_df.empty:
+        return {}
+
+    df = pitching_df.copy()
+
+    # ── Identify reliever rows ─────────────────────────────────────────────
+    has_gs = "GS" in df.columns
+    has_g  = "G"  in df.columns
+
+    if has_gs and has_g:
+        df["_GS"] = pd.to_numeric(df["GS"], errors="coerce").fillna(0)
+        df["_G"]  = pd.to_numeric(df["G"],  errors="coerce").fillna(0)
+        relievers = df[
+            (df["_GS"] == 0) |
+            ((df["_G"] > 0) & (df["_GS"] / df["_G"].replace(0, 1) < 0.30))
+        ].copy()
+    elif has_gs:
+        df["_GS"] = pd.to_numeric(df["GS"], errors="coerce").fillna(0)
+        relievers = df[df["_GS"] == 0].copy()
+    else:
+        # Can't distinguish starters from relievers — return empty, fall back to league avg
+        return {}
+
+    if relievers.empty:
+        return {}
+
+    # ── Find team column ───────────────────────────────────────────────────
+    team_col = None
+    for candidate in ["Team", "team", "Tm", "tm", "TEAM"]:
+        if candidate in relievers.columns:
+            team_col = candidate
+            break
+    if team_col is None:
+        return {}
+
+    # ── Normalize stat columns to decimal rates ────────────────────────────
+    def to_rate(series: pd.Series, thresh: float = 1.0) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce")
+        if s.dropna().median() > thresh:
+            s = s / 100.0
+        return s
+
+    # Pull the Series safely even if column is missing
+    k_series    = to_rate(relievers[team_col].map(lambda _: None).combine_first(
+                      relievers.get("K%", pd.Series(dtype=float, index=relievers.index))), thresh=1.0) \
+                  if "K%" in relievers.columns else pd.Series(dtype=float, index=relievers.index)
+    k_series    = to_rate(relievers["K%"],    thresh=1.0) if "K%"    in relievers.columns else pd.Series(dtype=float, index=relievers.index)
+    fip_series  = pd.to_numeric(relievers["FIP"],   errors="coerce") if "FIP"   in relievers.columns else \
+                  pd.to_numeric(relievers["xFIP"],  errors="coerce") if "xFIP"  in relievers.columns else \
+                  pd.Series(dtype=float, index=relievers.index)
+    whip_series = pd.to_numeric(relievers["WHIP"],  errors="coerce") if "WHIP"  in relievers.columns else \
+                  pd.Series(dtype=float, index=relievers.index)
+    hh_series   = to_rate(relievers["Hard%"], thresh=1.0) if "Hard%" in relievers.columns else \
+                  pd.Series(dtype=float, index=relievers.index)
+
+    relievers = relievers.copy()
+    relievers["_k_rate"] = k_series.values
+    relievers["_fip"]    = fip_series.values
+    relievers["_whip"]   = whip_series.values
+    relievers["_hh"]     = hh_series.values
+
+    # ── Group by team, use median (robust to outlier arms) ─────────────────
+    try:
+        group = relievers.groupby(team_col).agg(
+            k_rate=("_k_rate", "median"),
+            fip   =("_fip",    "median"),
+            whip  =("_whip",   "median"),
+            hh    =("_hh",     "median"),
+        ).reset_index()
+    except Exception:
+        return {}
+
+    # ── Score each team bullpen ────────────────────────────────────────────
+    team_scores: Dict[str, float] = {}
+    for _, row in group.iterrows():
+        team = str(row[team_col]).strip().upper()
+        if not team or team in ("", "---", "TOT", "2TM", "3TM"):
+            continue
+
+        k_rate = float(row["k_rate"]) if pd.notna(row["k_rate"]) else 0.228
+        fip    = float(row["fip"])    if pd.notna(row["fip"])    else 4.50
+        whip   = float(row["whip"])   if pd.notna(row["whip"])   else 1.35
+        hh     = float(row["hh"])     if pd.notna(row["hh"])     else 0.340
+
+        # Clamp to valid ranges
+        k_rate = max(0.08, min(0.42, k_rate))
+        fip    = max(2.0,  min(8.0,  fip))
+        whip   = max(0.80, min(2.20, whip))
+        hh     = max(0.20, min(0.55, hh))
+
+        # Vulnerability sub-scores (high = hittable bullpen = good for batters)
+        k_vuln    = max(0.0, min(100.0, (0.35 - k_rate) / (0.35 - 0.10) * 100))
+        era_vuln  = max(0.0, min(100.0, (fip  - 2.0)    / (7.0  - 2.0)  * 100))
+        whip_vuln = max(0.0, min(100.0, (whip - 0.90)   / (1.80 - 0.90) * 100))
+        hh_vuln   = max(0.0, min(100.0, (hh   - 0.28)   / (0.50 - 0.28) * 100))
+
+        # Weighted composite (same formula as SP, no barrel% for relievers)
+        bp_score = (
+            k_vuln    * 0.38 +
+            hh_vuln   * 0.22 +
+            era_vuln  * 0.22 +   # FIP double-weighted since no barrel%
+            whip_vuln * 0.18
+        )
+
+        team_scores[team] = round(max(0.0, min(100.0, bp_score)), 1)
+
+    return team_scores
+
+
+def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
+                          bullpen_vuln: float = 42.0) -> Tuple[float, str]:
     """
     Pitcher VULNERABILITY score 0-100.
     HIGH score = pitcher is hittable = good for batter TB.
     LOW score = elite pitcher = suppresses TB.
     Webb/Fried type = ~20-30. League avg pitcher = ~50. Mop-up arm = ~75+.
-    Blends SP stats (60%) with league-avg bullpen (40%) to account for
-    bullpen innings batters will face after SP exit.
+
+    V1.3: Blends SP stats (60%) with PER-TEAM bullpen vulnerability (40%).
+    bullpen_vuln is pre-computed by compute_team_bullpen_scores() and passed
+    in from the scoring loop. Defaults to 42.0 (league avg) when unavailable.
+    Swing between best/worst bullpen: ~8-10 score points.
     """
     def f(key, default):
         try: return float(statcast.get(key, default))
@@ -1488,12 +1620,11 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float,
         whip_vuln   * 0.08    # WHIP adds baserunner context
     )
 
-    # Bullpen blend: avg team bullpen FIP ~4.5, K% ~23%, WHIP ~1.35
+    # V1.3: Use per-team bullpen vuln (was fixed at 42.0 league avg for all teams)
     # Batters see ~40% of PAs against bullpen (3-4 IP out of 9)
-    bp_vuln = 42.0  # league avg bullpen vulnerability
-    blended = sp_score * 0.60 + bp_vuln * 0.40
+    blended = sp_score * 0.60 + float(bullpen_vuln) * 0.40
 
-    label = f"K%: {k_rate*100:.0f}% | WHIP: {whip:.2f} | FIP: {era_use:.2f}"
+    label = f"K%: {k_rate*100:.0f}% | WHIP: {whip:.2f} | FIP: {era_use:.2f} | BP vuln: {bullpen_vuln:.0f}"
     return max(0, min(100, blended)), label
 
 
@@ -1842,8 +1973,17 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         log(f"Pitching stats: {len(pitching_df)} pitchers loaded", "ok")
         pitching_df = prepare_lookup_df(pitching_df)  # build _norm_name index ONCE
         st.session_state.pitching_cols = list(pitching_df.columns)
+        # ── V1.3: Compute per-team bullpen scores ONCE before scoring loop ──
+        team_bullpen_scores = compute_team_bullpen_scores(pitching_df)
+        n_bp_teams = len(team_bullpen_scores)
+        if n_bp_teams > 0:
+            log(f"Bullpen quality computed for {n_bp_teams} teams ✅", "ok")
+        else:
+            log("Bullpen quality unavailable — using league average (42.0) for all teams", "warn")
+        st.session_state["team_bullpen_scores"] = team_bullpen_scores
     else:
         log("Pitching stats unavailable — using league averages", "warn")
+        team_bullpen_scores = {}
 
     # ── 1. SCHEDULE ──────────────────────────────────────
     log("Fetching MLB schedule...", "run")
@@ -2025,7 +2165,10 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
             # ── SCORE COMPONENTS ────────────────────────
             bat_score, _, bat_details = compute_batter_score(batter_statcast)
-            pit_score, pit_label = compute_pitcher_score(pitcher_statcast)
+            # V1.3: Look up opponent team's specific bullpen vulnerability
+            opp_team = batter.get("opponent", "").strip().upper()
+            bp_vuln = team_bullpen_scores.get(opp_team, 42.0)
+            pit_score, pit_label = compute_pitcher_score(pitcher_statcast, bullpen_vuln=bp_vuln)
             plat_score, plat_label = compute_platoon_score(batter_hand, sp_hand)
             lineup_sc, lineup_label = compute_lineup_score(lineup_slot)
             park_sc, park_label = compute_park_score(park_team, True)
@@ -2116,6 +2259,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "sub_park": round(park_sc, 1),
                 "sub_weather": round(weather_sc, 1),
                 "sub_vegas": round(vegas_sc, 1),
+                "bullpen_vuln": round(bp_vuln, 1),
                 "platoon_edge": plat_label,
                 "temperature": weather.get("temperature", 70),
                 "wind_speed": weather.get("wind_speed", 0),
@@ -4897,45 +5041,121 @@ Free tier (500/mo) is more than enough.
                 if rate < 80:
                     st.warning("Low match rate — scores using league averages for unmatched players")
             
-            # Show raw name samples from DataFrame so we can diagnose lookup failures
-            if "lookup_diag" in st.session_state:
+            # Show raw name samples — use .get() everywhere to avoid AttributeError
+            # before model has been run (session_state keys may not exist yet)
+            lookup_diag = st.session_state.get("lookup_diag")
+            batting_df_sample = st.session_state.get("batting_df_sample", [])
+            norm_name_sample  = st.session_state.get("norm_name_sample", [])
+            search_sample     = st.session_state.get("search_sample", [])
+            batting_cols      = st.session_state.get("batting_cols", [])
+            pitching_cols     = st.session_state.get("pitching_cols", [])
+            sample_player     = st.session_state.get("sample_player")
+
+            if lookup_diag:
                 st.markdown("**🔬 Live lookup diagnostic (first batter):**")
-                st.json(st.session_state.lookup_diag)
-                st.markdown("**Raw _name values in batting DataFrame (first 10):**")
-                st.code("\n".join(st.session_state.batting_df_sample))
-            if "norm_name_sample" in st.session_state:
+                st.json(lookup_diag)
+                if batting_df_sample:
+                    st.markdown("**Raw _name values in batting DataFrame (first 10):**")
+                    st.code("\n".join(str(x) for x in batting_df_sample))
+            if norm_name_sample:
                 st.markdown("**Normalized _norm_name values (first 10):**")
-                st.code("\n".join(st.session_state.norm_name_sample))
-            if "search_sample" in st.session_state:
+                st.code("\n".join(str(x) for x in norm_name_sample))
+            if search_sample:
                 st.markdown("**Names we searched for (first 5):**")
-                st.code("\n".join(st.session_state.search_sample))
-            if "batting_cols" in st.session_state:
-                cols = st.session_state.batting_cols
-                # Check for the critical columns we need
-                critical_bat = ["SLG", "ISO", "K%", "BB%", "wRC+", "wOBA", 
-                               "Barrel%", "Hard%", "EV", "xSLG", "xwOBA"]
+                st.code("\n".join(str(x) for x in search_sample))
+            if batting_cols:
+                critical_bat = ["SLG", "ISO", "K%", "BB%", "wRC+", "wOBA",
+                                "Barrel%", "Hard%", "EV", "xSLG", "xwOBA"]
                 st.markdown("**Batting — critical columns:**")
                 for c in critical_bat:
-                    found = c in cols
-                    st.markdown(f"{'✅' if found else '❌'} `{c}`")
-                st.caption(f"Total columns loaded: {len(cols)}")
-            if "pitching_cols" in st.session_state:
-                cols = st.session_state.pitching_cols
-                critical_pit = ["K%", "ERA", "FIP", "xFIP", "Hard%", "Barrel%", "SO", "TBF", "xERA"]
+                    st.markdown(f"{'✅' if c in batting_cols else '❌'} `{c}`")
+                st.caption(f"Total columns loaded: {len(batting_cols)}")
+            else:
+                st.info("Run the model to see batting column status.")
+            if pitching_cols:
+                critical_pit = ["K%", "ERA", "FIP", "xFIP", "Hard%", "Barrel%",
+                                "SO", "TBF", "xERA", "G", "GS", "Team", "WHIP"]
                 st.markdown("**Pitching — critical columns:**")
                 for c in critical_pit:
-                    found = c in cols
-                    st.markdown(f"{'✅' if found else '❌'} `{c}`")
-                st.caption(f"Total pitching columns: {len(cols)}")
-            if "sample_player" in st.session_state:
+                    st.markdown(f"{'✅' if c in pitching_cols else '❌'} `{c}`")
+                st.caption(f"Total pitching columns: {len(pitching_cols)}")
+            else:
+                st.info("Run the model to see pitching column status.")
+            if sample_player:
                 st.markdown("**Sample player (Judge):**")
-                st.json(st.session_state.sample_player)
+                st.json(sample_player)
 
-        st.caption(f"v1.2 | {datetime.now(EST).strftime('%I:%M %p EST')}")
+        # ── V1.3 NEW: Bullpen Quality Debug ──────────────────────────────
+        with st.expander("🔬 Debug: V1.3 Bullpen Quality Scores"):
+            st.caption("Per-team bullpen vulnerability (0=unhittable, 100=mop-up arms). "
+                       "High score = weak bullpen = good for batters. "
+                       "Was fixed at 42.0 for all teams in V1.2.")
+            bp_scores = st.session_state.get("team_bullpen_scores", {})
+            if bp_scores:
+                bp_df = pd.DataFrame([
+                    {"Team": t, "Bullpen Vuln Score": v,
+                     "Quality": "🔒 Elite" if v < 35 else "✅ Good" if v < 45 else "⚠️ Average" if v < 55 else "💀 Weak"}
+                    for t, v in sorted(bp_scores.items(), key=lambda x: x[1])
+                ])
+
+                def color_bp(val):
+                    try:
+                        v = float(val)
+                        if v < 35:  return "color: #00ff88; font-weight: bold"
+                        elif v < 45: return "color: #66ddff"
+                        elif v < 55: return "color: #ffdd00"
+                        return "color: #ff4444; font-weight: bold"
+                    except: return ""
+
+                styled_bp = bp_df.style.applymap(color_bp, subset=["Bullpen Vuln Score"])
+                st.dataframe(styled_bp, use_container_width=True)
+                st.caption(f"✅ {len(bp_scores)} teams scored | League avg baseline: 42.0")
+
+                # Show score impact on a sample batter
+                st.markdown("**Score impact example (avg batter, avg SP, score = 55):**")
+                example_rows = []
+                for label, bp_v in [("Best bullpen (score ~28)", 28), ("League avg (42)", 42), ("Worst bullpen (score ~62)", 62)]:
+                    sp_score_ex = 45.0  # avg SP
+                    blended_ex  = sp_score_ex * 0.60 + bp_v * 0.40
+                    example_rows.append({"Scenario": label, "SP Score": 45, "BP Vuln": bp_v,
+                                         "Blended Pit Score": round(blended_ex, 1)})
+                st.table(pd.DataFrame(example_rows))
+            else:
+                st.warning("Bullpen scores not computed — pitching_df may be missing GS or Team columns. "
+                           "All teams defaulting to league average (42.0). "
+                           "Run model and check pitching critical columns above.")
+
+        # ── V1.3 NEW: Per-player score breakdown debug ───────────────────
+        with st.expander("🔬 Debug: Score Component Breakdown (top 10 plays)"):
+            st.caption("Shows exactly how each sub-score contributed to the final score. "
+                       "BP Vuln = the opponent's bullpen score used for that batter.")
+            plays_debug = st.session_state.get("plays", [])
+            if plays_debug:
+                debug_rows = []
+                for p in plays_debug[:10]:
+                    debug_rows.append({
+                        "Player":     p["name"],
+                        "Team":       p["team"],
+                        "Opp":        p.get("opponent", "?"),
+                        "Final":      p["score"],
+                        "Batter":     p.get("sub_batter", "—"),
+                        "Pitcher":    p.get("sub_pitcher", "—"),
+                        "BP Vuln":    p.get("bullpen_vuln", "—"),
+                        "Platoon":    p.get("sub_platoon", "—"),
+                        "Park":       p.get("sub_park", "—"),
+                        "Weather":    p.get("sub_weather", "—"),
+                        "Vegas":      p.get("sub_vegas", "—"),
+                        "Lineup":     p.get("sub_lineup", "—"),
+                    })
+                st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+            else:
+                st.info("Run the model to see per-player score breakdowns.")
+
+        st.caption(f"v1.3 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
     # ── MAIN CONTENT ──────────────────────────────────────
-    st.title("⚾ MLB Total Bases Analyzer V1.0")
-    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4")
+    st.title("⚾ MLB Total Bases Analyzer V1.3")
+    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.3: Per-team bullpen quality")
     
     # Tabs
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
