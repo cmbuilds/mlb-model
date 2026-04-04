@@ -915,8 +915,10 @@ def get_batter_stats(player_name: str, mlb_id: str,
             stats["exit_velocity_avg"] = ev
 
         # ── Sweet Spot% ───────────────────────────────────────────────────
-        sweet = safe_get(row, 'Sweetspot%', 'sweet_spot_percent',
-                         'sweet_spot_rate', 'LA Sweet-Spot%', default=None)
+        # FanGraphs uses several column names across seasons/API versions
+        sweet = safe_get(row, 'Sweetspot%', 'SweetSpot%', 'Sweet-Spot%',
+                         'LA Sweet-Spot%', 'sweet_spot_percent',
+                         'sweet_spot_rate', 'SweetSpot', default=None)
         if sweet is not None and sweet > 0:
             stats["sweet_spot_rate"] = sweet if sweet < 1 else sweet / 100
 
@@ -1838,45 +1840,117 @@ def compute_hr_score(
     park_hr_factor: float,
     implied_total: float,
     weather: Dict,
-    hard_hit: float = 0.37
+    hard_hit: float = 0.37,
+    exit_velocity: float = 88.5,
+    iso: float = 0.165,
 ) -> float:
     """
     Compute dedicated HR upside score 0-100.
-    Used for Home Run Plays page.
+    V1.3: Added exit velocity and ISO signals. Reduced sweet_spot weight
+    since it was defaulting to league avg for everyone.
+
+    Signal weights (research-backed):
+    - Barrel%      40% — r=0.93 with HR rate, #1 predictor
+    - Park factor  20% — Coors/GABP vs pitcher's parks = real difference
+    - Hard hit%    12% — exit velocity proxy, correlates with HR distance
+    - Exit velocity 8% — direct measurement of batted ball power
+    - ISO           8% — raw power history, stable year-to-year
+    - Vegas implied 7% — high-total games = more HR opportunities
+    - Wind/weather  5% — 15mph out = ~15-20% more HRs
+
+    Sweet spot removed as primary signal (was 20%) — defaults to 30.5%
+    for too many players. Barrel% already captures optimal launch angle.
     """
-    # Barrel rate is #1 HR predictor (r=0.93)
-    barrel_score = min(100, barrel_rate / 0.20 * 100)
-    
-    # Sweet spot rate
-    sweet_score = min(100, sweet_spot / 0.40 * 100)
-    
-    # Park HR factor: 0.85=0, 1.0=50, 1.35=100
-    park_score = (park_hr_factor - 0.85) / (1.35 - 0.85) * 100
-    park_score = max(0, min(100, park_score))
-    
-    # Vegas implied
-    vegas_score = min(100, implied_total / 6.5 * 100)
-    
-    # Wind effect on HR
-    wind_bonus = 0
+    # ── Barrel% — #1 HR predictor (r=0.93) ────────────────────────────
+    # 0%=0, 10%=50, 20%=100 (Judge at 24.7% → capped at 100)
+    barrel_score = max(0, min(100, barrel_rate / 0.20 * 100))
+
+    # ── Hard hit% — contact quality / power proxy ─────────────────────
+    # 28%=0, 42%=50, 56%=100
+    hh_score = max(0, min(100, (hard_hit - 0.28) / (0.56 - 0.28) * 100))
+
+    # ── Exit velocity — direct power measurement ───────────────────────
+    # 82mph=0, 89mph=50, 96mph+=100
+    ev_score = max(0, min(100, (exit_velocity - 82.0) / (96.0 - 82.0) * 100))
+
+    # ── ISO — raw power history ────────────────────────────────────────
+    # .080=0, .180=50, .320=100
+    iso_score = max(0, min(100, (iso - 0.080) / (0.320 - 0.080) * 100))
+
+    # ── Park HR factor ─────────────────────────────────────────────────
+    # 0.85=0, 1.00=30, 1.35=100
+    park_score = max(0, min(100, (park_hr_factor - 0.85) / (1.35 - 0.85) * 100))
+
+    # ── Vegas implied total ────────────────────────────────────────────
+    # 3.0=0, 4.5=50, 6.5=100
+    vegas_score = max(0, min(100, (implied_total - 3.0) / (6.5 - 3.0) * 100)) if implied_total > 0 else 40.0
+
+    # ── Wind / weather — dynamic weight based on speed ────────────────
+    # Wind is conditionally significant: 20mph out = ~25% more HRs, 7mph = noise.
+    # Strategy: scale both the bonus AND its weight by wind speed.
+    # Below 8mph: neutral, near-zero weight (don't let calm wind steal weight
+    # from barrel% and park factor).
+    # 8-14mph: moderate signal, ~8% weight.
+    # 15mph+: strong signal, up to 15% weight — redistributed from park_score.
+    wind_raw    = 0.0   # raw directional adjustment (-100 to +100 scale)
+    wind_weight = 0.0   # dynamic weight pulled into composite
+
     if not weather.get("is_dome"):
         effect = weather.get("wind_effect", "neutral")
-        speed = weather.get("wind_speed", 0)
-        if effect == "strong_out":
-            wind_bonus = 25
-        elif effect == "out":
-            wind_bonus = 15
-        elif effect == "in":
-            wind_bonus = -20
-    
-    composite = (
+        speed  = float(weather.get("wind_speed", 0))
+        temp   = float(weather.get("temperature", 70))
+
+        if speed >= 8:
+            # Scale wind effect linearly with speed: 8mph=base, 25mph=max
+            speed_factor = min(1.0, (speed - 8.0) / (25.0 - 8.0))
+
+            if effect == "strong_out":
+                wind_raw = 80.0 * speed_factor      # up to +80 pts on 0-100 scale
+                wind_weight = 0.08 + 0.07 * speed_factor  # 8-15% weight
+            elif effect == "out":
+                wind_raw = 55.0 * speed_factor
+                wind_weight = 0.05 + 0.07 * speed_factor
+            elif effect == "in":
+                wind_raw = -70.0 * speed_factor     # suppresses HRs hard
+                wind_weight = 0.05 + 0.07 * speed_factor
+            else:
+                wind_raw = 0.0
+                wind_weight = 0.0
+
+        # Temperature: cold air is denser, suppresses HR distance
+        # Add directly to composite as a fixed small adjustment (not weight-scaled)
+        temp_adj = 0.0
+        if temp < 45:
+            temp_adj = -8.0
+        elif temp < 55:
+            temp_adj = -4.0
+        elif temp > 85:
+            temp_adj = +4.0
+        elif temp > 92:
+            temp_adj = +7.0
+    else:
+        temp_adj = 0.0
+
+    # Redistribute weight: wind steals from park_score when significant
+    # (a 20mph out wind matters more than a 1.05x park factor)
+    adjusted_park_weight = max(0.08, 0.20 - wind_weight)
+
+    # ── Composite ─────────────────────────────────────────────────────
+    base = (
         barrel_score * 0.40 +
-        sweet_score * 0.20 +
-        park_score * 0.25 +
-        vegas_score * 0.10 +
-        min(25, max(-20, wind_bonus)) * 0.05 + 50 * 0.05  # wind normalized
+        park_score   * adjusted_park_weight +
+        hh_score     * 0.12 +
+        ev_score     * 0.08 +
+        iso_score    * 0.08 +
+        vegas_score  * 0.07
     )
-    
+
+    # Remaining weight after dynamic redistribution goes to barrel (already dominant)
+    # Wind contribution: wind_raw is on a 0-100 scale, weighted dynamically
+    wind_contribution = wind_raw * wind_weight if wind_weight > 0 else 0.0
+
+    composite = base + wind_contribution + temp_adj
+
     return max(0, min(100, round(composite, 1)))
 
 # ============================================================================
@@ -2254,6 +2328,8 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 implied_total=implied,
                 weather=weather,
                 hard_hit=batter_statcast.get("hard_hit_rate", 0.37),
+                exit_velocity=batter_statcast.get("exit_velocity_avg", 88.5),
+                iso=batter_statcast.get("iso_proxy", 0.165),
             )
 
             results.append({
@@ -2884,22 +2960,26 @@ def display_hr_plays(plays: List[Dict]):
     """Display top HR upside plays."""
     
     st.header("💣 Home Run Plays")
-    st.caption("Top 10 daily HR candidates. Powered by barrel rate, sweet spot%, park HR factor, and wind vector.")
-    
+    st.caption("Top 10 daily HR candidates. Powered by barrel rate, hard hit%, exit velocity, ISO, park factor, wind, and implied total.")
+
     hr_sorted = sorted(plays, key=lambda x: x["hr_score"], reverse=True)[:10]
-    
+
     rows = []
     for p in hr_sorted:
         wind_label = p.get("weather_label", "").split("|")[0].strip()
         park_name = STADIUM_COORDS.get(p["park"], (0, 0, p["park"], False))[2]
-        
+        sweet = p.get("sweet_spot_rate", 0)
+
         rows.append({
             "HR Score": f"{p['hr_score']:.0f}",
             "Player": p["name"],
             "Team": p["team"],
             "Opp SP": p["sp_name"][:20],
             "Barrel%": f"{p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "—",
-            "Sweet Spot%": f"{p['sweet_spot_rate']*100:.1f}%" if p["sweet_spot_rate"] else "—",
+            "HH%": f"{p['hard_hit_rate']*100:.1f}%" if p.get("hard_hit_rate") else "—",
+            "EV": f"{p.get('exit_velocity', 0):.1f}" if p.get("exit_velocity", 0) > 0 else "—",
+            "ISO": f"{p.get('iso', 0):.3f}" if p.get("iso", 0) > 0 else "—",
+            "Sweet Spot%": f"{sweet*100:.1f}%" if sweet and sweet != 0.305 else "—",
             "Park HR Factor": f"{PARK_HR_FACTORS.get(p['park'], 1.0):.2f}x",
             "Park": park_name[:20],
             "Wind": p.get("wind_dir", "") + f" {p.get('wind_speed', 0):.0f}mph",
@@ -2932,7 +3012,9 @@ def display_hr_plays(plays: List[Dict]):
             col1, col2 = st.columns(2)
             with col1:
                 st.write(f"**Barrel%:** {p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "**Barrel%:** —")
-                st.write(f"**Sweet Spot%:** {p['sweet_spot_rate']*100:.1f}%" if p["sweet_spot_rate"] else "**Sweet Spot%:** —")
+                st.write(f"**Hard Hit%:** {p['hard_hit_rate']*100:.1f}%" if p.get("hard_hit_rate") else "**Hard Hit%:** —")
+                st.write(f"**Exit Velocity:** {p.get('exit_velocity', 0):.1f} mph" if p.get("exit_velocity", 0) > 0 else "**Exit Velocity:** —")
+                st.write(f"**ISO:** {p.get('iso', 0):.3f}" if p.get("iso", 0) > 0 else "**ISO:** —")
                 st.write(f"**Park:** {STADIUM_COORDS.get(p['park'], (0,0,p['park'],False))[2]}")
                 st.write(f"**Park HR Factor:** {PARK_HR_FACTORS.get(p['park'], 1.0):.2f}x")
             with col2:
