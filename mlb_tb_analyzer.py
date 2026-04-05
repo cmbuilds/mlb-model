@@ -3530,7 +3530,7 @@ def display_hits_tab(plays: List[Dict]):
     with col1:
         if not picks_df.empty:
             csv = picks_df.to_csv(index=False)
-            st.download_button("📥 Export All Picks", csv, "mlb_picks_history.csv", "text/csv")
+            st.download_button("📥 Export All Picks", csv, "mlb_picks_history.csv", "text/csv", key="dl_picks_history")
     with col2:
         if not parlays_df.empty:
             csv = parlays_df.to_csv(index=False)
@@ -5447,7 +5447,7 @@ Tomorrow's plays drop at 12PM EST 🔒"""
     st.markdown("---")
     if not all_picks_df.empty:
         st.download_button("📥 Export All Picks", all_picks_df.to_csv(index=False),
-                           "mlb_picks.csv", "text/csv")
+                           "mlb_picks.csv", "text/csv", key="dl_all_picks_top")
 
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -5649,7 +5649,7 @@ Tomorrow's plays dropping at 12PM EST 🔒"""
     with col1:
         if not picks_df.empty:
             st.download_button("📥 Export All Picks", picks_df.to_csv(index=False),
-                               "mlb_picks.csv", "text/csv")
+                               "mlb_picks.csv", "text/csv", key="dl_all_picks_bot")
     with col2:
         if not parlays_df.empty:
             st.download_button("📥 Export Parlays", parlays_df.to_csv(index=False),
