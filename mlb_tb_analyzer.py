@@ -5361,10 +5361,11 @@ def display_results_tracker():
 
     if not fresh_tiered.empty and fresh_tiered["result"].isin(["hit","miss","dnp"]).any():
         date_fmt = selected_date.strftime("%-m/%-d")
-        lines_tb, lines_hr = [], []
-        hits_c, misses_c, dnp_c = 0, 0, 0
 
-        for _, r in fresh_tiered.head(10).iterrows():
+        # ── TOP 5 TB PICKS (matches the bet card you post) ────────────────────
+        lines_tb = []
+        hits_c, misses_c, dnp_c = 0, 0, 0
+        for _, r in fresh_tiered.head(5).iterrows():
             res = r.get("result", "pending")
             tb  = int(r["tb_actual"]) if pd.notna(r.get("tb_actual")) else 0
             nm  = r["player_name"]
@@ -5378,14 +5379,23 @@ def display_results_tracker():
                 lines_tb.append(f"⚠️ {nm} — DNP")
                 dnp_c += 1
 
-        for _, r in top5.iterrows():
+        # ── TOP 2 HR CALLS — ✅ only if actual HR (tb >= 4), ❌ otherwise ─────
+        lines_hr = []
+        hr_col_use = "hr_score" if "hr_score" in fresh_tiered.columns else "model_score"
+        top2_hr = fresh_tiered.nlargest(2, hr_col_use)
+        hr_hits_c = 0
+        hr_total_c = 0
+        for _, r in top2_hr.iterrows():
             res = r.get("result", "pending")
             tb  = int(r["tb_actual"]) if pd.notna(r.get("tb_actual")) else 0
             nm  = r["player_name"]
+            if res in ("hit", "miss", "dnp"):
+                hr_total_c += 1
             if res == "hit" and tb >= 4:
                 lines_hr.append(f"💣 {nm} — HR ✅")
+                hr_hits_c += 1
             elif res == "hit":
-                lines_hr.append(f"✅ {nm} — {tb} TB (no HR)")
+                lines_hr.append(f"❌ {nm} — {tb} TB (no HR)")
             elif res == "miss":
                 lines_hr.append(f"❌ {nm} — {tb} TB")
             elif res == "dnp":
@@ -5393,26 +5403,33 @@ def display_results_tracker():
 
         total_res = hits_c + misses_c
         hit_pct   = f"{hits_c/total_res*100:.0f}%" if total_res > 0 else "—"
+        hr_pct    = f"{hr_hits_c}/{hr_total_c}" if hr_total_c > 0 else "—"
 
         discord = f"""📊 DAILY RECAP — {date_fmt}
 ━━━━━━━━━━━━━━━━━━━
 
-⚾ O1.5 TB PICKS (Top 10)
+⚾ O1.5 TB PICKS
 {chr(10).join(lines_tb) if lines_tb else "Results pending..."}
 
-💣 HR CALLS (Top 5)
+💣 HR CALLS
 {chr(10).join(lines_hr) if lines_hr else "Results pending..."}
 
 ━━━━━━━━━━━━━━━━━━━
 🎯 TB: {hits_c}/{total_res} cashed ({hit_pct}){(" · ⚠️ " + str(dnp_c) + " DNP") if dnp_c > 0 else ""}
+💣 HR: {hr_pct} hit
 
 Tomorrow's plays drop at 12PM EST 🔒"""
 
+        # Twitter — clean and concise
+        tb_short  = " · ".join(lines_tb) if lines_tb else "pending"
+        hr_short  = " · ".join(lines_hr) if lines_hr else "pending"
         twitter = f"""Result {date_fmt}
 
-TB: {" · ".join(lines_tb[:5]) if lines_tb else "pending"}
+{tb_short}
 
-{hits_c}/{total_res} cashed{(" · " + str(dnp_c) + " DNP") if dnp_c > 0 else ""}
+💣 {hr_short}
+
+{hits_c}/{total_res} TB cashed{(" · " + str(dnp_c) + " DNP") if dnp_c > 0 else ""} · HR {hr_pct}
 
 #MLBbets #SportsBetting"""
 
