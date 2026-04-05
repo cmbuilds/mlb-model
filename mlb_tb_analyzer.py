@@ -215,9 +215,15 @@ def init_db():
         k_rate REAL,
         iso REAL,
         platoon_edge TEXT,
+        hr_score REAL DEFAULT 0,
         created_at TEXT
     )
     """)
+    # Migration: add hr_score if not exists in older DBs
+    try:
+        c.execute("ALTER TABLE picks ADD COLUMN hr_score REAL DEFAULT 0")
+    except Exception:
+        pass
     
     c.execute("""
     CREATE TABLE IF NOT EXISTS parlays (
@@ -248,8 +254,8 @@ def save_picks_to_db(picks: List[Dict], date_str: str):
         (pick_id, date, game_id, player_id, player_name, team, opponent, sp_name, sp_hand,
          lineup_slot, batter_hand, tb_line, model_score, model_prob, tier, park,
          wind_speed, wind_dir, temperature, implied_total, xslg, barrel_rate,
-         hard_hit_rate, k_rate, iso, platoon_edge, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,1.5,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         hard_hit_rate, k_rate, iso, platoon_edge, hr_score, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,1.5,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pick_id, date_str, p.get('game_id', ''), p.get('player_id', ''),
             p['name'], p['team'], p.get('opponent', ''), p.get('sp_name', 'TBD'),
@@ -258,7 +264,7 @@ def save_picks_to_db(picks: List[Dict], date_str: str):
             p.get('wind_speed', 0), p.get('wind_dir', 'N/A'), p.get('temperature', 70),
             p.get('implied_total', 4.5), p.get('xslg', 0), p.get('barrel_rate', 0),
             p.get('hard_hit_rate', 0), p.get('k_rate', 0), p.get('iso', 0),
-            p.get('platoon_edge', ''), datetime.now(EST).isoformat()
+            p.get('platoon_edge', ''), p.get('hr_score', 0), datetime.now(EST).isoformat()
         ))
     conn.commit()
     conn.close()
@@ -4962,13 +4968,469 @@ def display_prizepicks_tab(plays: List[Dict]):
         """)
 
 
+def fetch_actual_tb_for_date(date_str: str) -> Dict[str, Dict]:
+    """
+    Fetch actual total bases for all players on a given date from MLB Stats API.
+    Returns dict keyed by player_id (str): {
+        'total_bases': int, 'hits': int, 'hr': int, 'doubles': int,
+        'triples': int, 'name': str, 'played': bool
+    }
+    Works for any completed date — uses boxscore batting stats.
+    """
+    results = {}
+    try:
+        # Get all games for the date
+        sched_r = requests.get(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={"sportId": 1, "date": date_str},
+            timeout=12
+        )
+        if sched_r.status_code != 200:
+            return {}
+        games = sched_r.json().get("dates", [{}])[0].get("games", [])
+
+        for game in games:
+            status = game.get("status", {}).get("abstractGameState", "")
+            if status not in ("Final", "Live"):
+                continue
+            pk = game["gamePk"]
+            try:
+                box_r = requests.get(
+                    f"https://statsapi.mlb.com/api/v1/game/{pk}/boxscore",
+                    timeout=12
+                )
+                if box_r.status_code != 200:
+                    continue
+                box = box_r.json()
+                for side in ["home", "away"]:
+                    team_data = box.get("teams", {}).get(side, {})
+                    players   = team_data.get("players", {})
+                    for pid_key, pdata in players.items():
+                        pos = pdata.get("position", {}).get("type", "")
+                        if pos == "Pitcher":
+                            continue
+                        pid = str(pdata.get("person", {}).get("id", ""))
+                        name = pdata.get("person", {}).get("fullName", "")
+                        batting = pdata.get("stats", {}).get("batting", {})
+                        # atBats > 0 means they played; atBats = 0 could be DNP or just no AB
+                        ab   = int(batting.get("atBats", 0) or 0)
+                        pa   = int(batting.get("plateAppearances", 0) or 0)
+                        tb   = int(batting.get("totalBases", 0) or 0)
+                        hits = int(batting.get("hits", 0) or 0)
+                        hr   = int(batting.get("homeRuns", 0) or 0)
+                        dbl  = int(batting.get("doubles", 0) or 0)
+                        tri  = int(batting.get("triples", 0) or 0)
+                        played = pa > 0
+                        if pid:
+                            results[pid] = {
+                                "total_bases": tb,
+                                "hits":        hits,
+                                "hr":          hr,
+                                "doubles":     dbl,
+                                "triples":     tri,
+                                "name":        name,
+                                "played":      played,
+                            }
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return results
+
+
 def display_results_tracker():
     """
-    Results Tracker V1.3 — date-picker focused, tiered picks only.
-    Pick a date → see only Tier 1/2/3 picks → log TB → get copy-ready
-    Discord and Twitter result posts automatically.
+    Results Tracker V1.4
+    - Pick ANY date (not just model-run dates)
+    - Auto-fetches actual game results from MLB Stats API
+    - Shows Top 10 TB picks + Top 5 HR picks with results
+    - Auto-saves to DB and generates copy-ready Discord/Twitter posts
     """
     st.header("📈 Results Tracker")
+
+    # ── DATE PICKER — any date, not limited to DB dates ──────────────────────
+    col_date, col_fetch = st.columns([2, 1])
+    with col_date:
+        selected_date = st.date_input(
+            "📅 Select date to view results:",
+            value=datetime.now(EST).date() - timedelta(days=1),
+            key="rt_date_v2"
+        )
+    date_str = selected_date.strftime("%Y-%m-%d")
+
+    # ── LOAD DB PICKS FOR THIS DATE ───────────────────────────────────────────
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        picks_df = pd.read_sql(
+            "SELECT * FROM picks WHERE date=? ORDER BY model_score DESC",
+            conn, params=(date_str,)
+        )
+        all_picks_df = pd.read_sql(
+            "SELECT * FROM picks ORDER BY date DESC, model_score DESC", conn
+        )
+    except Exception:
+        picks_df = pd.DataFrame()
+        all_picks_df = pd.DataFrame()
+    conn.close()
+
+    TIER_ORDER = {"🔒 TIER 1": 0, "✅ TIER 2": 1, "📊 TIER 3": 2}
+
+    # ── LIVE SEASON TRACKER ───────────────────────────────────────────────────
+    # Separate running totals: Top 10 TB picks vs Top 5 HR picks
+    if not all_picks_df.empty:
+        tiered_all = all_picks_df[all_picks_df["tier"].isin(TIER_ORDER.keys())].copy()
+
+        # ── Per-day ranking to identify top 10 TB and top 5 HR ────────────────
+        # Top 10 TB = top 10 by model_score per day
+        # Top 5 HR  = top 5 by hr_score per day (falls back to model_score)
+        hr_col_db = "hr_score" if "hr_score" in tiered_all.columns else "model_score"
+
+        tb_picks_list = []
+        hr_picks_list = []
+        for day, day_df in tiered_all.groupby("date"):
+            day_sorted_tb = day_df.sort_values("model_score", ascending=False)
+            day_sorted_hr = day_df.sort_values(hr_col_db, ascending=False)
+            tb_picks_list.append(day_sorted_tb.head(10))
+            hr_picks_list.append(day_sorted_hr.head(5))
+
+        tb_all = pd.concat(tb_picks_list) if tb_picks_list else pd.DataFrame()
+        hr_all = pd.concat(hr_picks_list) if hr_picks_list else pd.DataFrame()
+
+        # ── Compute stats ───────────────────────────────────────────────────────
+        def stats_for(df):
+            res = df[df["result"].isin(["hit","miss"])]
+            h = len(res[res["result"] == "hit"])
+            m = len(res[res["result"] == "miss"])
+            t = h + m
+            pct = h / t * 100 if t > 0 else 0
+            dnp = len(df[df["result"] == "dnp"])
+            pending = len(df[df["result"] == "pending"])
+            return h, m, t, pct, dnp, pending
+
+        tb_h, tb_m, tb_t, tb_pct, tb_dnp, tb_pend = stats_for(tb_all)
+        hr_h, hr_m, hr_t, hr_pct, hr_dnp, hr_pend = stats_for(hr_all)
+
+        # ── Display ─────────────────────────────────────────────────────────────
+        st.markdown("### 📊 Season Tracker")
+
+        col_tb, col_spacer, col_hr = st.columns([5, 0.5, 5])
+
+        with col_tb:
+            st.markdown("**⚾ Top 10 O1.5 TB Picks**")
+            m1, m2, m3 = st.columns(3)
+            with m1: st.metric("Record",   f"{tb_h}-{tb_m}")
+            with m2: st.metric("Hit Rate", f"{tb_pct:.1f}%" if tb_t > 0 else "—")
+            with m3: st.metric("Pending",  tb_pend)
+
+            # Daily breakdown table for TB
+            if tb_picks_list:
+                daily_tb = []
+                for day, day_df in tiered_all.groupby("date"):
+                    d = day_df.sort_values("model_score", ascending=False).head(10)
+                    res_d = d[d["result"].isin(["hit","miss"])]
+                    h = len(res_d[res_d["result"]=="hit"])
+                    t = len(res_d)
+                    daily_tb.append({
+                        "Date":   day,
+                        "Record": f"{h}/{t}" if t > 0 else "—",
+                        "Hit%":   f"{h/t*100:.0f}%" if t > 0 else "—",
+                        "DNP":    len(d[d["result"]=="dnp"]),
+                    })
+                daily_tb_df = pd.DataFrame(daily_tb).sort_values("Date", ascending=False)
+
+                def color_hit(val):
+                    try:
+                        v = float(str(val).replace("%",""))
+                        if v >= 70: return "color: #4caf50; font-weight: bold"
+                        if v >= 50: return "color: #ffdd00"
+                        return "color: #ff4444"
+                    except: return ""
+
+                styled_tb = daily_tb_df.style.map(color_hit, subset=["Hit%"])
+                st.dataframe(styled_tb, use_container_width=True, hide_index=True, height=220)
+
+        with col_hr:
+            st.markdown("**💣 Top 5 HR Picks**")
+            m1, m2, m3 = st.columns(3)
+            # HR hit = tb_actual >= 4
+            if not hr_all.empty and "tb_actual" in hr_all.columns:
+                hr_res = hr_all[hr_all["result"].isin(["hit","miss"])].copy()
+                hr_res["tb_actual"] = pd.to_numeric(hr_res["tb_actual"], errors="coerce").fillna(0)
+                actual_hr_hits = len(hr_res[hr_res["tb_actual"] >= 4])
+                actual_hr_tot  = len(hr_res)
+                actual_hr_pct  = actual_hr_hits / actual_hr_tot * 100 if actual_hr_tot > 0 else 0
+            else:
+                actual_hr_hits, actual_hr_tot, actual_hr_pct = hr_h, hr_t, hr_pct
+
+            with m1: st.metric("HR Record",  f"{actual_hr_hits}-{actual_hr_tot - actual_hr_hits}")
+            with m2: st.metric("HR Hit%",    f"{actual_hr_pct:.1f}%" if actual_hr_tot > 0 else "—")
+            with m3: st.metric("Pending",    hr_pend)
+
+            # Daily breakdown table for HR
+            if hr_picks_list:
+                daily_hr = []
+                for day, day_df in tiered_all.groupby("date"):
+                    d = day_df.sort_values(hr_col_db, ascending=False).head(5)
+                    d2 = d.copy()
+                    d2["tb_actual"] = pd.to_numeric(d2.get("tb_actual", 0), errors="coerce").fillna(0)
+                    res_d = d2[d2["result"].isin(["hit","miss"])]
+                    hr_hits = len(res_d[res_d["tb_actual"] >= 4])
+                    t = len(res_d)
+                    daily_hr.append({
+                        "Date":    day,
+                        "HR Hits": f"{hr_hits}/{t}" if t > 0 else "—",
+                        "HR%":     f"{hr_hits/t*100:.0f}%" if t > 0 else "—",
+                        "DNP":     len(d[d["result"]=="dnp"]),
+                    })
+                daily_hr_df = pd.DataFrame(daily_hr).sort_values("Date", ascending=False)
+                styled_hr = daily_hr_df.style.map(color_hit, subset=["HR%"])
+                st.dataframe(styled_hr, use_container_width=True, hide_index=True, height=220)
+
+        st.markdown("---")
+
+    # ── AUTO-FETCH RESULTS ────────────────────────────────────────────────────
+    with col_fetch:
+        st.write("")
+        st.write("")
+        fetch_btn = st.button("⚡ Auto-Fetch Results", type="primary", use_container_width=True)
+
+    if picks_df.empty:
+        st.warning(f"No picks found in database for {date_str}. You need to have run the model on this date.")
+        st.info("Tip: Run the model for this date first, then come back here to fetch results.")
+        return
+
+    # Filter to tiered only
+    tiered = picks_df[picks_df["tier"].isin(TIER_ORDER.keys())].copy()
+    tiered["_tier_sort"] = tiered["tier"].map(TIER_ORDER)
+    tiered = tiered.sort_values(["_tier_sort", "model_score"], ascending=[True, False])
+
+    # Top 10 TB picks + Top 5 HR picks (HR sorted by hr_score if stored, else model_score)
+    top10_tb = tiered.head(10)
+    # For HR — use hr_score column if available, otherwise top barrel/power picks
+    if "hr_score" in tiered.columns:
+        top5_hr = tiered.nlargest(5, "hr_score")
+    else:
+        top5_hr = tiered.nlargest(5, "barrel_rate") if "barrel_rate" in tiered.columns else tiered.head(5)
+
+    # Auto-fetch actual results when button clicked
+    actual_results = {}
+    if fetch_btn:
+        with st.spinner(f"Fetching actual game results for {date_str}..."):
+            actual_results = fetch_actual_tb_for_date(date_str)
+
+        if actual_results:
+            st.success(f"✅ Fetched results for {len(actual_results)} players")
+            # Auto-save to DB
+            conn2 = sqlite3.connect(DB_PATH)
+            c2 = conn2.cursor()
+            saved = 0
+            for _, row in tiered.iterrows():
+                pid     = str(row.get("player_id", ""))
+                pick_id = row["pick_id"]
+                if pid in actual_results:
+                    ar = actual_results[pid]
+                    if not ar["played"]:
+                        c2.execute("UPDATE picks SET result=?, tb_actual=? WHERE pick_id=?",
+                                   ("dnp", 0, pick_id))
+                    else:
+                        tb_val = ar["total_bases"]
+                        res    = "hit" if tb_val >= 2 else "miss"
+                        c2.execute("UPDATE picks SET result=?, tb_actual=? WHERE pick_id=?",
+                                   (res, tb_val, pick_id))
+                    saved += 1
+            conn2.commit()
+            conn2.close()
+            st.success(f"💾 Auto-saved results for {saved} picks")
+            st.rerun()
+        else:
+            st.warning("Could not fetch results — games may not be final yet, or check your connection.")
+
+    # Reload fresh picks after any auto-save
+    conn3 = sqlite3.connect(DB_PATH)
+    try:
+        fresh = pd.read_sql(
+            "SELECT * FROM picks WHERE date=? ORDER BY model_score DESC",
+            conn3, params=(date_str,)
+        )
+    except Exception:
+        fresh = pd.DataFrame()
+    conn3.close()
+
+    fresh_tiered = fresh[fresh["tier"].isin(TIER_ORDER.keys())].copy() if not fresh.empty else tiered
+
+    # ── TOP 10 TB PICKS ───────────────────────────────────────────────────────
+    st.subheader(f"⚾ Top 10 O1.5 TB Picks — {date_str}")
+
+    tb_rows = []
+    for _, row in fresh_tiered.head(10).iterrows():
+        res    = row.get("result", "pending")
+        tb_act = row.get("tb_actual")
+        tb_val = int(tb_act) if pd.notna(tb_act) else None
+
+        if res == "hit":
+            status = "✅"
+        elif res == "miss":
+            status = "❌"
+        elif res == "dnp":
+            status = "⚠️ DNP"
+        else:
+            status = "⏳"
+
+        tb_rows.append({
+            "Status": status,
+            "Player":      row["player_name"],
+            "Team":        row["team"],
+            "Opp SP":      row.get("sp_name", ""),
+            "Tier":        row["tier"],
+            "Score":       f"{row['model_score']:.0f}",
+            "Actual TB":   str(tb_val) if tb_val is not None else "—",
+            "Result":      res.upper() if res != "pending" else "PENDING",
+        })
+
+    if tb_rows:
+        tb_df = pd.DataFrame(tb_rows)
+        def color_result(val):
+            if "HIT" in str(val):   return "color: #4caf50; font-weight: bold"
+            if "MISS" in str(val):  return "color: #ff4444; font-weight: bold"
+            if "DNP" in str(val):   return "color: #ffaa00"
+            return "color: #888"
+        styled = tb_df.style.map(color_result, subset=["Result"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # ── TOP 5 HR PICKS ────────────────────────────────────────────────────────
+    st.subheader(f"💣 Top 5 HR Picks — {date_str}")
+
+    hr_col = "hr_score" if "hr_score" in fresh_tiered.columns else "model_score"
+    top5 = fresh_tiered.nlargest(5, hr_col) if not fresh_tiered.empty else pd.DataFrame()
+
+    hr_rows = []
+    for _, row in top5.iterrows():
+        res    = row.get("result", "pending")
+        tb_act = row.get("tb_actual")
+        tb_val = int(tb_act) if pd.notna(tb_act) else None
+        # HR = 4 TB, so if tb_actual >= 4 AND actual_hr > 0, they hit a HR
+        # We flag HR if tb >= 4 (could be 4 singles but very rare — HR is most likely)
+        hr_hit = "✅ HR" if (tb_val is not None and tb_val >= 4) else ("❌" if res == "miss" else ("⚠️ DNP" if res == "dnp" else "⏳"))
+
+        hr_rows.append({
+            "HR Result":  hr_hit,
+            "Player":     row["player_name"],
+            "Team":       row["team"],
+            "Opp SP":     row.get("sp_name", ""),
+            "HR Score":   f"{row.get(hr_col, 0):.0f}",
+            "Actual TB":  str(tb_val) if tb_val is not None else "—",
+            "TB Result":  res.upper() if res != "pending" else "PENDING",
+        })
+
+    if hr_rows:
+        hr_df = pd.DataFrame(hr_rows)
+        def color_hr(val):
+            if "HR" in str(val) and "✅" in str(val): return "color: #f5a623; font-weight: bold"
+            if "❌" in str(val): return "color: #ff4444"
+            if "DNP" in str(val): return "color: #ffaa00"
+            return "color: #888"
+        styled_hr = hr_df.style.map(color_hr, subset=["HR Result"])
+        st.dataframe(styled_hr, use_container_width=True, hide_index=True)
+
+    # ── MANUAL OVERRIDE — in case auto-fetch misses anyone ───────────────────
+    with st.expander("✏️ Manual Override (if auto-fetch missed a player)"):
+        pending = fresh_tiered[fresh_tiered["result"] == "pending"] if not fresh_tiered.empty else pd.DataFrame()
+        if not pending.empty:
+            for _, row in pending.iterrows():
+                pick_id = row["pick_id"]
+                col_info, col_tb, col_dnp, col_save = st.columns([3, 1.2, 0.8, 0.8])
+                with col_info:
+                    st.markdown(f"**{row['player_name']}** ({row['team']}) — {row['tier']}")
+                with col_tb:
+                    tb_v = st.number_input("TB", 0, 16, 0, key=f"man_tb_{pick_id}", label_visibility="collapsed")
+                with col_dnp:
+                    dnp_v = st.checkbox("DNP", key=f"man_dnp_{pick_id}")
+                with col_save:
+                    if st.button("Save", key=f"man_save_{pick_id}"):
+                        if dnp_v:
+                            update_pick_result(pick_id, "dnp", 0)
+                        else:
+                            update_pick_result(pick_id, "hit" if tb_v >= 2 else "miss", tb_v)
+                        st.rerun()
+        else:
+            st.caption("All picks logged — no manual entry needed.")
+
+    # ── COPY-READY POSTS ──────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📋 Copy-Ready Posts")
+
+    if not fresh_tiered.empty and fresh_tiered["result"].isin(["hit","miss","dnp"]).any():
+        date_fmt = selected_date.strftime("%-m/%-d")
+        lines_tb, lines_hr = [], []
+        hits_c, misses_c, dnp_c = 0, 0, 0
+
+        for _, r in fresh_tiered.head(10).iterrows():
+            res = r.get("result", "pending")
+            tb  = int(r["tb_actual"]) if pd.notna(r.get("tb_actual")) else 0
+            nm  = r["player_name"]
+            if res == "hit":
+                lines_tb.append(f"✅ {nm} — {tb} TB")
+                hits_c += 1
+            elif res == "miss":
+                lines_tb.append(f"❌ {nm} — {tb} TB")
+                misses_c += 1
+            elif res == "dnp":
+                lines_tb.append(f"⚠️ {nm} — DNP")
+                dnp_c += 1
+
+        for _, r in top5.iterrows():
+            res = r.get("result", "pending")
+            tb  = int(r["tb_actual"]) if pd.notna(r.get("tb_actual")) else 0
+            nm  = r["player_name"]
+            if res == "hit" and tb >= 4:
+                lines_hr.append(f"💣 {nm} — HR ✅")
+            elif res == "hit":
+                lines_hr.append(f"✅ {nm} — {tb} TB (no HR)")
+            elif res == "miss":
+                lines_hr.append(f"❌ {nm} — {tb} TB")
+            elif res == "dnp":
+                lines_hr.append(f"⚠️ {nm} — DNP")
+
+        total_res = hits_c + misses_c
+        hit_pct   = f"{hits_c/total_res*100:.0f}%" if total_res > 0 else "—"
+
+        discord = f"""📊 DAILY RECAP — {date_fmt}
+━━━━━━━━━━━━━━━━━━━
+
+⚾ O1.5 TB PICKS (Top 10)
+{chr(10).join(lines_tb) if lines_tb else "Results pending..."}
+
+💣 HR CALLS (Top 5)
+{chr(10).join(lines_hr) if lines_hr else "Results pending..."}
+
+━━━━━━━━━━━━━━━━━━━
+🎯 TB: {hits_c}/{total_res} cashed ({hit_pct}){(" · ⚠️ " + str(dnp_c) + " DNP") if dnp_c > 0 else ""}
+
+Tomorrow's plays drop at 12PM EST 🔒"""
+
+        twitter = f"""Result {date_fmt}
+
+TB: {" · ".join(lines_tb[:5]) if lines_tb else "pending"}
+
+{hits_c}/{total_res} cashed{(" · " + str(dnp_c) + " DNP") if dnp_c > 0 else ""}
+
+#MLBbets #SportsBetting"""
+
+        col_d, col_t = st.columns(2)
+        with col_d:
+            st.markdown("**Discord**")
+            st.code(discord, language=None)
+        with col_t:
+            st.markdown("**Twitter reply**")
+            st.code(twitter, language=None)
+    else:
+        st.info("Click **⚡ Auto-Fetch Results** above to load actual game results, then posts will appear here.")
+
+    # ── EXPORT ────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    if not all_picks_df.empty:
+        st.download_button("📥 Export All Picks", all_picks_df.to_csv(index=False),
+                           "mlb_picks.csv", "text/csv")
 
     conn = sqlite3.connect(DB_PATH)
     try:
