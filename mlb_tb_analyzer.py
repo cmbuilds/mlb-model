@@ -40,7 +40,7 @@ import pytz
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="⚾ MLB TB Analyzer V1.3",
+    page_title="⚾ MLB TB Analyzer V1.0",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="auto"
@@ -280,8 +280,125 @@ def update_pick_result(pick_id: str, result: str, tb_actual: int):
     c = conn.cursor()
     c.execute("UPDATE picks SET result=?, tb_actual=? WHERE pick_id=?",
               (result, tb_actual, pick_id))
+    conn.commit()()
+    conn.close()
+
+def fetch_results_for_date(date_str: str) -> Dict:
+    """
+    Auto-fetch actual total bases for all tiered pending picks on a given date.
+    Hits MLB Stats API boxscore endpoint for each game, calculates TB per player,
+    updates DB. Returns summary dict with counts.
+    Singles=1, Doubles=2, Triples=3, HR=4. Walks/HBP/SB = 0.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    pending = pd.read_sql(
+        "SELECT * FROM picks WHERE date=? AND result='pending' AND tier NOT LIKE '%NO PLAY%'",
+        conn, params=(date_str,)
+    )
+    conn.close()
+
+    if pending.empty:
+        return {"status": "no_pending", "updated": 0, "skipped": 0, "details": []}
+
+    # Get all unique game_ids for this date
+    game_ids = pending["game_id"].dropna().unique().tolist()
+    game_ids = [g for g in game_ids if g and str(g).strip() not in ("", "0", "nan")]
+
+    # If no game_ids stored, try fetching from schedule
+    if not game_ids:
+        try:
+            url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=boxscore"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            for date_obj in data.get("dates", []):
+                for game in date_obj.get("games", []):
+                    game_ids.append(str(game.get("gamePk", "")))
+        except Exception:
+            pass
+
+    # Build player_name -> TB map by fetching each boxscore
+    player_tb_map = {}  # player_id -> tb, also player_name -> tb as fallback
+
+    for game_id in game_ids:
+        if not game_id:
+            continue
+        try:
+            url = f"https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
+            r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                continue
+            box = r.json()
+
+            for side in ["away", "home"]:
+                team_data = box.get("teams", {}).get(side, {})
+                players = team_data.get("players", {})
+                for pid, pdata in players.items():
+                    stats = pdata.get("stats", {}).get("batting", {})
+                    if not stats:
+                        continue
+                    singles = stats.get("hits", 0) - stats.get("doubles", 0) - stats.get("triples", 0) - stats.get("homeRuns", 0)
+                    tb = (
+                        max(0, singles) * 1 +
+                        stats.get("doubles", 0) * 2 +
+                        stats.get("triples", 0) * 3 +
+                        stats.get("homeRuns", 0) * 4
+                    )
+                    player_id = str(pdata.get("person", {}).get("id", ""))
+                    player_name = pdata.get("person", {}).get("fullName", "")
+                    if player_id:
+                        player_tb_map[player_id] = {"tb": tb, "name": player_name, "game_id": game_id}
+                    if player_name:
+                        player_tb_map[player_name.lower()] = {"tb": tb, "name": player_name, "game_id": game_id}
+        except Exception:
+            continue
+
+    # Now match pending picks and update DB
+    updated = 0
+    skipped = 0
+    postponed = 0
+    details = []
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    for _, row in pending.iterrows():
+        pick_id = row["pick_id"]
+        player_id = str(row.get("player_id", "")).strip()
+        player_name = str(row.get("player_name", "")).strip()
+
+        # Try match by player_id first, then name
+        match = player_tb_map.get(player_id) or player_tb_map.get(player_name.lower())
+
+        if match is None:
+            # Check if game was postponed by seeing if game_id has any data at all
+            game_id = str(row.get("game_id", "")).strip()
+            if game_id and game_id not in [str(g) for g in game_ids]:
+                result_label = "postponed"
+                c.execute("UPDATE picks SET result=? WHERE pick_id=?", (result_label, pick_id))
+                postponed += 1
+                details.append({"name": player_name, "tb": None, "result": "postponed"})
+            else:
+                skipped += 1
+                details.append({"name": player_name, "tb": None, "result": "not_found"})
+            continue
+
+        tb = match["tb"]
+        result = "hit" if tb >= 2 else "miss"
+        c.execute("UPDATE picks SET result=?, tb_actual=? WHERE pick_id=?", (result, tb, pick_id))
+        updated += 1
+        details.append({"name": player_name, "tb": tb, "result": result})
+
     conn.commit()
     conn.close()
+
+    return {
+        "status": "done",
+        "updated": updated,
+        "skipped": skipped,
+        "postponed": postponed,
+        "details": details
+    }
+
 
 def save_parlay_to_db(parlay: Dict, date_str: str):
     """Save parlay to database."""
@@ -443,16 +560,11 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
 @st.cache_data(ttl=10800)
 def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     """
-    Load batter stats from FanGraphs JSON API.
-    V1.3 REWRITE: Simplified, robust pipeline that avoids the complex multi-frame
-    merge logic that caused all-league-average scores.
-
-    Strategy:
-    - Fetch 2025 type=8 (advanced: K%, SLG, ISO, wRC+, BB%, wOBA) -> primary_adv
-    - Fetch 2025 type=24 (statcast: xSLG, Barrel%, Hard%, EV, xwOBA) -> primary_sc
-    - Merge them on playerid (clean join, no outer/suffix confusion)
-    - Fetch 2026 type=8 and type=24 separately -> blend key stats at player level
-    - Single clean_fangraphs_df call on final result
+    Load batter stats from FanGraphs JSON API directly.
+    type=8 = advanced stats (SLG, ISO, K%, BB%, wRC+, wOBA)
+    type=24 = statcast stats (Barrel%, HardHit%, EV, xSLG, xwOBA)
+    Merges both tables for complete picture.
+    Falls back to pybaseball if API fails.
     """
     base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
     headers = {
@@ -460,111 +572,100 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
         "Referer": "https://www.fangraphs.com/leaders/major-league",
         "Accept": "application/json",
     }
-
-    def _fetch_fg(season_yr: int, stat_type: str, minpa: str = "1") -> pd.DataFrame:
-        """Fetch one FanGraphs leaderboard page. Returns empty DataFrame on any error."""
-        try:
-            params = {
-                "age": "", "pos": "all", "stats": "bat", "lg": "all",
-                "qual": "0", "minpa": minpa,
-                "season": season_yr, "season1": season_yr,
-                "ind": "0", "team": "0", "pageitems": "2000", "pagenum": "1",
-                "sortdir": "default", "type": stat_type,
-                "sortstat": "WAR" if stat_type == "8" else "xSLG",
-            }
-            r = requests.get(base_url, params=params, headers=headers, timeout=20)
-            if r.status_code == 200:
-                rows = r.json().get("data", [])
-                if rows:
-                    return pd.DataFrame(rows)
-        except Exception:
-            pass
-        return pd.DataFrame()
-
-    # ── Fetch all four frames ──────────────────────────────────────────────
-    adv_2025 = _fetch_fg(season,     "8",  minpa="1")   # full season advanced
-    sc_2025  = _fetch_fg(season,     "24", minpa="1")   # full season statcast
-    adv_2026 = _fetch_fg(season + 1, "8",  minpa="0")   # current year advanced
-    sc_2026  = _fetch_fg(season + 1, "24", minpa="0")   # current year statcast
-
-    # ── Pybaseball fallback if ALL FanGraphs calls failed ─────────────────
-    if adv_2025.empty and adv_2026.empty:
+    common_params = {
+        "age": "", "pos": "all", "stats": "bat", "lg": "all",
+        "qual": "0",   # No minimum PA — load every MLB player including bench
+        "minpa": "1",  # At least 1 PA to filter out pure pitchers
+        "season": season, "season1": season,
+        "ind": "0", "team": "0", "pageitems": "2000", "pagenum": "1",
+        "sortdir": "default",
+        "sortstat": "PA",  # Sort by PA so all batters with plate appearances are included
+    }
+    
+    frames = {}
+    # Load 2025 full season (primary — large sample, reliable)
+    # and 2026 season start (recency signal for hot/cold players + covers returning injured)
+    for yr, label in [(season, "primary"), (season + 1, "recent")]:
+        for stat_type, slabel in [("8", "adv"), ("24", "sc")]:
+            key = f"{label}_{slabel}"
+            try:
+                # For 2026 (recent): use minpa=0 to catch returning injured players
+                # who may have only 1-5 PA in opening week
+                yr_params = {**common_params,
+                             "season": yr, "season1": yr,
+                             "type": stat_type,
+                             "sortstat": "WAR" if stat_type == "8" else "xSLG"}
+                if label == "recent":
+                    yr_params["minpa"] = "0"  # no PA floor for 2026 — catch everyone on roster
+                    yr_params["qual"]  = "0"
+                r = requests.get(base_url, params=yr_params, headers=headers, timeout=20)
+                if r.status_code == 200:
+                    rows = r.json().get("data", [])
+                    if rows:
+                        frames[key] = pd.DataFrame(rows)
+            except Exception:
+                pass
+    
+    # Pybaseball fallback if all API calls failed
+    if not frames:
         try:
             from pybaseball import batting_stats
             df = batting_stats(season, qual=1)
             if df is not None and not df.empty:
-                return clean_fangraphs_df(df)
+                frames["pybaseball"] = df
         except Exception:
             pass
+
+    if not frames:
         return pd.DataFrame()
 
-    # ── Find the best join key across frames ──────────────────────────────
-    JOIN_KEYS = ["playerid", "PlayerID", "IDfg", "xMLBAMID"]
-
-    def _find_key(df_a: pd.DataFrame, df_b: pd.DataFrame) -> Optional[str]:
-        for k in JOIN_KEYS:
-            if not df_a.empty and not df_b.empty and k in df_a.columns and k in df_b.columns:
-                return k
-        return None
-
-    # ── Build 2025 base: merge advanced + statcast ─────────────────────────
-    # Start from 2025 advanced (most complete: K%, SLG, ISO, wRC+, BB%, wOBA)
-    if not adv_2025.empty:
-        result = adv_2025.copy()
-        # Merge in 2025 statcast columns (xSLG, Barrel%, Hard%, EV)
-        if not sc_2025.empty:
-            jk = _find_key(result, sc_2025)
-            if jk:
-                # Only add columns that don't already exist
-                sc_new_cols = [c for c in sc_2025.columns if c not in result.columns]
-                if sc_new_cols:
-                    result = result.merge(sc_2025[[jk] + sc_new_cols],
-                                          on=jk, how="left")
-    elif not sc_2025.empty:
-        result = sc_2025.copy()
+    # Strategy: prefer 2026 data where available (recency), supplement with 2025
+    # If 2026 advanced data loaded, use it as base (covers returning injured players)
+    if "recent_adv" in frames and len(frames["recent_adv"]) > 100:
+        # 2026 has meaningful data — use as primary, supplement with 2025 for players missing
+        base_key = "recent_adv"
+        fallback_key = "primary_adv"
+        # Union merge: 2026 players get 2026 stats, 2025-only players still included
+        if fallback_key in frames:
+            try:
+                for k in ["playerid", "PlayerID", "IDfg", "xMLBAMID"]:
+                    if k in frames[base_key].columns and k in frames[fallback_key].columns:
+                        # Outer join: keeps all players from both seasons
+                        result = frames[fallback_key].copy()
+                        new_cols_2026 = [c for c in frames[base_key].columns
+                                         if c not in result.columns or c == k]
+                        merged = result.merge(
+                            frames[base_key][[k] + [c for c in new_cols_2026 if c != k]],
+                            on=k, how="outer", suffixes=("_2025", "_2026")
+                        )
+                        result = merged
+                        break
+                else:
+                    result = frames[base_key].copy()
+            except Exception:
+                result = frames.get("primary_adv", frames[base_key]).copy()
+        else:
+            result = frames[base_key].copy()
     else:
-        result = pd.DataFrame()
+        # No meaningful 2026 data yet — use 2025 as primary
+        base_key = "primary_adv" if "primary_adv" in frames else list(frames.keys())[0]
+        result = frames[base_key].copy()
 
-    # ── Blend in 2026 YTD stats at the PLAYER level ───────────────────────
-    # Rather than complex outer merges, we store 2026 stats with _2026 suffix
-    # and blend them in get_batter_stats() at scoring time.
-    # This avoids any column collision or NaN propagation issues.
-    for df_2026, suffix in [(adv_2026, "_2026"), (sc_2026, "_2026sc")]:
-        if df_2026.empty or result.empty:
+    # Merge in remaining frames (statcast columns etc)
+    for key, df in frames.items():
+        if df is result or key in ("primary_adv", "recent_adv"):
             continue
-        jk = _find_key(result, df_2026)
-        if not jk:
-            continue
-        # Add 2026 columns with suffix (only stat columns, not id/name columns)
-        id_like = {"playerid", "PlayerID", "IDfg", "xMLBAMID", "Name", "name",
-                   "PlayerName", "Team", "team", "Age", "age", "Season", "season"}
-        cols_to_add = [c for c in df_2026.columns
-                       if c not in id_like and c != jk]
-        if not cols_to_add:
-            continue
-        rename_map = {c: f"{c}{suffix}" for c in cols_to_add}
-        df_renamed = df_2026[[jk] + cols_to_add].rename(columns=rename_map)
-        # Remove any renamed cols that already exist to avoid duplicate suffix stacking
-        new_renamed = [v for v in rename_map.values() if v not in result.columns]
-        if new_renamed:
-            result = result.merge(
-                df_renamed[[jk] + new_renamed],
-                on=jk, how="left"
-            )
-
-    # ── Add 2026-only players (new callups not in 2025) ───────────────────
-    if not adv_2026.empty and not result.empty:
-        jk = _find_key(result, adv_2026)
-        if jk and jk in result.columns:
-            existing_ids = set(result[jk].dropna().astype(str).str.split(".").str[0])
-            new_players = adv_2026[
-                ~adv_2026[jk].astype(str).str.split(".").str[0].isin(existing_ids)
-            ]
-            if not new_players.empty:
-                result = pd.concat([result, new_players], ignore_index=True, sort=False)
-
-    if result.empty:
-        return pd.DataFrame()
+        try:
+            for k in ["playerid", "PlayerID", "IDfg", "xMLBAMID", "Name"]:
+                if k in result.columns and k in df.columns:
+                    suffix = "_2026" if "recent" in key else "_sc" if "_sc" in key else "_x"
+                    new_cols = [c for c in df.columns if c not in result.columns]
+                    if new_cols:
+                        result = result.merge(df[[k] + new_cols], on=k, how="left",
+                                              suffixes=("", suffix))
+                    break
+        except Exception:
+            pass
 
     return clean_fangraphs_df(result)
 
@@ -573,9 +674,8 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
 def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     """
     Load pitcher stats from FanGraphs JSON API.
-    Merges advanced (K%, ERA, FIP, WHIP, G, GS, Team) + statcast (Hard%, Barrel%).
-    pageitems=1000 ensures all relievers are captured (30 teams × ~25 pitchers = 750).
-    Also loads 2026 YTD for relievers active this season.
+    Uses qual=0 (no minimum) to capture all starters including early-season.
+    Merges advanced (K%, ERA, FIP) + statcast (Hard%, Barrel%, xERA) tables.
     """
     base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
     headers = {
@@ -583,69 +683,57 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
         "Referer": "https://www.fangraphs.com/leaders/major-league",
         "Accept": "application/json",
     }
+    common_params = {
+        "age": "", "pos": "all", "stats": "pit", "lg": "all",
+        "qual": "0",   # No minimum — capture all starters
+        "season": season, "season1": season,
+        "ind": "0", "team": "0", "pageitems": "500", "pagenum": "1",
+        "sortdir": "default", "minip": "1",
+    }
 
-    def _fetch_pit(season_yr: int, stat_type: str) -> pd.DataFrame:
+    frames = {}
+    for stat_type, label, sort in [
+        ("8",  "advanced", "ERA"),
+        ("24", "statcast", "xERA"),
+    ]:
         try:
-            params = {
-                "age": "", "pos": "all", "stats": "pit", "lg": "all",
-                "qual": "0", "season": season_yr, "season1": season_yr,
-                "ind": "0", "team": "0", "pageitems": "1000", "pagenum": "1",
-                "sortdir": "default", "minip": "0",
-                "type": stat_type,
-                "sortstat": "ERA" if stat_type == "8" else "xERA",
-            }
+            params = {**common_params, "type": stat_type, "sortstat": sort}
             r = requests.get(base_url, params=params, headers=headers, timeout=20)
             if r.status_code == 200:
                 rows = r.json().get("data", [])
                 if rows:
-                    return pd.DataFrame(rows)
+                    frames[label] = pd.DataFrame(rows)
         except Exception:
             pass
-        return pd.DataFrame()
-
-    adv_2025 = _fetch_pit(season,     "8")
-    sc_2025  = _fetch_pit(season,     "24")
-    adv_2026 = _fetch_pit(season + 1, "8")
 
     # Pybaseball fallback
-    if adv_2025.empty and adv_2026.empty:
+    if not frames:
         try:
             from pybaseball import pitching_stats
             df = pitching_stats(season, qual=1)
             if df is not None and not df.empty:
-                return clean_fangraphs_df(df)
+                frames["pybaseball"] = df
         except Exception:
             pass
+
+    if not frames:
         return pd.DataFrame()
 
-    # Build result: prefer 2026 if meaningful (active season), else 2025
-    if not adv_2026.empty and len(adv_2026) > 50:
-        result = adv_2026.copy()
-        # Supplement with 2025 players not yet in 2026 (returning from IL etc)
-        if not adv_2025.empty:
-            for k in ["playerid", "PlayerID", "IDfg"]:
-                if k in result.columns and k in adv_2025.columns:
-                    existing = set(result[k].dropna().astype(str).str.split(".").str[0])
-                    extras = adv_2025[~adv_2025[k].astype(str).str.split(".").str[0].isin(existing)]
-                    if not extras.empty:
-                        result = pd.concat([result, extras], ignore_index=True, sort=False)
+    if "advanced" in frames:
+        result = frames["advanced"].copy()
+        if "statcast" in frames:
+            sc = frames["statcast"]
+            for k in ["playerid", "PlayerID", "IDfg", "Name"]:
+                if k in result.columns and k in sc.columns:
+                    new_cols = [c for c in sc.columns if c not in result.columns]
+                    if new_cols:
+                        result = result.merge(sc[[k] + new_cols], on=k, how="left")
                     break
-    elif not adv_2025.empty:
-        result = adv_2025.copy()
     else:
-        return pd.DataFrame()
+        result = list(frames.values())[0].copy()
 
-    # Merge statcast columns (Hard%, Barrel%, xERA)
-    sc_frame = sc_2025 if not sc_2025.empty else pd.DataFrame()
-    if not sc_frame.empty:
-        for k in ["playerid", "PlayerID", "IDfg", "Name"]:
-            if k in result.columns and k in sc_frame.columns:
-                new_cols = [c for c in sc_frame.columns if c not in result.columns]
-                if new_cols:
-                    result = result.merge(sc_frame[[k] + new_cols], on=k, how="left")
-                break
-
-    # Add K% alias if missing
+    # Add K% alias — FanGraphs pitching sometimes uses "K%" or "K/9"
+    # Normalize to K% as rate (0-1)
     if "K%" not in result.columns and "SO" in result.columns and "TBF" in result.columns:
         try:
             result["K%"] = result["SO"] / result["TBF"]
@@ -842,7 +930,6 @@ def get_batter_stats(player_name: str, mlb_id: str,
     Extract batter stats from pre-loaded DataFrames.
     All percentages normalized to decimals (0.23 not 23%).
     Falls back to MLB league averages if player not found.
-    V1.3: Handles _2026 / _2026sc suffixes from new merge strategy.
     """
     # 2025 MLB league averages (all as decimals)
     stats = {
@@ -860,92 +947,88 @@ def get_batter_stats(player_name: str, mlb_id: str,
         "tb_per_game":      0.85,
         "data_source":      "league_avg",
     }
-
+    
     row = find_player_row(batting_df, player_name, mlb_id)
-
+    
     if row is not None:
-        # ── SLG / power — prefer xSLG over SLG ───────────────────────────
-        xslg = safe_get(row, 'xSLG', 'xslg', default=None)
-        slg  = safe_get(row, 'SLG',  'slg',  default=None)
-        if xslg and 0.050 < xslg < 1.200:
+        # SLG / power — prefer xSLG over SLG
+        xslg = safe_get(row, 'xSLG', default=None)
+        slg  = safe_get(row, 'SLG',  default=None)
+        if xslg and xslg > 0:
             stats["slg_proxy"] = xslg
-        elif slg and 0.050 < slg < 1.200:
+        elif slg and slg > 0:
             stats["slg_proxy"] = slg
 
-        # ── ISO ────────────────────────────────────────────────────────────
-        iso = safe_get(row, 'ISO', 'iso', default=None)
-        if iso and 0 < iso < 0.700:
+        # ISO
+        iso = safe_get(row, 'ISO', default=None)
+        if iso and iso > 0:
             stats["iso_proxy"] = iso
 
-        # ── K% ────────────────────────────────────────────────────────────
-        k = safe_get(row, 'K%', 'k_percent', default=None)
-        if k is not None and k > 0:
-            stats["k_rate"] = k if k < 1 else k / 100
+        # K% and BB% — pybaseball returns as decimals (0.23)
+        k = safe_get(row, 'K%', default=None)
+        if k is not None and 0 < k < 1:
+            stats["k_rate"] = k
+        elif k is not None and k > 1:
+            stats["k_rate"] = k / 100  # handle if stored as pct
 
-        # ── BB% ───────────────────────────────────────────────────────────
-        bb = safe_get(row, 'BB%', 'bb_percent', default=None)
-        if bb is not None and bb > 0:
-            stats["bb_rate"] = bb if bb < 1 else bb / 100
+        bb = safe_get(row, 'BB%', default=None)
+        if bb is not None and 0 < bb < 1:
+            stats["bb_rate"] = bb
+        elif bb is not None and bb > 1:
+            stats["bb_rate"] = bb / 100
 
-        # ── wRC+ ──────────────────────────────────────────────────────────
-        wrc = safe_get(row, 'wRC+', 'wRC', default=None)
+        # wRC+ — stored as integer 100 = average
+        wrc = safe_get(row, 'wRC+', default=None)
         if wrc and wrc > 0:
-            stats["wrc_plus"] = float(wrc)
+            stats["wrc_plus"] = wrc
 
-        # ── wOBA ──────────────────────────────────────────────────────────
-        woba = safe_get(row, 'xwOBA', 'wOBA', 'xwoba', 'woba', default=None)
-        if woba and 0.100 < woba < 0.700:
+        # wOBA — decimal
+        woba = safe_get(row, 'xwOBA', 'wOBA', default=None)
+        if woba and 0 < woba < 1:
             stats["woba"] = woba
 
-        # ── Barrel% ───────────────────────────────────────────────────────
-        barrel = safe_get(row, 'Barrel%', 'Barrel', 'barrel_batted_rate',
-                          'barrel_rate', default=None)
+        # Barrel% — pybaseball normalizes to decimal after our fix (0.085)
+        barrel = safe_get(row, 'Barrel%', 'barrel_batted_rate', default=None)
         if barrel is not None and barrel > 0:
             stats["barrel_rate"] = barrel if barrel < 1 else barrel / 100
 
-        # ── Hard Hit% ─────────────────────────────────────────────────────
-        hard = safe_get(row, 'Hard%', 'HardHit%', 'hard_hit_percent',
-                        'hard_hit_rate', default=None)
+        # Hard% — normalized to decimal after our fix (0.34)
+        hard = safe_get(row, 'Hard%', 'hard_hit_percent', default=None)
         if hard is not None and hard > 0:
             stats["hard_hit_rate"] = hard if hard < 1 else hard / 100
 
-        # ── Exit Velocity ─────────────────────────────────────────────────
-        ev = safe_get(row, 'EV', 'avg_exit_velocity', 'exit_velocity_avg', default=None)
+        # EV — exit velocity in mph
+        ev = safe_get(row, 'EV', 'avg_exit_velocity', default=None)
         if ev and ev > 50:
             stats["exit_velocity_avg"] = ev
 
-        # ── Sweet Spot% ───────────────────────────────────────────────────
-        # FanGraphs uses several column names across seasons/API versions
-        sweet = safe_get(row, 'Sweetspot%', 'SweetSpot%', 'Sweet-Spot%',
-                         'LA Sweet-Spot%', 'sweet_spot_percent',
-                         'sweet_spot_rate', 'SweetSpot', default=None)
+        # Sweet spot% (launch angle 8-32 degrees) — key for HR model
+        sweet = safe_get(row, 'Sweetspot%', 'sweet_spot_percent', default=None)
         if sweet is not None and sweet > 0:
             stats["sweet_spot_rate"] = sweet if sweet < 1 else sweet / 100
 
-        stats["data_source"] = "fangraphs"
+        # wRC+ — store explicitly for downstream O0.5/PP models
+        if wrc and wrc > 0:
+            stats["wrc_plus"] = float(wrc)
 
-        # ── 2026 YTD blending (_2026 suffix from new merge strategy) ──────
-        # Advanced stats blend (K%, SLG, ISO, wRC+)
-        xslg_26  = safe_get(row, 'xSLG_2026', 'xSLG_2026sc', default=None)
-        if xslg_26 and 0.100 < xslg_26 < 1.200:
-            stats["slg_proxy"] = stats["slg_proxy"] * 0.60 + xslg_26 * 0.40
+        # 2026 recent form blending — if 2026 YTD stats available, blend 70/30
+        # 2026 columns have _2026 suffix after the outer join merge
+        xslg_2026 = safe_get(row, 'xSLG_2026', default=None)
+        if xslg_2026 and 0.100 < float(xslg_2026) < 1.000:
+            # 60% 2025 season + 40% 2026 YTD (recency weighted)
+            stats["slg_proxy"] = stats["slg_proxy"] * 0.60 + float(xslg_2026) * 0.40
 
-        barrel_26 = safe_get(row, 'Barrel%_2026', 'Barrel%_2026sc',
-                             'Barrel_2026', 'Barrel_2026sc', default=None)
-        if barrel_26 and barrel_26 > 0:
-            b26 = barrel_26 if barrel_26 < 1 else barrel_26 / 100
+        barrel_2026 = safe_get(row, 'Barrel%_2026', default=None)
+        if barrel_2026 and float(barrel_2026) > 0:
+            b26 = float(barrel_2026) if float(barrel_2026) < 1 else float(barrel_2026) / 100
             stats["barrel_rate"] = stats["barrel_rate"] * 0.65 + b26 * 0.35
 
-        k_26 = safe_get(row, 'K%_2026', default=None)
-        if k_26 and k_26 > 0:
-            k26 = k_26 if k_26 < 1 else k_26 / 100
+        k_2026 = safe_get(row, 'K%_2026', default=None)
+        if k_2026 and float(k_2026) > 0:
+            k26 = float(k_2026) if float(k_2026) < 1 else float(k_2026) / 100
             stats["k_rate"] = stats["k_rate"] * 0.65 + k26 * 0.35
 
-        hard_26 = safe_get(row, 'Hard%_2026', 'Hard%_2026sc',
-                           'HardHit%_2026', 'HardHit%_2026sc', default=None)
-        if hard_26 and hard_26 > 0:
-            h26 = hard_26 if hard_26 < 1 else hard_26 / 100
-            stats["hard_hit_rate"] = stats["hard_hit_rate"] * 0.65 + h26 * 0.35
+        stats["data_source"] = "fangraphs"
 
     return stats
 
@@ -1476,146 +1559,14 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     return max(0, min(100, composite)), "Contact quality", details
 
 
-# ============================================================================
-# BULLPEN QUALITY — Per-team vulnerability from loaded pitching_df
-# V1.3: replaces fixed league-average (42.0) with real per-team scores
-# ============================================================================
-def compute_team_bullpen_scores(pitching_df: pd.DataFrame) -> Dict[str, float]:
-    """
-    Build per-team bullpen vulnerability scores (0-100) from the already-loaded
-    FanGraphs pitching DataFrame. Runs ONCE before the scoring loop.
-
-    Filters to relievers (GS == 0 or GS/G < 30%), groups by team, computes
-    a weighted K%/FIP/WHIP/HH% composite using the same formula as the SP
-    sub-score in compute_pitcher_score().
-
-    Returns dict keyed by UPPERCASE team abbreviation:
-        {"NYY": 38.2, "ATH": 61.4, "COL": 58.0, ...}
-    Falls back to league average (42.0) for any missing team at scoring time.
-    """
-    LEAGUE_AVG_BP_VULN = 42.0
-
-    if pitching_df is None or pitching_df.empty:
-        return {}
-
-    df = pitching_df.copy()
-
-    # ── Identify reliever rows ─────────────────────────────────────────────
-    has_gs = "GS" in df.columns
-    has_g  = "G"  in df.columns
-
-    if has_gs and has_g:
-        df["_GS"] = pd.to_numeric(df["GS"], errors="coerce").fillna(0)
-        df["_G"]  = pd.to_numeric(df["G"],  errors="coerce").fillna(0)
-        relievers = df[
-            (df["_GS"] == 0) |
-            ((df["_G"] > 0) & (df["_GS"] / df["_G"].replace(0, 1) < 0.30))
-        ].copy()
-    elif has_gs:
-        df["_GS"] = pd.to_numeric(df["GS"], errors="coerce").fillna(0)
-        relievers = df[df["_GS"] == 0].copy()
-    else:
-        # Can't distinguish starters from relievers — return empty, fall back to league avg
-        return {}
-
-    if relievers.empty:
-        return {}
-
-    # ── Find team column ───────────────────────────────────────────────────
-    team_col = None
-    for candidate in ["Team", "team", "Tm", "tm", "TEAM"]:
-        if candidate in relievers.columns:
-            team_col = candidate
-            break
-    if team_col is None:
-        return {}
-
-    # ── Normalize stat columns to decimal rates ────────────────────────────
-    def to_rate(series: pd.Series, thresh: float = 1.0) -> pd.Series:
-        s = pd.to_numeric(series, errors="coerce")
-        if s.dropna().median() > thresh:
-            s = s / 100.0
-        return s
-
-    # Pull the Series safely even if column is missing
-    k_series    = to_rate(relievers[team_col].map(lambda _: None).combine_first(
-                      relievers.get("K%", pd.Series(dtype=float, index=relievers.index))), thresh=1.0) \
-                  if "K%" in relievers.columns else pd.Series(dtype=float, index=relievers.index)
-    k_series    = to_rate(relievers["K%"],    thresh=1.0) if "K%"    in relievers.columns else pd.Series(dtype=float, index=relievers.index)
-    fip_series  = pd.to_numeric(relievers["FIP"],   errors="coerce") if "FIP"   in relievers.columns else \
-                  pd.to_numeric(relievers["xFIP"],  errors="coerce") if "xFIP"  in relievers.columns else \
-                  pd.Series(dtype=float, index=relievers.index)
-    whip_series = pd.to_numeric(relievers["WHIP"],  errors="coerce") if "WHIP"  in relievers.columns else \
-                  pd.Series(dtype=float, index=relievers.index)
-    hh_series   = to_rate(relievers["Hard%"], thresh=1.0) if "Hard%" in relievers.columns else \
-                  pd.Series(dtype=float, index=relievers.index)
-
-    relievers = relievers.copy()
-    relievers["_k_rate"] = k_series.values
-    relievers["_fip"]    = fip_series.values
-    relievers["_whip"]   = whip_series.values
-    relievers["_hh"]     = hh_series.values
-
-    # ── Group by team, use median (robust to outlier arms) ─────────────────
-    try:
-        group = relievers.groupby(team_col).agg(
-            k_rate=("_k_rate", "median"),
-            fip   =("_fip",    "median"),
-            whip  =("_whip",   "median"),
-            hh    =("_hh",     "median"),
-        ).reset_index()
-    except Exception:
-        return {}
-
-    # ── Score each team bullpen ────────────────────────────────────────────
-    team_scores: Dict[str, float] = {}
-    for _, row in group.iterrows():
-        team = str(row[team_col]).strip().upper()
-        if not team or team in ("", "---", "TOT", "2TM", "3TM"):
-            continue
-
-        k_rate = float(row["k_rate"]) if pd.notna(row["k_rate"]) else 0.228
-        fip    = float(row["fip"])    if pd.notna(row["fip"])    else 4.50
-        whip   = float(row["whip"])   if pd.notna(row["whip"])   else 1.35
-        hh     = float(row["hh"])     if pd.notna(row["hh"])     else 0.340
-
-        # Clamp to valid ranges
-        k_rate = max(0.08, min(0.42, k_rate))
-        fip    = max(2.0,  min(8.0,  fip))
-        whip   = max(0.80, min(2.20, whip))
-        hh     = max(0.20, min(0.55, hh))
-
-        # Vulnerability sub-scores (high = hittable bullpen = good for batters)
-        k_vuln    = max(0.0, min(100.0, (0.35 - k_rate) / (0.35 - 0.10) * 100))
-        era_vuln  = max(0.0, min(100.0, (fip  - 2.0)    / (7.0  - 2.0)  * 100))
-        whip_vuln = max(0.0, min(100.0, (whip - 0.90)   / (1.80 - 0.90) * 100))
-        hh_vuln   = max(0.0, min(100.0, (hh   - 0.28)   / (0.50 - 0.28) * 100))
-
-        # Weighted composite (same formula as SP, no barrel% for relievers)
-        bp_score = (
-            k_vuln    * 0.38 +
-            hh_vuln   * 0.22 +
-            era_vuln  * 0.22 +   # FIP double-weighted since no barrel%
-            whip_vuln * 0.18
-        )
-
-        team_scores[team] = round(max(0.0, min(100.0, bp_score)), 1)
-
-    return team_scores
-
-
-def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
-                          bullpen_vuln: float = 42.0) -> Tuple[float, str]:
+def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, str]:
     """
     Pitcher VULNERABILITY score 0-100.
     HIGH score = pitcher is hittable = good for batter TB.
     LOW score = elite pitcher = suppresses TB.
     Webb/Fried type = ~20-30. League avg pitcher = ~50. Mop-up arm = ~75+.
-
-    V1.3: Blends SP stats (60%) with PER-TEAM bullpen vulnerability (40%).
-    bullpen_vuln is pre-computed by compute_team_bullpen_scores() and passed
-    in from the scoring loop. Defaults to 42.0 (league avg) when unavailable.
-    Swing between best/worst bullpen: ~8-10 score points.
+    Blends SP stats (60%) with league-avg bullpen (40%) to account for
+    bullpen innings batters will face after SP exit.
     """
     def f(key, default):
         try: return float(statcast.get(key, default))
@@ -1654,11 +1605,12 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
         whip_vuln   * 0.08    # WHIP adds baserunner context
     )
 
-    # V1.3: Use per-team bullpen vuln (was fixed at 42.0 league avg for all teams)
+    # Bullpen blend: avg team bullpen FIP ~4.5, K% ~23%, WHIP ~1.35
     # Batters see ~40% of PAs against bullpen (3-4 IP out of 9)
-    blended = sp_score * 0.60 + float(bullpen_vuln) * 0.40
+    bp_vuln = 42.0  # league avg bullpen vulnerability
+    blended = sp_score * 0.60 + bp_vuln * 0.40
 
-    label = f"K%: {k_rate*100:.0f}% | WHIP: {whip:.2f} | FIP: {era_use:.2f} | BP vuln: {bullpen_vuln:.0f}"
+    label = f"K%: {k_rate*100:.0f}% | WHIP: {whip:.2f} | FIP: {era_use:.2f}"
     return max(0, min(100, blended)), label
 
 
@@ -1840,117 +1792,45 @@ def compute_hr_score(
     park_hr_factor: float,
     implied_total: float,
     weather: Dict,
-    hard_hit: float = 0.37,
-    exit_velocity: float = 88.5,
-    iso: float = 0.165,
+    hard_hit: float = 0.37
 ) -> float:
     """
     Compute dedicated HR upside score 0-100.
-    V1.3: Added exit velocity and ISO signals. Reduced sweet_spot weight
-    since it was defaulting to league avg for everyone.
-
-    Signal weights (research-backed):
-    - Barrel%      40% — r=0.93 with HR rate, #1 predictor
-    - Park factor  20% — Coors/GABP vs pitcher's parks = real difference
-    - Hard hit%    12% — exit velocity proxy, correlates with HR distance
-    - Exit velocity 8% — direct measurement of batted ball power
-    - ISO           8% — raw power history, stable year-to-year
-    - Vegas implied 7% — high-total games = more HR opportunities
-    - Wind/weather  5% — 15mph out = ~15-20% more HRs
-
-    Sweet spot removed as primary signal (was 20%) — defaults to 30.5%
-    for too many players. Barrel% already captures optimal launch angle.
+    Used for Home Run Plays page.
     """
-    # ── Barrel% — #1 HR predictor (r=0.93) ────────────────────────────
-    # 0%=0, 10%=50, 20%=100 (Judge at 24.7% → capped at 100)
-    barrel_score = max(0, min(100, barrel_rate / 0.20 * 100))
-
-    # ── Hard hit% — contact quality / power proxy ─────────────────────
-    # 28%=0, 42%=50, 56%=100
-    hh_score = max(0, min(100, (hard_hit - 0.28) / (0.56 - 0.28) * 100))
-
-    # ── Exit velocity — direct power measurement ───────────────────────
-    # 82mph=0, 89mph=50, 96mph+=100
-    ev_score = max(0, min(100, (exit_velocity - 82.0) / (96.0 - 82.0) * 100))
-
-    # ── ISO — raw power history ────────────────────────────────────────
-    # .080=0, .180=50, .320=100
-    iso_score = max(0, min(100, (iso - 0.080) / (0.320 - 0.080) * 100))
-
-    # ── Park HR factor ─────────────────────────────────────────────────
-    # 0.85=0, 1.00=30, 1.35=100
-    park_score = max(0, min(100, (park_hr_factor - 0.85) / (1.35 - 0.85) * 100))
-
-    # ── Vegas implied total ────────────────────────────────────────────
-    # 3.0=0, 4.5=50, 6.5=100
-    vegas_score = max(0, min(100, (implied_total - 3.0) / (6.5 - 3.0) * 100)) if implied_total > 0 else 40.0
-
-    # ── Wind / weather — dynamic weight based on speed ────────────────
-    # Wind is conditionally significant: 20mph out = ~25% more HRs, 7mph = noise.
-    # Strategy: scale both the bonus AND its weight by wind speed.
-    # Below 8mph: neutral, near-zero weight (don't let calm wind steal weight
-    # from barrel% and park factor).
-    # 8-14mph: moderate signal, ~8% weight.
-    # 15mph+: strong signal, up to 15% weight — redistributed from park_score.
-    wind_raw    = 0.0   # raw directional adjustment (-100 to +100 scale)
-    wind_weight = 0.0   # dynamic weight pulled into composite
-
+    # Barrel rate is #1 HR predictor (r=0.93)
+    barrel_score = min(100, barrel_rate / 0.20 * 100)
+    
+    # Sweet spot rate
+    sweet_score = min(100, sweet_spot / 0.40 * 100)
+    
+    # Park HR factor: 0.85=0, 1.0=50, 1.35=100
+    park_score = (park_hr_factor - 0.85) / (1.35 - 0.85) * 100
+    park_score = max(0, min(100, park_score))
+    
+    # Vegas implied
+    vegas_score = min(100, implied_total / 6.5 * 100)
+    
+    # Wind effect on HR
+    wind_bonus = 0
     if not weather.get("is_dome"):
         effect = weather.get("wind_effect", "neutral")
-        speed  = float(weather.get("wind_speed", 0))
-        temp   = float(weather.get("temperature", 70))
-
-        if speed >= 8:
-            # Scale wind effect linearly with speed: 8mph=base, 25mph=max
-            speed_factor = min(1.0, (speed - 8.0) / (25.0 - 8.0))
-
-            if effect == "strong_out":
-                wind_raw = 80.0 * speed_factor      # up to +80 pts on 0-100 scale
-                wind_weight = 0.08 + 0.07 * speed_factor  # 8-15% weight
-            elif effect == "out":
-                wind_raw = 55.0 * speed_factor
-                wind_weight = 0.05 + 0.07 * speed_factor
-            elif effect == "in":
-                wind_raw = -70.0 * speed_factor     # suppresses HRs hard
-                wind_weight = 0.05 + 0.07 * speed_factor
-            else:
-                wind_raw = 0.0
-                wind_weight = 0.0
-
-        # Temperature: cold air is denser, suppresses HR distance
-        # Add directly to composite as a fixed small adjustment (not weight-scaled)
-        temp_adj = 0.0
-        if temp < 45:
-            temp_adj = -8.0
-        elif temp < 55:
-            temp_adj = -4.0
-        elif temp > 85:
-            temp_adj = +4.0
-        elif temp > 92:
-            temp_adj = +7.0
-    else:
-        temp_adj = 0.0
-
-    # Redistribute weight: wind steals from park_score when significant
-    # (a 20mph out wind matters more than a 1.05x park factor)
-    adjusted_park_weight = max(0.08, 0.20 - wind_weight)
-
-    # ── Composite ─────────────────────────────────────────────────────
-    base = (
+        speed = weather.get("wind_speed", 0)
+        if effect == "strong_out":
+            wind_bonus = 25
+        elif effect == "out":
+            wind_bonus = 15
+        elif effect == "in":
+            wind_bonus = -20
+    
+    composite = (
         barrel_score * 0.40 +
-        park_score   * adjusted_park_weight +
-        hh_score     * 0.12 +
-        ev_score     * 0.08 +
-        iso_score    * 0.08 +
-        vegas_score  * 0.07
+        sweet_score * 0.20 +
+        park_score * 0.25 +
+        vegas_score * 0.10 +
+        min(25, max(-20, wind_bonus)) * 0.05 + 50 * 0.05  # wind normalized
     )
-
-    # Remaining weight after dynamic redistribution goes to barrel (already dominant)
-    # Wind contribution: wind_raw is on a 0-100 scale, weighted dynamically
-    wind_contribution = wind_raw * wind_weight if wind_weight > 0 else 0.0
-
-    composite = base + wind_contribution + temp_adj
-
+    
     return max(0, min(100, round(composite, 1)))
 
 # ============================================================================
@@ -2035,15 +1915,6 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         batting_df = prepare_lookup_df(batting_df)  # build _norm_name index ONCE
         # Store debug info
         st.session_state.batting_cols = list(batting_df.columns)
-        # Log which key stat columns actually loaded
-        key_cols = ["xSLG", "SLG", "ISO", "K%", "BB%", "wRC+", "wOBA",
-                    "Barrel%", "Hard%", "EV", "xMLBAMID"]
-        present = [c for c in key_cols if c in batting_df.columns]
-        missing = [c for c in key_cols if c not in batting_df.columns]
-        if missing:
-            log(f"  ⚠️ Missing stat cols: {missing}", "warn")
-        else:
-            log(f"  Key cols present: {present[:6]}... ✅", "ok")
         # Store raw name samples to diagnose lookup failures
         if "_name" in batting_df.columns:
             st.session_state.batting_df_sample = [str(x) for x in batting_df["_name"].head(10).tolist()]
@@ -2088,17 +1959,8 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         log(f"Pitching stats: {len(pitching_df)} pitchers loaded", "ok")
         pitching_df = prepare_lookup_df(pitching_df)  # build _norm_name index ONCE
         st.session_state.pitching_cols = list(pitching_df.columns)
-        # ── V1.3: Compute per-team bullpen scores ONCE before scoring loop ──
-        team_bullpen_scores = compute_team_bullpen_scores(pitching_df)
-        n_bp_teams = len(team_bullpen_scores)
-        if n_bp_teams > 0:
-            log(f"Bullpen quality computed for {n_bp_teams} teams ✅", "ok")
-        else:
-            log("Bullpen quality unavailable — using league average (42.0) for all teams", "warn")
-        st.session_state["team_bullpen_scores"] = team_bullpen_scores
     else:
         log("Pitching stats unavailable — using league averages", "warn")
-        team_bullpen_scores = {}
 
     # ── 1. SCHEDULE ──────────────────────────────────────
     log("Fetching MLB schedule...", "run")
@@ -2280,10 +2142,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
             # ── SCORE COMPONENTS ────────────────────────
             bat_score, _, bat_details = compute_batter_score(batter_statcast)
-            # V1.3: Look up opponent team's specific bullpen vulnerability
-            opp_team = batter.get("opponent", "").strip().upper()
-            bp_vuln = team_bullpen_scores.get(opp_team, 42.0)
-            pit_score, pit_label = compute_pitcher_score(pitcher_statcast, bullpen_vuln=bp_vuln)
+            pit_score, pit_label = compute_pitcher_score(pitcher_statcast)
             plat_score, plat_label = compute_platoon_score(batter_hand, sp_hand)
             lineup_sc, lineup_label = compute_lineup_score(lineup_slot)
             park_sc, park_label = compute_park_score(park_team, True)
@@ -2328,8 +2187,6 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 implied_total=implied,
                 weather=weather,
                 hard_hit=batter_statcast.get("hard_hit_rate", 0.37),
-                exit_velocity=batter_statcast.get("exit_velocity_avg", 88.5),
-                iso=batter_statcast.get("iso_proxy", 0.165),
             )
 
             results.append({
@@ -2376,7 +2233,6 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "sub_park": round(park_sc, 1),
                 "sub_weather": round(weather_sc, 1),
                 "sub_vegas": round(vegas_sc, 1),
-                "bullpen_vuln": round(bp_vuln, 1),
                 "platoon_edge": plat_label,
                 "temperature": weather.get("temperature", 70),
                 "wind_speed": weather.get("wind_speed", 0),
@@ -2623,9 +2479,9 @@ def display_leaderboard(plays: List[Dict]):
             except:
                 return ""
 
-        styled = df.style.map(color_tier, subset=["Tier"]).map(color_score, subset=["Score"])
+        styled = df.style.applymap(color_tier, subset=["Tier"]).applymap(color_score, subset=["Score"])
         if "Edge" in df.columns:
-            styled = styled.map(color_edge, subset=["Edge"])
+            styled = styled.applymap(color_edge, subset=["Edge"])
         st.dataframe(styled, use_container_width=True, height=500)
         
         # Export button
@@ -2960,26 +2816,22 @@ def display_hr_plays(plays: List[Dict]):
     """Display top HR upside plays."""
     
     st.header("💣 Home Run Plays")
-    st.caption("Top 10 daily HR candidates. Powered by barrel rate, hard hit%, exit velocity, ISO, park factor, wind, and implied total.")
-
+    st.caption("Top 10 daily HR candidates. Powered by barrel rate, sweet spot%, park HR factor, and wind vector.")
+    
     hr_sorted = sorted(plays, key=lambda x: x["hr_score"], reverse=True)[:10]
-
+    
     rows = []
     for p in hr_sorted:
         wind_label = p.get("weather_label", "").split("|")[0].strip()
         park_name = STADIUM_COORDS.get(p["park"], (0, 0, p["park"], False))[2]
-        sweet = p.get("sweet_spot_rate", 0)
-
+        
         rows.append({
             "HR Score": f"{p['hr_score']:.0f}",
             "Player": p["name"],
             "Team": p["team"],
             "Opp SP": p["sp_name"][:20],
             "Barrel%": f"{p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "—",
-            "HH%": f"{p['hard_hit_rate']*100:.1f}%" if p.get("hard_hit_rate") else "—",
-            "EV": f"{p.get('exit_velocity', 0):.1f}" if p.get("exit_velocity", 0) > 0 else "—",
-            "ISO": f"{p.get('iso', 0):.3f}" if p.get("iso", 0) > 0 else "—",
-            "Sweet Spot%": f"{sweet*100:.1f}%" if sweet and sweet != 0.305 else "—",
+            "Sweet Spot%": f"{p['sweet_spot_rate']*100:.1f}%" if p["sweet_spot_rate"] else "—",
             "Park HR Factor": f"{PARK_HR_FACTORS.get(p['park'], 1.0):.2f}x",
             "Park": park_name[:20],
             "Wind": p.get("wind_dir", "") + f" {p.get('wind_speed', 0):.0f}mph",
@@ -3000,7 +2852,7 @@ def display_hr_plays(plays: List[Dict]):
             except:
                 return ""
         
-        styled = df.style.map(color_hr, subset=["HR Score"])
+        styled = df.style.applymap(color_hr, subset=["HR Score"])
         st.dataframe(styled, use_container_width=True)
     
     # Top 3 HR plays detailed
@@ -3012,9 +2864,7 @@ def display_hr_plays(plays: List[Dict]):
             col1, col2 = st.columns(2)
             with col1:
                 st.write(f"**Barrel%:** {p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "**Barrel%:** —")
-                st.write(f"**Hard Hit%:** {p['hard_hit_rate']*100:.1f}%" if p.get("hard_hit_rate") else "**Hard Hit%:** —")
-                st.write(f"**Exit Velocity:** {p.get('exit_velocity', 0):.1f} mph" if p.get("exit_velocity", 0) > 0 else "**Exit Velocity:** —")
-                st.write(f"**ISO:** {p.get('iso', 0):.3f}" if p.get("iso", 0) > 0 else "**ISO:** —")
+                st.write(f"**Sweet Spot%:** {p['sweet_spot_rate']*100:.1f}%" if p["sweet_spot_rate"] else "**Sweet Spot%:** —")
                 st.write(f"**Park:** {STADIUM_COORDS.get(p['park'], (0,0,p['park'],False))[2]}")
                 st.write(f"**Park HR Factor:** {PARK_HR_FACTORS.get(p['park'], 1.0):.2f}x")
             with col2:
@@ -3384,7 +3234,7 @@ def display_hits_tab(plays: List[Dict]):
                 return "color: #888888"
             except: return ""
 
-        styled = df.style.map(color_htier, subset=["Tier"]).map(color_hscore, subset=["H-Score"])
+        styled = df.style.applymap(color_htier, subset=["Tier"]).applymap(color_hscore, subset=["H-Score"])
         st.dataframe(styled, use_container_width=True, height=500)
 
         csv = df.to_csv(index=False)
@@ -4106,9 +3956,9 @@ Cal Raleigh, C, 3200
             except: return ""
 
         styled = (df_fd.style
-                  .map(color_proj, subset=["FD Proj","Ceiling"])
-                  .map(color_own,  subset=["Own%"])
-                  .map(color_val,  subset=["Value"]))
+                  .applymap(color_proj, subset=["FD Proj","Ceiling"])
+                  .applymap(color_own,  subset=["Own%"])
+                  .applymap(color_val,  subset=["Value"]))
         st.dataframe(styled, use_container_width=True, height=450)
 
         csv_fd = df_fd.to_csv(index=False)
@@ -4511,9 +4361,9 @@ Cal Raleigh, C, 3200
             except: return ""
 
         styled_sp = (sp_df.style
-                     .map(color_sp_grade, subset=["Grade"])
-                     .map(color_sp_proj,  subset=["FD Proj","Ceiling"])
-                     .map(color_sp_val,   subset=["Value"]))
+                     .applymap(color_sp_grade, subset=["Grade"])
+                     .applymap(color_sp_proj,  subset=["FD Proj","Ceiling"])
+                     .applymap(color_sp_val,   subset=["Value"]))
         st.dataframe(styled_sp, use_container_width=True)
 
     # ── VALUE PLAYS ───────────────────────────────────────────────────────
@@ -4834,8 +4684,8 @@ def display_prizepicks_tab(plays: List[Dict]):
             return ""  # handled in platoon column
 
         styled = (df_pp.style
-                  .map(color_proj, subset=["PP Proj","Ceiling"])
-                  .map(color_conf, subset=["Conf"]))
+                  .applymap(color_proj, subset=["PP Proj","Ceiling"])
+                  .applymap(color_conf, subset=["Conf"]))
         st.dataframe(styled, use_container_width=True, height=520)
 
         csv_pp = df_pp.to_csv(index=False)
@@ -4966,8 +4816,72 @@ def display_results_tracker():
     """Display performance tracking and historical results."""
     st.header("📈 Results Tracker")
 
-    conn = sqlite3.connect(DB_PATH)
+    # ── ONE-CLICK FETCH RESULTS ───────────────────────────────────────────────
+    st.subheader("🔁 Fetch Results")
+    st.caption("Select a date and pull actual total bases from MLB Stats API for all tiered picks.")
 
+    col_d, col_b, col_r = st.columns([2, 1, 3])
+    with col_d:
+        fetch_date = st.date_input(
+            "Results date",
+            value=datetime.now(EST).date() - timedelta(days=1),
+            key="fetch_date_input"
+        )
+    with col_b:
+        st.write("")
+        st.write("")
+        fetch_clicked = st.button("⚡ Fetch Results", type="primary", use_container_width=True)
+
+    if fetch_clicked:
+        fetch_date_str = fetch_date.strftime("%Y-%m-%d")
+        with col_r:
+            st.write("")
+            st.write("")
+            with st.spinner(f"Fetching MLB box scores for {fetch_date_str}..."):
+                summary = fetch_results_for_date(fetch_date_str)
+
+        if summary["status"] == "no_pending":
+            st.info(f"No pending tiered picks found for {fetch_date_str}. Run the model for that date first, or all picks are already resolved.")
+        else:
+            updated = summary["updated"]
+            skipped = summary["skipped"]
+            postponed = summary.get("postponed", 0)
+            details = summary["details"]
+
+            if updated > 0:
+                hits = sum(1 for d in details if d["result"] == "hit")
+                misses = sum(1 for d in details if d["result"] == "miss")
+                st.success(f"✅ Updated {updated} picks — {hits} HIT / {misses} MISS")
+            if postponed > 0:
+                st.warning(f"⚠️ {postponed} pick(s) marked postponed — game did not occur")
+            if skipped > 0:
+                st.warning(f"⚠️ {skipped} pick(s) not found in box scores — player may not have appeared")
+
+            # Show per-pick breakdown
+            if details:
+                rows = []
+                for d in details:
+                    if d["result"] == "hit":
+                        icon = "✅ HIT"
+                    elif d["result"] == "miss":
+                        icon = "❌ MISS"
+                    elif d["result"] == "postponed":
+                        icon = "⏸️ PPD"
+                    else:
+                        icon = "❓ N/A"
+                    rows.append({
+                        "Player": d["name"],
+                        "TB": d["tb"] if d["tb"] is not None else "—",
+                        "Result": icon
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            st.rerun()
+
+    st.markdown("---")
+
+    # ── LOAD PICKS ────────────────────────────────────────────────────────────
+    conn = sqlite3.connect(DB_PATH)
     col1, col2 = st.columns([3, 1])
     with col2:
         if st.button("🔄 Refresh"):
@@ -4985,7 +4899,7 @@ def display_results_tracker():
         st.info("📊 No data yet. Run the model and log results to start tracking.")
         return
 
-    # Overall performance
+    # ── OVERALL PERFORMANCE ───────────────────────────────────────────────────
     resolved = picks_df[picks_df["result"].isin(["hit", "miss"])]
     if not resolved.empty:
         total_hits = len(resolved[resolved["result"] == "hit"])
@@ -5005,6 +4919,8 @@ def display_results_tracker():
             st.metric("Tier 2 Hit%", f"{r*100:.1f}%" if len(t2) > 0 else "—")
 
     st.markdown("---")
+
+    # ── PICK LOG ──────────────────────────────────────────────────────────────
     st.subheader("📋 Pick Log")
 
     col1, col2 = st.columns(2)
@@ -5024,27 +4940,28 @@ def display_results_tracker():
         st.dataframe(filtered[avail], use_container_width=True)
 
     st.markdown("---")
-    st.subheader("✏️ Log Results")
-    st.caption("After games complete, log actual total bases here.")
 
-    pending = picks_df[picks_df["result"] == "pending"]
-    if not pending.empty:
-        opts = {f"{r['player_name']} ({r['team']}) - {r['date']}": r["pick_id"]
-                for _, r in pending.head(20).iterrows()}
-        sel = st.selectbox("Select pick:", list(opts.keys()))
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            tb = st.number_input("Actual TB", 0, 16, 0)
-        with col2:
-            result = "hit" if tb >= 2 else "miss"
-            st.metric("Result", result.upper())
-        with col3:
-            if st.button("💾 Save"):
-                update_pick_result(opts[sel], result, tb)
-                st.success(f"✅ {tb} TB = {result.upper()}")
-                st.rerun()
-    else:
-        st.caption("No pending picks.")
+    # ── MANUAL OVERRIDE (fallback) ────────────────────────────────────────────
+    with st.expander("✏️ Manual Result Entry (fallback if auto-fetch misses a player)"):
+        st.caption("Use this only if the auto-fetch above didn't find a player's result.")
+        pending = picks_df[picks_df["result"] == "pending"]
+        if not pending.empty:
+            opts = {f"{r['player_name']} ({r['team']}) - {r['date']}": r["pick_id"]
+                    for _, r in pending.head(30).iterrows()}
+            sel = st.selectbox("Select pick:", list(opts.keys()))
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                tb = st.number_input("Actual TB", 0, 16, 0)
+            with col2:
+                result = "hit" if tb >= 2 else "miss"
+                st.metric("Result", result.upper())
+            with col3:
+                if st.button("💾 Save"):
+                    update_pick_result(opts[sel], result, tb)
+                    st.success(f"✅ {tb} TB = {result.upper()}")
+                    st.rerun()
+        else:
+            st.caption("No pending picks.")
 
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -5164,121 +5081,45 @@ Free tier (500/mo) is more than enough.
                 if rate < 80:
                     st.warning("Low match rate — scores using league averages for unmatched players")
             
-            # Show raw name samples — use .get() everywhere to avoid AttributeError
-            # before model has been run (session_state keys may not exist yet)
-            lookup_diag = st.session_state.get("lookup_diag")
-            batting_df_sample = st.session_state.get("batting_df_sample", [])
-            norm_name_sample  = st.session_state.get("norm_name_sample", [])
-            search_sample     = st.session_state.get("search_sample", [])
-            batting_cols      = st.session_state.get("batting_cols", [])
-            pitching_cols     = st.session_state.get("pitching_cols", [])
-            sample_player     = st.session_state.get("sample_player")
-
-            if lookup_diag:
+            # Show raw name samples from DataFrame so we can diagnose lookup failures
+            if "lookup_diag" in st.session_state:
                 st.markdown("**🔬 Live lookup diagnostic (first batter):**")
-                st.json(lookup_diag)
-                if batting_df_sample:
-                    st.markdown("**Raw _name values in batting DataFrame (first 10):**")
-                    st.code("\n".join(str(x) for x in batting_df_sample))
-            if norm_name_sample:
+                st.json(st.session_state.lookup_diag)
+                st.markdown("**Raw _name values in batting DataFrame (first 10):**")
+                st.code("\n".join(st.session_state.batting_df_sample))
+            if "norm_name_sample" in st.session_state:
                 st.markdown("**Normalized _norm_name values (first 10):**")
-                st.code("\n".join(str(x) for x in norm_name_sample))
-            if search_sample:
+                st.code("\n".join(st.session_state.norm_name_sample))
+            if "search_sample" in st.session_state:
                 st.markdown("**Names we searched for (first 5):**")
-                st.code("\n".join(str(x) for x in search_sample))
-            if batting_cols:
-                critical_bat = ["SLG", "ISO", "K%", "BB%", "wRC+", "wOBA",
-                                "Barrel%", "Hard%", "EV", "xSLG", "xwOBA"]
+                st.code("\n".join(st.session_state.search_sample))
+            if "batting_cols" in st.session_state:
+                cols = st.session_state.batting_cols
+                # Check for the critical columns we need
+                critical_bat = ["SLG", "ISO", "K%", "BB%", "wRC+", "wOBA", 
+                               "Barrel%", "Hard%", "EV", "xSLG", "xwOBA"]
                 st.markdown("**Batting — critical columns:**")
                 for c in critical_bat:
-                    st.markdown(f"{'✅' if c in batting_cols else '❌'} `{c}`")
-                st.caption(f"Total columns loaded: {len(batting_cols)}")
-            else:
-                st.info("Run the model to see batting column status.")
-            if pitching_cols:
-                critical_pit = ["K%", "ERA", "FIP", "xFIP", "Hard%", "Barrel%",
-                                "SO", "TBF", "xERA", "G", "GS", "Team", "WHIP"]
+                    found = c in cols
+                    st.markdown(f"{'✅' if found else '❌'} `{c}`")
+                st.caption(f"Total columns loaded: {len(cols)}")
+            if "pitching_cols" in st.session_state:
+                cols = st.session_state.pitching_cols
+                critical_pit = ["K%", "ERA", "FIP", "xFIP", "Hard%", "Barrel%", "SO", "TBF", "xERA"]
                 st.markdown("**Pitching — critical columns:**")
                 for c in critical_pit:
-                    st.markdown(f"{'✅' if c in pitching_cols else '❌'} `{c}`")
-                st.caption(f"Total pitching columns: {len(pitching_cols)}")
-            else:
-                st.info("Run the model to see pitching column status.")
-            if sample_player:
+                    found = c in cols
+                    st.markdown(f"{'✅' if found else '❌'} `{c}`")
+                st.caption(f"Total pitching columns: {len(cols)}")
+            if "sample_player" in st.session_state:
                 st.markdown("**Sample player (Judge):**")
-                st.json(sample_player)
+                st.json(st.session_state.sample_player)
 
-        # ── V1.3 NEW: Bullpen Quality Debug ──────────────────────────────
-        with st.expander("🔬 Debug: V1.3 Bullpen Quality Scores"):
-            st.caption("Per-team bullpen vulnerability (0=unhittable, 100=mop-up arms). "
-                       "High score = weak bullpen = good for batters. "
-                       "Was fixed at 42.0 for all teams in V1.2.")
-            bp_scores = st.session_state.get("team_bullpen_scores", {})
-            if bp_scores:
-                bp_df = pd.DataFrame([
-                    {"Team": t, "Bullpen Vuln Score": v,
-                     "Quality": "🔒 Elite" if v < 35 else "✅ Good" if v < 45 else "⚠️ Average" if v < 55 else "💀 Weak"}
-                    for t, v in sorted(bp_scores.items(), key=lambda x: x[1])
-                ])
-
-                def color_bp(val):
-                    try:
-                        v = float(val)
-                        if v < 35:  return "color: #00ff88; font-weight: bold"
-                        elif v < 45: return "color: #66ddff"
-                        elif v < 55: return "color: #ffdd00"
-                        return "color: #ff4444; font-weight: bold"
-                    except: return ""
-
-                styled_bp = bp_df.style.map(color_bp, subset=["Bullpen Vuln Score"])
-                st.dataframe(styled_bp, use_container_width=True)
-                st.caption(f"✅ {len(bp_scores)} teams scored | League avg baseline: 42.0")
-
-                # Show score impact on a sample batter
-                st.markdown("**Score impact example (avg batter, avg SP, score = 55):**")
-                example_rows = []
-                for label, bp_v in [("Best bullpen (score ~28)", 28), ("League avg (42)", 42), ("Worst bullpen (score ~62)", 62)]:
-                    sp_score_ex = 45.0  # avg SP
-                    blended_ex  = sp_score_ex * 0.60 + bp_v * 0.40
-                    example_rows.append({"Scenario": label, "SP Score": 45, "BP Vuln": bp_v,
-                                         "Blended Pit Score": round(blended_ex, 1)})
-                st.table(pd.DataFrame(example_rows))
-            else:
-                st.warning("Bullpen scores not computed — pitching_df may be missing GS or Team columns. "
-                           "All teams defaulting to league average (42.0). "
-                           "Run model and check pitching critical columns above.")
-
-        # ── V1.3 NEW: Per-player score breakdown debug ───────────────────
-        with st.expander("🔬 Debug: Score Component Breakdown (top 10 plays)"):
-            st.caption("Shows exactly how each sub-score contributed to the final score. "
-                       "BP Vuln = the opponent's bullpen score used for that batter.")
-            plays_debug = st.session_state.get("plays", [])
-            if plays_debug:
-                debug_rows = []
-                for p in plays_debug[:10]:
-                    debug_rows.append({
-                        "Player":     p["name"],
-                        "Team":       p["team"],
-                        "Opp":        p.get("opponent", "?"),
-                        "Final":      p["score"],
-                        "Batter":     p.get("sub_batter", "—"),
-                        "Pitcher":    p.get("sub_pitcher", "—"),
-                        "BP Vuln":    p.get("bullpen_vuln", "—"),
-                        "Platoon":    p.get("sub_platoon", "—"),
-                        "Park":       p.get("sub_park", "—"),
-                        "Weather":    p.get("sub_weather", "—"),
-                        "Vegas":      p.get("sub_vegas", "—"),
-                        "Lineup":     p.get("sub_lineup", "—"),
-                    })
-                st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
-            else:
-                st.info("Run the model to see per-player score breakdowns.")
-
-        st.caption(f"v1.3 | {datetime.now(EST).strftime('%I:%M %p EST')}")
+        st.caption(f"v1.2 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
     # ── MAIN CONTENT ──────────────────────────────────────
-    st.title("⚾ MLB Total Bases Analyzer V1.3")
-    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.3: Per-team bullpen quality")
+    st.title("⚾ MLB Total Bases Analyzer V1.0")
+    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4")
     
     # Tabs
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
