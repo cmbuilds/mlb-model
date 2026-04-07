@@ -505,7 +505,8 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
         return pd.DataFrame()
 
     # ── Find the best join key across frames ──────────────────────────────
-    JOIN_KEYS = ["playerid", "PlayerID", "IDfg", "xMLBAMID"]
+    # NOTE: FanGraphs API alternates between "xMLBAMID" and "MLBAMID" across seasons
+    JOIN_KEYS = ["playerid", "PlayerID", "IDfg", "xMLBAMID", "MLBAMID"]
 
     def _find_key(df_a: pd.DataFrame, df_b: pd.DataFrame) -> Optional[str]:
         for k in JOIN_KEYS:
@@ -572,7 +573,24 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     if result.empty:
         return pd.DataFrame()
 
-    return clean_fangraphs_df(result)
+    cleaned = clean_fangraphs_df(result)
+
+    # ── Sanity check: if no MLBAM ID crosswalk exists, try pybaseball batting_stats
+    # as a supplemental ID lookup (merge on Name only for xMLBAMID population)
+    has_xid = "xMLBAMID" in cleaned.columns or "MLBAMID" in cleaned.columns
+    if not has_xid:
+        try:
+            from pybaseball import batting_stats
+            pyb = batting_stats(season, qual=1)
+            if pyb is not None and not pyb.empty:
+                # pybaseball uses IDfg; if cleaned has playerid/IDfg, merge to get xMLBAMID
+                pyb_cleaned = clean_fangraphs_df(pyb)
+                # Just use pybaseball as primary if FG xMLBAMID is absent
+                return pyb_cleaned
+        except Exception:
+            pass
+
+    return cleaned
 
 
 @st.cache_data(ttl=10800)
@@ -761,11 +779,12 @@ def prepare_lookup_df(df: pd.DataFrame) -> pd.DataFrame:
     if name_col and "_norm_name" not in df.columns:
         df["_norm_name"] = df[name_col].apply(_norm)
     
-    # Pre-convert xMLBAMID to string int for fast matching
-    if "xMLBAMID" in df.columns:
-        df["xMLBAMID"] = df["xMLBAMID"].apply(
-            lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("", "nan", "None") else ""
-        )
+    # Pre-convert xMLBAMID / MLBAMID to string int for fast matching
+    for _id_col in ("xMLBAMID", "MLBAMID"):
+        if _id_col in df.columns:
+            df[_id_col] = df[_id_col].apply(
+                lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("", "nan", "None") else ""
+            )
     
     return df
 
@@ -780,14 +799,15 @@ def find_player_row(df: pd.DataFrame, player_name: str, mlb_id: str = "") -> Opt
     if df is None or df.empty or not player_name:
         return None
 
-    # 1. xMLBAMID match — most reliable (FanGraphs xMLBAMID = MLB MLBAM player_id)
-    if mlb_id and "xMLBAMID" in df.columns:
-        try:
-            m = df[df["xMLBAMID"].astype(str).str.split(".").str[0] == str(mlb_id)]
-            if not m.empty:
-                return m.iloc[0]
-        except Exception:
-            pass
+    # 1. xMLBAMID / MLBAMID match — most reliable (FanGraphs MLBAM player ID crosswalk)
+    for _id_col in ("xMLBAMID", "MLBAMID"):
+        if mlb_id and _id_col in df.columns:
+            try:
+                m = df[df[_id_col].astype(str).str.split(".").str[0] == str(mlb_id)]
+                if not m.empty:
+                    return m.iloc[0]
+            except Exception:
+                pass
 
     # 2. _mlb_id fallback
     if mlb_id and "_mlb_id" in df.columns:
@@ -2243,13 +2263,17 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 if nc != "NONE":
                     sample_vals = batting_df[nc].head(3).tolist()
                 has_xmlbamid = "xMLBAMID" in batting_df.columns
-                xmlbam_sample = batting_df["xMLBAMID"].head(3).tolist() if has_xmlbamid else []
+                has_mlbamid  = "MLBAMID" in batting_df.columns
+                xmlbam_col   = "xMLBAMID" if has_xmlbamid else ("MLBAMID" if has_mlbamid else None)
+                xmlbam_sample = batting_df[xmlbam_col].head(3).tolist() if xmlbam_col else []
                 st.session_state["lookup_diag"] = {
                     "searching_for": f"{name} (MLBAM id={player_id})",
                     "batting_df_rows": n_rows,
                     "name_col_used": nc,
                     "first_3_norm_names": [str(v) for v in sample_vals],
                     "xMLBAMID_exists": has_xmlbamid,
+                    "MLBAMID_exists": has_mlbamid,
+                    "id_col_used": xmlbam_col or "NONE — ID lookup disabled",
                     "xMLBAMID_sample": [str(v) for v in xmlbam_sample],
                     "data_source": batter_statcast.get("data_source"),
                     "matched": batter_statcast.get("data_source") == "fangraphs",
@@ -2398,6 +2422,19 @@ def run_model(date_str: str, status_container) -> List[Dict]:
     results.sort(key=lambda x: x["score"], reverse=True)
 
     log("─" * 40)
+    # ── Match rate diagnostic ─────────────────────────────────────────────
+    matched_total   = st.session_state.get("_matched", 0)
+    unmatched_total = st.session_state.get("_unmatched", 0)
+    total_lookup    = matched_total + unmatched_total
+    if total_lookup > 0:
+        match_pct = matched_total / total_lookup * 100
+        if match_pct < 50:
+            log(f"⚠️ STAT MATCH RATE: {matched_total}/{total_lookup} ({match_pct:.0f}%) — "
+                f"most batters using league averages. Check Debug panel → Data Quality.", "warn")
+        elif match_pct < 80:
+            log(f"⚠️ Stat match rate: {matched_total}/{total_lookup} ({match_pct:.0f}%) — some league-avg fallbacks", "warn")
+        else:
+            log(f"✅ Stat match rate: {matched_total}/{total_lookup} ({match_pct:.0f}%)", "ok")
     if total_batters == 0:
         log("No batters scored. Lineups likely not posted yet — try again closer to game time.", "warn")
     else:
@@ -5098,6 +5135,8 @@ def display_results_tracker():
 
         # ── Compute stats ───────────────────────────────────────────────────────
         def stats_for(df):
+            if df.empty or "result" not in df.columns:
+                return 0, 0, 0, 0, 0, 0
             res = df[df["result"].isin(["hit","miss"])]
             h = len(res[res["result"] == "hit"])
             m = len(res[res["result"] == "miss"])
