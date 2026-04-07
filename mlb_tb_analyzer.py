@@ -447,7 +447,10 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
 # ============================================================================
 
 # ── Disk cache helpers (survive st.cache_data expiry + FanGraphs blocks) ──────
-_DISK_CACHE_DIR = "/tmp/propex_stat_cache"
+# Streamlit Cloud: /tmp is ephemeral (lost on restart).
+# Use a path relative to the app file so cache survives redeployments when
+# committed to git (stat_cache/ is in .gitignore-excluded or included deliberately).
+_DISK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stat_cache")
 
 def _disk_cache_path(name: str) -> str:
     os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
@@ -462,8 +465,10 @@ def _save_disk_cache(name: str, df: pd.DataFrame) -> None:
     except Exception:
         pass
 
-def _load_disk_cache(name: str, max_age_hours: int = 48) -> Optional[pd.DataFrame]:
-    """Load a previously-saved DataFrame from disk. Returns None if absent or stale."""
+def _load_disk_cache(name: str, max_age_hours: int = 168) -> Optional[pd.DataFrame]:
+    """Load a previously-saved DataFrame from disk. Returns None if absent or stale.
+    Default 168h = 7 days — allows git-committed seed cache to survive a full week.
+    """
     try:
         import pickle, time
         p = _disk_cache_path(name)
@@ -546,6 +551,15 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
         except Exception as e:
             _fg_errors.append(f"Error (season={season_yr} type={stat_type}): {str(e)[:80]}")
         return pd.DataFrame()
+
+    # ── Check disk cache first — if < 6h old, skip FanGraphs entirely ────────
+    # This avoids hammering FanGraphs on every Streamlit rerun/tab-switch.
+    # The "Clear Cache + Rerun" button clears st.cache_data but NOT disk cache,
+    # so a fresh FanGraphs fetch is only forced by deleting the .pkl file.
+    _early_cache = _load_disk_cache("batting_stats", max_age_hours=6)
+    if _early_cache is not None:
+        st.session_state["_batting_source"] = "disk_cache"
+        return _early_cache
 
     # ── Fetch all four frames ──────────────────────────────────────────────
     adv_2025 = _fetch_fg(season,     "8",  minpa="1")   # full season advanced
@@ -719,6 +733,12 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
         except Exception as e:
             _pit_errors.append(f"Error (season={season_yr}): {str(e)[:80]}")
         return pd.DataFrame()
+
+    # ── Check disk cache first if < 6h old ───────────────────────────────────
+    _early_pit_cache = _load_disk_cache("pitching_stats", max_age_hours=6)
+    if _early_pit_cache is not None:
+        st.session_state["_pitching_source"] = "disk_cache"
+        return _early_pit_cache
 
     adv_2025 = _fetch_pit(season,     "8")
     sc_2025  = _fetch_pit(season,     "24")
@@ -5938,13 +5958,16 @@ Free tier (500/mo) is more than enough.
 
             # Disk cache status
             import os as _os, time as _time
+            _cache_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "stat_cache")
             for _cname in ("batting_stats", "pitching_stats"):
-                _p = f"/tmp/propex_stat_cache/{_cname}.pkl"
+                _p = _os.path.join(_cache_dir, f"{_cname}.pkl")
                 if _os.path.exists(_p):
                     _age = (_time.time() - _os.path.getmtime(_p)) / 3600
-                    st.caption(f"💾 Disk cache `{_cname}`: {_age:.1f}h old")
+                    _age_label = f"{_age:.1f}h old"
+                    _freshness = "✅ fresh" if _age < 6 else ("⚠️ stale" if _age > 120 else "💾 cached")
+                    st.caption(f"💾 Disk cache `{_cname}`: {_age_label} — {_freshness}")
                 else:
-                    st.caption(f"⬜ No disk cache for `{_cname}` yet")
+                    st.caption(f"⬜ No disk cache for `{_cname}` — run `seed_stat_cache.py` locally and commit `stat_cache/`")
 
             st.markdown("---")
             matched = st.session_state.get("_matched", 0)
