@@ -446,12 +446,48 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
 # All column names auto-detected at runtime (no hardcoding)
 # ============================================================================
 
+# ── Disk cache helpers (survive st.cache_data expiry + FanGraphs blocks) ──────
+_DISK_CACHE_DIR = "/tmp/propex_stat_cache"
+
+def _disk_cache_path(name: str) -> str:
+    os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
+    return os.path.join(_DISK_CACHE_DIR, f"{name}.pkl")
+
+def _save_disk_cache(name: str, df: pd.DataFrame) -> None:
+    """Persist a DataFrame to disk so it survives st.cache_data TTL expiry."""
+    try:
+        import pickle
+        with open(_disk_cache_path(name), "wb") as f:
+            pickle.dump(df, f)
+    except Exception:
+        pass
+
+def _load_disk_cache(name: str, max_age_hours: int = 48) -> Optional[pd.DataFrame]:
+    """Load a previously-saved DataFrame from disk. Returns None if absent or stale."""
+    try:
+        import pickle, time
+        p = _disk_cache_path(name)
+        if not os.path.exists(p):
+            return None
+        age_hours = (time.time() - os.path.getmtime(p)) / 3600
+        if age_hours > max_age_hours:
+            return None
+        with open(p, "rb") as f:
+            df = pickle.load(f)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+    except Exception:
+        pass
+    return None
+
+
 @st.cache_data(ttl=10800)
 def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     """
     Load batter stats from FanGraphs JSON API.
-    V1.3 REWRITE: Simplified, robust pipeline that avoids the complex multi-frame
-    merge logic that caused all-league-average scores.
+    V1.4: Added disk-based persistence cache so a successful fetch survives
+    st.cache_data TTL expiry and FanGraphs temporary IP blocks.
+    Error codes are now surfaced (not silently swallowed) to the session state.
 
     Strategy:
     - Fetch 2025 type=8 (advanced: K%, SLG, ISO, wRC+, BB%, wOBA) -> primary_adv
@@ -459,16 +495,34 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     - Merge them on playerid (clean join, no outer/suffix confusion)
     - Fetch 2026 type=8 and type=24 separately -> blend key stats at player level
     - Single clean_fangraphs_df call on final result
+    - On any FanGraphs failure: serve from disk cache (up to 48h old)
     """
+    import time as _time
+
     base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
+
+    # Rotate through browser User-Agents to reduce IP-based blocking
+    _UA_LIST = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    ]
+    import random as _random
+    _ua = _random.choice(_UA_LIST)
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": _ua,
         "Referer": "https://www.fangraphs.com/leaders/major-league",
-        "Accept": "application/json",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
     }
 
+    _fg_errors = []   # collect status codes for debug surfacing
+
     def _fetch_fg(season_yr: int, stat_type: str, minpa: str = "1") -> pd.DataFrame:
-        """Fetch one FanGraphs leaderboard page. Returns empty DataFrame on any error."""
+        """Fetch one FanGraphs leaderboard page. Returns empty DataFrame on any error.
+        Records HTTP status codes in _fg_errors for debug surfacing."""
         try:
             params = {
                 "age": "", "pos": "all", "stats": "bat", "lg": "all",
@@ -478,13 +532,19 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
                 "sortdir": "default", "type": stat_type,
                 "sortstat": "WAR" if stat_type == "8" else "xSLG",
             }
-            r = requests.get(base_url, params=params, headers=headers, timeout=20)
+            r = requests.get(base_url, params=params, headers=headers, timeout=25)
             if r.status_code == 200:
                 rows = r.json().get("data", [])
                 if rows:
                     return pd.DataFrame(rows)
-        except Exception:
-            pass
+                else:
+                    _fg_errors.append(f"HTTP 200 but data=[] (season={season_yr} type={stat_type})")
+            else:
+                _fg_errors.append(f"HTTP {r.status_code} (season={season_yr} type={stat_type})")
+        except requests.exceptions.ConnectionError as e:
+            _fg_errors.append(f"ConnectionError/ProxyBlock (season={season_yr} type={stat_type}): {str(e)[:80]}")
+        except Exception as e:
+            _fg_errors.append(f"Error (season={season_yr} type={stat_type}): {str(e)[:80]}")
         return pd.DataFrame()
 
     # ── Fetch all four frames ──────────────────────────────────────────────
@@ -493,15 +553,30 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     adv_2026 = _fetch_fg(season + 1, "8",  minpa="0")   # current year advanced
     sc_2026  = _fetch_fg(season + 1, "24", minpa="0")   # current year statcast
 
-    # ── Pybaseball fallback if ALL FanGraphs calls failed ─────────────────
+    # Surface errors to session state for the debug panel
+    if _fg_errors:
+        st.session_state["_fg_batting_errors"] = _fg_errors
+
+    # ── ALL FanGraphs calls failed — try disk cache first, then pybaseball ─
     if adv_2025.empty and adv_2026.empty:
+        # 1. Disk cache (up to 48h old — covers a few days of blocking)
+        cached = _load_disk_cache("batting_stats")
+        if cached is not None:
+            st.session_state["_batting_source"] = "disk_cache"
+            return cached
+
+        # 2. Pybaseball batting_stats fallback (also hits FanGraphs HTML, may fail too)
         try:
             from pybaseball import batting_stats
             df = batting_stats(season, qual=1)
             if df is not None and not df.empty:
-                return clean_fangraphs_df(df)
+                cleaned = clean_fangraphs_df(df)
+                _save_disk_cache("batting_stats", cleaned)
+                return cleaned
         except Exception:
             pass
+
+        st.session_state["_batting_source"] = "failed"
         return pd.DataFrame()
 
     # ── Find the best join key across frames ──────────────────────────────
@@ -576,20 +651,22 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     cleaned = clean_fangraphs_df(result)
 
     # ── Sanity check: if no MLBAM ID crosswalk exists, try pybaseball batting_stats
-    # as a supplemental ID lookup (merge on Name only for xMLBAMID population)
     has_xid = "xMLBAMID" in cleaned.columns or "MLBAMID" in cleaned.columns
     if not has_xid:
         try:
             from pybaseball import batting_stats
             pyb = batting_stats(season, qual=1)
             if pyb is not None and not pyb.empty:
-                # pybaseball uses IDfg; if cleaned has playerid/IDfg, merge to get xMLBAMID
                 pyb_cleaned = clean_fangraphs_df(pyb)
-                # Just use pybaseball as primary if FG xMLBAMID is absent
+                _save_disk_cache("batting_stats", pyb_cleaned)
+                st.session_state["_batting_source"] = "fangraphs+pybaseball"
                 return pyb_cleaned
         except Exception:
             pass
 
+    # ── Save to disk cache on every successful live fetch ─────────────────
+    _save_disk_cache("batting_stats", cleaned)
+    st.session_state["_batting_source"] = "fangraphs_live"
     return cleaned
 
 
@@ -597,16 +674,26 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
 def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     """
     Load pitcher stats from FanGraphs JSON API.
+    V1.4: Added disk-based persistence cache + error surfacing (same as batting loader).
     Merges advanced (K%, ERA, FIP, WHIP, G, GS, Team) + statcast (Hard%, Barrel%).
     pageitems=1000 ensures all relievers are captured (30 teams × ~25 pitchers = 750).
     Also loads 2026 YTD for relievers active this season.
     """
+    import random as _random
     base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
+    _UA_LIST = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    ]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": _random.choice(_UA_LIST),
         "Referer": "https://www.fangraphs.com/leaders/major-league",
-        "Accept": "application/json",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
     }
+    _pit_errors = []
 
     def _fetch_pit(season_yr: int, stat_type: str) -> pd.DataFrame:
         try:
@@ -618,28 +705,44 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                 "type": stat_type,
                 "sortstat": "ERA" if stat_type == "8" else "xERA",
             }
-            r = requests.get(base_url, params=params, headers=headers, timeout=20)
+            r = requests.get(base_url, params=params, headers=headers, timeout=25)
             if r.status_code == 200:
                 rows = r.json().get("data", [])
                 if rows:
                     return pd.DataFrame(rows)
-        except Exception:
-            pass
+                else:
+                    _pit_errors.append(f"HTTP 200 but data=[] (season={season_yr} type={stat_type})")
+            else:
+                _pit_errors.append(f"HTTP {r.status_code} (season={season_yr} type={stat_type})")
+        except requests.exceptions.ConnectionError as e:
+            _pit_errors.append(f"ConnectionError/ProxyBlock (season={season_yr}): {str(e)[:80]}")
+        except Exception as e:
+            _pit_errors.append(f"Error (season={season_yr}): {str(e)[:80]}")
         return pd.DataFrame()
 
     adv_2025 = _fetch_pit(season,     "8")
     sc_2025  = _fetch_pit(season,     "24")
     adv_2026 = _fetch_pit(season + 1, "8")
 
-    # Pybaseball fallback
+    if _pit_errors:
+        st.session_state["_fg_pitching_errors"] = _pit_errors
+
+    # ── ALL calls failed — try disk cache first, then pybaseball ─────────
     if adv_2025.empty and adv_2026.empty:
+        cached = _load_disk_cache("pitching_stats")
+        if cached is not None:
+            st.session_state["_pitching_source"] = "disk_cache"
+            return cached
         try:
             from pybaseball import pitching_stats
             df = pitching_stats(season, qual=1)
             if df is not None and not df.empty:
-                return clean_fangraphs_df(df)
+                cleaned = clean_fangraphs_df(df)
+                _save_disk_cache("pitching_stats", cleaned)
+                return cleaned
         except Exception:
             pass
+        st.session_state["_pitching_source"] = "failed"
         return pd.DataFrame()
 
     # Build result: prefer 2026 if meaningful (active season), else 2025
@@ -676,7 +779,10 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
         except Exception:
             pass
 
-    return clean_fangraphs_df(result)
+    cleaned = clean_fangraphs_df(result)
+    _save_disk_cache("pitching_stats", cleaned)
+    st.session_state["_pitching_source"] = "fangraphs_live"
+    return cleaned
 
 
 def clean_fangraphs_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -2109,7 +2215,21 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "xSLG": sample.get("xSLG", "❌ missing"),
             }
     else:
-        log("Batting stats unavailable — all scores use league averages", "warn")
+        bat_src = st.session_state.get("_batting_source", "unknown")
+        fg_errs = st.session_state.get("_fg_batting_errors", [])
+        if bat_src == "disk_cache":
+            log("⚠️ FanGraphs unreachable — serving stats from DISK CACHE (may be up to 48h old)", "warn")
+        elif bat_src == "failed":
+            log("❌ Batting stats FAILED — all scores use league averages", "warn")
+            if fg_errs:
+                for e in fg_errs[:3]:
+                    log(f"   FG error: {e}", "warn")
+                log("   → Fix: Clear cache & rerun, or wait for FanGraphs to unblock Streamlit IPs", "warn")
+        else:
+            log("Batting stats unavailable — all scores use league averages", "warn")
+            if fg_errs:
+                for e in fg_errs[:3]:
+                    log(f"   FG error: {e}", "warn")
     if not pitching_df.empty:
         log(f"Pitching stats: {len(pitching_df)} pitchers loaded", "ok")
         pitching_df = prepare_lookup_df(pitching_df)  # build _norm_name index ONCE
@@ -2123,7 +2243,15 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             log("Bullpen quality unavailable — using league average (42.0) for all teams", "warn")
         st.session_state["team_bullpen_scores"] = team_bullpen_scores
     else:
-        log("Pitching stats unavailable — using league averages", "warn")
+        pit_src = st.session_state.get("_pitching_source", "unknown")
+        pit_fg_errs = st.session_state.get("_fg_pitching_errors", [])
+        if pit_src == "disk_cache":
+            log("⚠️ FanGraphs unreachable — serving pitcher stats from DISK CACHE", "warn")
+        else:
+            log("❌ Pitching stats unavailable — using league averages", "warn")
+            if pit_fg_errs:
+                for e in pit_fg_errs[:2]:
+                    log(f"   FG error: {e}", "warn")
         team_bullpen_scores = {}
 
     # ── 1. SCHEDULE ──────────────────────────────────────
@@ -5791,6 +5919,34 @@ Free tier (500/mo) is more than enough.
         
         with st.expander("🔍 Debug: Data Quality Check"):
             st.caption("Expand after running model to verify all key stats loaded")
+
+            # ── Data source status ─────────────────────────────────────────
+            bat_src  = st.session_state.get("_batting_source", "not_run")
+            pit_src  = st.session_state.get("_pitching_source", "not_run")
+            src_icon = {"fangraphs_live": "✅", "fangraphs+pybaseball": "✅",
+                        "disk_cache": "💾", "failed": "❌", "not_run": "⏳"}
+            st.markdown(f"**Batting stats source:** {src_icon.get(bat_src,'❓')} `{bat_src}`")
+            st.markdown(f"**Pitching stats source:** {src_icon.get(pit_src,'❓')} `{pit_src}`")
+
+            # Show FanGraphs errors if any
+            fg_bat_errs = st.session_state.get("_fg_batting_errors", [])
+            fg_pit_errs = st.session_state.get("_fg_pitching_errors", [])
+            if fg_bat_errs:
+                st.error("**FanGraphs batting fetch errors:**\n" + "\n".join(fg_bat_errs))
+            if fg_pit_errs:
+                st.error("**FanGraphs pitching fetch errors:**\n" + "\n".join(fg_pit_errs))
+
+            # Disk cache status
+            import os as _os, time as _time
+            for _cname in ("batting_stats", "pitching_stats"):
+                _p = f"/tmp/propex_stat_cache/{_cname}.pkl"
+                if _os.path.exists(_p):
+                    _age = (_time.time() - _os.path.getmtime(_p)) / 3600
+                    st.caption(f"💾 Disk cache `{_cname}`: {_age:.1f}h old")
+                else:
+                    st.caption(f"⬜ No disk cache for `{_cname}` yet")
+
+            st.markdown("---")
             matched = st.session_state.get("_matched", 0)
             unmatched = st.session_state.get("_unmatched", 0)
             total = matched + unmatched
@@ -5911,11 +6067,11 @@ Free tier (500/mo) is more than enough.
             else:
                 st.info("Run the model to see per-player score breakdowns.")
 
-        st.caption(f"v1.3 | {datetime.now(EST).strftime('%I:%M %p EST')}")
+        st.caption(f"v1.4 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
     # ── MAIN CONTENT ──────────────────────────────────────
-    st.title("⚾ MLB Total Bases Analyzer V1.3")
-    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.3: Per-team bullpen quality")
+    st.title("⚾ MLB Total Bases Analyzer V1.4")
+    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.4: Stat cache persistence + FG error surfacing")
     
     # Tabs
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
