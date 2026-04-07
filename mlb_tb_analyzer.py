@@ -40,7 +40,7 @@ import pytz
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="⚾ MLB TB Analyzer V1.3",
+    page_title="⚾ MLB TB Analyzer V1.6",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="auto"
@@ -489,320 +489,667 @@ def _load_disk_cache(name: str, max_age_hours: int = 168) -> Optional[pd.DataFra
 @st.cache_data(ttl=10800)
 def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     """
-    Load batter stats from FanGraphs JSON API.
-    V1.4: Added disk-based persistence cache so a successful fetch survives
-    st.cache_data TTL expiry and FanGraphs temporary IP blocks.
-    Error codes are now surfaced (not silently swallowed) to the session state.
-
-    Strategy:
-    - Fetch 2025 type=8 (advanced: K%, SLG, ISO, wRC+, BB%, wOBA) -> primary_adv
-    - Fetch 2025 type=24 (statcast: xSLG, Barrel%, Hard%, EV, xwOBA) -> primary_sc
-    - Merge them on playerid (clean join, no outer/suffix confusion)
-    - Fetch 2026 type=8 and type=24 separately -> blend key stats at player level
-    - Single clean_fangraphs_df call on final result
-    - On any FanGraphs failure: serve from disk cache (up to 48h old)
+    V1.5: FanGraphs-free batting pipeline.
+    Primary sources (all use MLBAM player_id — zero crosswalk needed):
+      1. Disk cache (< 6h)  — fastest path, skips all network calls
+      2. Baseball Savant expected stats CSV  → xSLG, xwOBA, xBA
+      3. Baseball Savant statcast leaderboard CSV → Barrel%, Hard Hit%, EV
+      4. MLB Stats API season stats → SLG, K%(derived), BB%(derived), ISO(derived)
+      5. FanGraphs JSON API (bonus layer if accessible) → wRC+, FIP, more
+      6. Disk cache (< 7d)  — stale fallback if all live fetches fail
+    All frames merged on MLBAM player_id → clean, no-crosswalk join.
     """
-    import time as _time
+    import io as _io
 
-    base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
+    # ── 1. Early disk cache (< 6h) ────────────────────────────────────────
+    _early = _load_disk_cache("batting_stats", max_age_hours=6)
+    if _early is not None:
+        st.session_state["_batting_source"] = "disk_cache_fresh"
+        return _early
 
-    # Rotate through browser User-Agents to reduce IP-based blocking
-    _UA_LIST = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    ]
-    import random as _random
-    _ua = _random.choice(_UA_LIST)
+    _errs = []
 
-    headers = {
-        "User-Agent": _ua,
-        "Referer": "https://www.fangraphs.com/leaders/major-league",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    _fg_errors = []   # collect status codes for debug surfacing
-
-    def _fetch_fg(season_yr: int, stat_type: str, minpa: str = "1") -> pd.DataFrame:
-        """Fetch one FanGraphs leaderboard page. Returns empty DataFrame on any error.
-        Records HTTP status codes in _fg_errors for debug surfacing."""
+    def _fetch_savant_csv(url: str, label: str) -> pd.DataFrame:
+        """Fetch a Baseball Savant CSV leaderboard. Returns empty DF on failure."""
         try:
-            params = {
-                "age": "", "pos": "all", "stats": "bat", "lg": "all",
-                "qual": "0", "minpa": minpa,
-                "season": season_yr, "season1": season_yr,
-                "ind": "0", "team": "0", "pageitems": "2000", "pagenum": "1",
-                "sortdir": "default", "type": stat_type,
-                "sortstat": "WAR" if stat_type == "8" else "xSLG",
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/csv,*/*",
             }
-            r = requests.get(base_url, params=params, headers=headers, timeout=25)
-            if r.status_code == 200:
-                rows = r.json().get("data", [])
-                if rows:
-                    return pd.DataFrame(rows)
-                else:
-                    _fg_errors.append(f"HTTP 200 but data=[] (season={season_yr} type={stat_type})")
+            r = requests.get(url, headers=headers, timeout=25)
+            if r.status_code == 200 and r.content:
+                df = pd.read_csv(_io.StringIO(r.text))
+                if not df.empty:
+                    return df
+                _errs.append(f"{label}: empty CSV")
             else:
-                _fg_errors.append(f"HTTP {r.status_code} (season={season_yr} type={stat_type})")
-        except requests.exceptions.ConnectionError as e:
-            _fg_errors.append(f"ConnectionError/ProxyBlock (season={season_yr} type={stat_type}): {str(e)[:80]}")
+                _errs.append(f"{label}: HTTP {r.status_code}")
         except Exception as e:
-            _fg_errors.append(f"Error (season={season_yr} type={stat_type}): {str(e)[:80]}")
+            _errs.append(f"{label}: {str(e)[:80]}")
         return pd.DataFrame()
 
-    # ── Check disk cache first — if < 6h old, skip FanGraphs entirely ────────
-    # This avoids hammering FanGraphs on every Streamlit rerun/tab-switch.
-    # The "Clear Cache + Rerun" button clears st.cache_data but NOT disk cache,
-    # so a fresh FanGraphs fetch is only forced by deleting the .pkl file.
-    _early_cache = _load_disk_cache("batting_stats", max_age_hours=6)
-    if _early_cache is not None:
-        st.session_state["_batting_source"] = "disk_cache"
-        return _early_cache
-
-    # ── Fetch all four frames ──────────────────────────────────────────────
-    adv_2025 = _fetch_fg(season,     "8",  minpa="1")   # full season advanced
-    sc_2025  = _fetch_fg(season,     "24", minpa="1")   # full season statcast
-    adv_2026 = _fetch_fg(season + 1, "8",  minpa="0")   # current year advanced
-    sc_2026  = _fetch_fg(season + 1, "24", minpa="0")   # current year statcast
-
-    # Surface errors to session state for the debug panel
-    if _fg_errors:
-        st.session_state["_fg_batting_errors"] = _fg_errors
-
-    # ── ALL FanGraphs calls failed — try disk cache first, then pybaseball ─
-    if adv_2025.empty and adv_2026.empty:
-        # 1. Disk cache (up to 48h old — covers a few days of blocking)
-        cached = _load_disk_cache("batting_stats")
-        if cached is not None:
-            st.session_state["_batting_source"] = "disk_cache"
-            return cached
-
-        # 2. Pybaseball batting_stats fallback (also hits FanGraphs HTML, may fail too)
+    def _fetch_mlb_stats_api(season_yr: int) -> pd.DataFrame:
+        """Fetch season batting stats from MLB Stats API (always unblocked)."""
         try:
-            from pybaseball import batting_stats
-            df = batting_stats(season, qual=1)
-            if df is not None and not df.empty:
-                cleaned = clean_fangraphs_df(df)
-                _save_disk_cache("batting_stats", cleaned)
-                return cleaned
-        except Exception:
-            pass
+            url = (
+                f"https://statsapi.mlb.com/api/v1/stats"
+                f"?stats=season&group=hitting&season={season_yr}"
+                f"&limit=2000&offset=0&sportId=1"
+            )
+            r = requests.get(url, timeout=25)
+            if r.status_code == 200:
+                splits = r.json().get("stats", [{}])[0].get("splits", [])
+                if splits:
+                    rows = []
+                    for s in splits:
+                        p   = s.get("player", {})
+                        st_ = s.get("stat", {})
+                        pa  = int(st_.get("plateAppearances", 0) or 0)
+                        so  = int(st_.get("strikeOuts", 0) or 0)
+                        bb  = int(st_.get("baseOnBalls", 0) or 0)
+                        try:
+                            slg = float(st_.get("slg", 0) or 0)
+                            avg = float(st_.get("avg", 0) or 0)
+                        except:
+                            slg = avg = 0.0
+                        rows.append({
+                            "mlbam_id":  str(p.get("id", "")),
+                            "_name":     p.get("fullName", ""),
+                            "SLG":       slg,
+                            "AVG":       avg,
+                            "ISO":       round(slg - avg, 3),
+                            "K%":        round(so / pa, 3) if pa > 0 else 0.228,
+                            "BB%":       round(bb / pa, 3) if pa > 0 else 0.082,
+                            "PA":        pa,
+                        })
+                    df = pd.DataFrame(rows)
+                    df = df[df["PA"] > 0]
+                    return df
+                _errs.append(f"MLB API {season_yr}: splits empty")
+        except Exception as e:
+            _errs.append(f"MLB API {season_yr}: {str(e)[:80]}")
+        return pd.DataFrame()
 
+    # ── 2. Fetch Baseball Savant expected stats (xSLG, xwOBA, xBA) ───────
+    # Try current season first, fall back to prior season
+    xstats_cur = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/expected_statistics"
+        f"?type=batter&year={season+1}&position=&team=&min=1&csv=true",
+        f"Savant xStats {season+1}"
+    )
+    xstats_pri = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/expected_statistics"
+        f"?type=batter&year={season}&position=&team=&min=1&csv=true",
+        f"Savant xStats {season}"
+    )
+
+    # ── 3. Fetch Baseball Savant statcast leaderboard (Barrel%, HH%, EV) ─
+    sc_cur = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/statcast"
+        f"?year={season+1}&position=&team=&min=1&type=batter&csv=true",
+        f"Savant Statcast {season+1}"
+    )
+    sc_pri = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/statcast"
+        f"?year={season}&position=&team=&min=1&type=batter&csv=true",
+        f"Savant Statcast {season}"
+    )
+
+    # ── 4. Fetch MLB Stats API (SLG, K%, BB%, ISO) ────────────────────────
+    mlb_cur = _fetch_mlb_stats_api(season + 1)
+    mlb_pri = _fetch_mlb_stats_api(season)
+
+    # ── 5. Bat tracking — bat speed, blast rate (Savant 2023+) ────────────
+    bat_cur = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/bat-tracking"
+        f"?year={season+1}&minSwings=50&type=batter&csv=true",
+        f"Savant BatTracking {season+1}"
+    )
+    bat_pri = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/bat-tracking"
+        f"?year={season}&minSwings=100&type=batter&csv=true",
+        f"Savant BatTracking {season}"
+    )
+
+    # ── 6. Pitch arsenal stats — batter run value by pitch type ───────────
+    # Fetch each of the 6 primary pitch types; combine into one frame keyed
+    # by mlbam_id with columns like rv_vs_FF, rv_vs_SL, woba_vs_FF, etc.
+    # pitchType codes: FF=4-seam, SL=slider, CH=changeup, CU=curve,
+    #                  SI=sinker, FC=cutter
+    _pitch_type_frames = {}
+    for _pt in ("FF", "SL", "CH", "CU", "SI", "FC"):
+        _df = _fetch_savant_csv(
+            f"https://baseballsavant.mlb.com/leaderboard/pitch-arsenal-stats"
+            f"?type=batter&pitchType={_pt}&year={season}&min=10&csv=true",
+            f"Savant PitchArsenal batter vs {_pt}"
+        )
+        if not _df.empty:
+            _pitch_type_frames[_pt] = _df
+
+    if _errs:
+        st.session_state["_fg_batting_errors"] = _errs
+
+    # ── Check if we got anything useful ───────────────────────────────────
+    got_savant   = not xstats_cur.empty or not xstats_pri.empty
+    got_sc       = not sc_cur.empty or not sc_pri.empty
+    got_mlb      = not mlb_cur.empty or not mlb_pri.empty
+    got_bat      = not bat_cur.empty or not bat_pri.empty
+    got_arsenal  = len(_pitch_type_frames) > 0
+
+    if _errs:
+        st.session_state["_fg_batting_errors"] = _errs
+
+    if not got_savant and not got_mlb:
+        # All live sources failed — serve stale disk cache
+        stale = _load_disk_cache("batting_stats", max_age_hours=168)
+        if stale is not None:
+            st.session_state["_batting_source"] = "disk_cache_stale"
+            return stale
         st.session_state["_batting_source"] = "failed"
         return pd.DataFrame()
 
-    # ── Find the best join key across frames ──────────────────────────────
-    # NOTE: FanGraphs API alternates between "xMLBAMID" and "MLBAMID" across seasons
-    JOIN_KEYS = ["playerid", "PlayerID", "IDfg", "xMLBAMID", "MLBAMID"]
+    # ── Normalize Savant player_id column to "mlbam_id" string ───────────
+    def _normalize_savant(df: pd.DataFrame, name_label: str) -> pd.DataFrame:
+        if df.empty:
+            return df
+        df = df.copy()
+        # Savant uses "player_id" or "IDfg" as the MLBAM key
+        for pid_col in ("player_id", "IDfg", "mlbam_id"):
+            if pid_col in df.columns:
+                df["mlbam_id"] = df[pid_col].apply(
+                    lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("", "nan") else ""
+                )
+                break
+        # Normalize name to _name
+        for nc in ("last_name, first_name", "last_name,first_name", "Name", "name",
+                   "PlayerName", "player_name"):
+            if nc in df.columns:
+                if "," in nc:
+                    # Savant format: "last_name, first_name" is one column with value "Doe, John"
+                    df["_name"] = df[nc].apply(
+                        lambda s: " ".join(reversed([p.strip() for p in str(s).split(",")])) if pd.notna(s) else ""
+                    )
+                else:
+                    df["_name"] = df[nc].astype(str)
+                break
+        return df
 
-    def _find_key(df_a: pd.DataFrame, df_b: pd.DataFrame) -> Optional[str]:
-        for k in JOIN_KEYS:
-            if not df_a.empty and not df_b.empty and k in df_a.columns and k in df_b.columns:
-                return k
-        return None
+    xstats_cur = _normalize_savant(xstats_cur, "xstats_cur")
+    xstats_pri = _normalize_savant(xstats_pri, "xstats_pri")
+    sc_cur     = _normalize_savant(sc_cur,     "sc_cur")
+    sc_pri     = _normalize_savant(sc_pri,     "sc_pri")
 
-    # ── Build 2025 base: merge advanced + statcast ─────────────────────────
-    # Start from 2025 advanced (most complete: K%, SLG, ISO, wRC+, BB%, wOBA)
-    if not adv_2025.empty:
-        result = adv_2025.copy()
-        # Merge in 2025 statcast columns (xSLG, Barrel%, Hard%, EV)
-        if not sc_2025.empty:
-            jk = _find_key(result, sc_2025)
-            if jk:
-                # Only add columns that don't already exist
-                sc_new_cols = [c for c in sc_2025.columns if c not in result.columns]
-                if sc_new_cols:
-                    result = result.merge(sc_2025[[jk] + sc_new_cols],
-                                          on=jk, how="left")
-    elif not sc_2025.empty:
-        result = sc_2025.copy()
-    else:
-        result = pd.DataFrame()
+    # ── Build primary frame: prefer current-season xstats, fall back to prior ─
+    # Use prior season as base (more PAs), overlay current season where available
+    base_xstats = xstats_pri if not xstats_pri.empty else xstats_cur
+    base_sc     = sc_pri     if not sc_pri.empty     else sc_cur
+    base_mlb    = mlb_pri    if not mlb_pri.empty    else mlb_cur
 
-    # ── Blend in 2026 YTD stats at the PLAYER level ───────────────────────
-    # Rather than complex outer merges, we store 2026 stats with _2026 suffix
-    # and blend them in get_batter_stats() at scoring time.
-    # This avoids any column collision or NaN propagation issues.
-    for df_2026, suffix in [(adv_2026, "_2026"), (sc_2026, "_2026sc")]:
-        if df_2026.empty or result.empty:
-            continue
-        jk = _find_key(result, df_2026)
-        if not jk:
-            continue
-        # Add 2026 columns with suffix (only stat columns, not id/name columns)
-        id_like = {"playerid", "PlayerID", "IDfg", "xMLBAMID", "Name", "name",
-                   "PlayerName", "Team", "team", "Age", "age", "Season", "season"}
-        cols_to_add = [c for c in df_2026.columns
-                       if c not in id_like and c != jk]
-        if not cols_to_add:
-            continue
-        rename_map = {c: f"{c}{suffix}" for c in cols_to_add}
-        df_renamed = df_2026[[jk] + cols_to_add].rename(columns=rename_map)
-        # Remove any renamed cols that already exist to avoid duplicate suffix stacking
-        new_renamed = [v for v in rename_map.values() if v not in result.columns]
-        if new_renamed:
-            result = result.merge(
-                df_renamed[[jk] + new_renamed],
-                on=jk, how="left"
-            )
-
-    # ── Add 2026-only players (new callups not in 2025) ───────────────────
-    if not adv_2026.empty and not result.empty:
-        jk = _find_key(result, adv_2026)
-        if jk and jk in result.columns:
-            existing_ids = set(result[jk].dropna().astype(str).str.split(".").str[0])
-            new_players = adv_2026[
-                ~adv_2026[jk].astype(str).str.split(".").str[0].isin(existing_ids)
-            ]
-            if not new_players.empty:
-                result = pd.concat([result, new_players], ignore_index=True, sort=False)
-
-    if result.empty:
+    # Pick whichever base has the most players
+    bases = [(len(f), f) for f in [base_xstats, base_sc, base_mlb] if not f.empty]
+    if not bases:
+        stale = _load_disk_cache("batting_stats", max_age_hours=168)
+        if stale is not None:
+            st.session_state["_batting_source"] = "disk_cache_stale"
+            return stale
+        st.session_state["_batting_source"] = "failed"
         return pd.DataFrame()
 
-    cleaned = clean_fangraphs_df(result)
+    result = max(bases, key=lambda x: x[0])[1].copy()
 
-    # ── Sanity check: if no MLBAM ID crosswalk exists, try pybaseball batting_stats
-    has_xid = "xMLBAMID" in cleaned.columns or "MLBAMID" in cleaned.columns
-    if not has_xid:
-        try:
-            from pybaseball import batting_stats
-            pyb = batting_stats(season, qual=1)
-            if pyb is not None and not pyb.empty:
-                pyb_cleaned = clean_fangraphs_df(pyb)
-                _save_disk_cache("batting_stats", pyb_cleaned)
-                st.session_state["_batting_source"] = "fangraphs+pybaseball"
-                return pyb_cleaned
-        except Exception:
-            pass
+    # ── Merge remaining frames on mlbam_id ────────────────────────────────
+    def _merge_on_id(base: pd.DataFrame, other: pd.DataFrame,
+                     keep_cols: list, suffix: str = "") -> pd.DataFrame:
+        if other.empty or "mlbam_id" not in other.columns:
+            return base
+        cols = [c for c in keep_cols if c in other.columns and
+                (c not in base.columns or suffix)]
+        if not cols:
+            return base
+        rename = {c: f"{c}{suffix}" for c in cols} if suffix else {}
+        sub = other[["mlbam_id"] + cols].rename(columns=rename)
+        # Avoid duplicate mlbam_id in sub
+        sub = sub.drop_duplicates(subset=["mlbam_id"])
+        return base.merge(sub, on="mlbam_id", how="left")
 
-    # ── Save to disk cache on every successful live fetch ─────────────────
-    _save_disk_cache("batting_stats", cleaned)
-    st.session_state["_batting_source"] = "fangraphs_live"
-    return cleaned
+    xstats_cols = ["est_slg", "xslg", "est_woba", "xwoba", "est_ba",
+                   "xba", "est_slg_minus_slg_diff", "xSLG", "xwOBA"]
+    sc_cols     = ["barrel_batted_rate", "hard_hit_percent", "avg_exit_velocity",
+                   "sweet_spot_percent", "Barrel%", "Hard%", "EV",
+                   "avg_launch_speed", "launch_angle_avg"]
+    mlb_cols    = ["SLG", "ISO", "K%", "BB%", "AVG"]
+
+    for frame, cols in [(base_xstats, xstats_cols),
+                        (base_sc,     sc_cols),
+                        (base_mlb,    mlb_cols)]:
+        if frame is not result:
+            result = _merge_on_id(result, frame, cols)
+
+    # Also blend in current-season data with _2026 suffix where different from base
+    if not xstats_cur.empty and base_xstats is not xstats_cur:
+        result = _merge_on_id(result, xstats_cur, ["est_slg", "xslg", "xSLG"], "_2026sc")
+    if not sc_cur.empty and base_sc is not sc_cur:
+        result = _merge_on_id(result, sc_cur,
+                              ["barrel_batted_rate", "hard_hit_percent",
+                               "avg_exit_velocity"], "_2026sc")
+    if not mlb_cur.empty and base_mlb is not mlb_cur:
+        result = _merge_on_id(result, mlb_cur, ["SLG", "K%", "BB%", "ISO"], "_2026")
+
+    # ── Normalize column names for get_batter_stats() compatibility ───────
+    col_aliases = {
+        "est_slg":            "xSLG",
+        "xslg":               "xSLG",
+        "est_woba":           "xwOBA",
+        "xwoba":              "xwOBA",
+        "barrel_batted_rate": "Barrel%",
+        "hard_hit_percent":   "Hard%",
+        "avg_exit_velocity":  "EV",
+        "avg_launch_speed":   "EV",
+        "sweet_spot_percent": "Sweetspot%",
+    }
+    for src_col, tgt_col in col_aliases.items():
+        if src_col in result.columns and tgt_col not in result.columns:
+            result[tgt_col] = result[src_col]
+
+    # ── Normalize xMLBAMID to mlbam_id for find_player_row() ─────────────
+    if "mlbam_id" in result.columns and "xMLBAMID" not in result.columns:
+        result["xMLBAMID"] = result["mlbam_id"].astype(str)
+
+    # ── Ensure _name exists ───────────────────────────────────────────────
+    if "_name" not in result.columns:
+        for nc in ("Name", "name", "PlayerName", "last_name"):
+            if nc in result.columns:
+                result["_name"] = result[nc].astype(str)
+                break
+
+    # ── Normalize % columns ───────────────────────────────────────────────
+    pct_cols = ["K%", "BB%", "Barrel%", "Hard%", "Sweetspot%",
+                "barrel_batted_rate", "hard_hit_percent", "sweet_spot_percent"]
+    for col in pct_cols:
+        if col in result.columns:
+            try:
+                vals = pd.to_numeric(result[col], errors="coerce").dropna()
+                if len(vals) > 0 and float(vals.max()) > 1.5:
+                    result[col] = pd.to_numeric(result[col], errors="coerce") / 100.0
+            except Exception:
+                pass
+
+    # ── Merge bat tracking (bat speed, blast rate, squared-up%) ─────────
+    base_bat = bat_pri if not bat_pri.empty else bat_cur
+    base_bat = _normalize_savant(base_bat, "bat") if not base_bat.empty else base_bat
+    bat_cols = ["bat_speed", "blast_rate", "squared_up_rate",
+                "swing_length", "fast_swing_rate"]
+    result = _merge_on_id(result, base_bat, bat_cols)
+    # Also alias to friendlier names
+    if "bat_speed" in result.columns and "BatSpeed" not in result.columns:
+        result["BatSpeed"] = result["bat_speed"]
+    if "blast_rate" in result.columns and "BlastRate" not in result.columns:
+        result["BlastRate"] = result["blast_rate"]
+    # Normalize blast_rate / squared_up_rate to decimals if in 0-100 range
+    for _bc in ("blast_rate", "squared_up_rate", "fast_swing_rate"):
+        if _bc in result.columns:
+            try:
+                _vals = pd.to_numeric(result[_bc], errors="coerce").dropna()
+                if len(_vals) > 0 and float(_vals.max()) > 1.5:
+                    result[_bc] = pd.to_numeric(result[_bc], errors="coerce") / 100.0
+            except Exception:
+                pass
+
+    # ── Merge pitch arsenal batter splits → per-pitch run value columns ───
+    # Build a single frame with mlbam_id + rv_vs_FF + rv_vs_SL + ... columns
+    # Savant columns: run_value_per100, ba, slg, woba, whiff_percent (per pitch type)
+    if _pitch_type_frames:
+        _arsenal_rows = {}  # keyed by mlbam_id
+        for _pt, _df in _pitch_type_frames.items():
+            _df = _normalize_savant(_df.copy(), f"arsenal_{_pt}")
+            if "mlbam_id" not in _df.columns:
+                continue
+            # Column names vary: run_value_per100, run_value, rv, etc.
+            _rv_col = next((c for c in _df.columns if "run_value" in c.lower()), None)
+            _woba_col = next((c for c in _df.columns if c.lower() in ("woba", "est_woba", "xwoba")), None)
+            _slg_col  = next((c for c in _df.columns if c.lower() == "slg"), None)
+            _whiff_col = next((c for c in _df.columns if "whiff" in c.lower()), None)
+            for _, _row in _df.iterrows():
+                _mid = str(_row.get("mlbam_id", "")).strip()
+                if not _mid:
+                    continue
+                if _mid not in _arsenal_rows:
+                    _arsenal_rows[_mid] = {"mlbam_id": _mid}
+                if _rv_col and pd.notna(_row.get(_rv_col)):
+                    _arsenal_rows[_mid][f"rv_vs_{_pt}"]   = float(_row[_rv_col])
+                if _woba_col and pd.notna(_row.get(_woba_col)):
+                    _arsenal_rows[_mid][f"woba_vs_{_pt}"] = float(_row[_woba_col])
+                if _slg_col and pd.notna(_row.get(_slg_col)):
+                    _arsenal_rows[_mid][f"slg_vs_{_pt}"]  = float(_row[_slg_col])
+                if _whiff_col and pd.notna(_row.get(_whiff_col)):
+                    _w = float(_row[_whiff_col])
+                    _arsenal_rows[_mid][f"whiff_vs_{_pt}"] = _w / 100.0 if _w > 1.5 else _w
+        if _arsenal_rows:
+            _arsenal_df = pd.DataFrame(list(_arsenal_rows.values()))
+            _arsenal_cols = [c for c in _arsenal_df.columns if c != "mlbam_id"]
+            result = _merge_on_id(result, _arsenal_df, _arsenal_cols)
+
+    # ── Try FanGraphs as bonus layer (wRC+, ISO refinement) ───────────────
+    try:
+        import random as _random
+        fg_url = "https://www.fangraphs.com/api/leaders/major-league/data"
+        fg_headers = {
+            "User-Agent": _random.choice([
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.3 Safari/605.1.15",
+            ]),
+            "Referer": "https://www.fangraphs.com/leaders/major-league",
+            "Accept": "application/json",
+        }
+        fg_params = {
+            "age": "", "pos": "all", "stats": "bat", "lg": "all",
+            "qual": "0", "minpa": "1", "season": season, "season1": season,
+            "ind": "0", "team": "0", "pageitems": "2000", "pagenum": "1",
+            "sortdir": "default", "type": "8", "sortstat": "WAR",
+        }
+        fg_r = requests.get(fg_url, params=fg_params, headers=fg_headers, timeout=10)
+        if fg_r.status_code == 200:
+            fg_rows = fg_r.json().get("data", [])
+            if fg_rows:
+                fg_df = pd.DataFrame(fg_rows)
+                fg_df = clean_fangraphs_df(fg_df)
+                # Merge wRC+, ISO onto result via xMLBAMID
+                for id_col in ("xMLBAMID", "MLBAMID"):
+                    if id_col in fg_df.columns and "xMLBAMID" in result.columns:
+                        fg_sub = fg_df[[id_col, "wRC+", "ISO"]].dropna(subset=[id_col]).copy() \
+                            if "wRC+" in fg_df.columns else fg_df[[id_col]].copy()
+                        fg_sub = fg_sub.rename(columns={id_col: "xMLBAMID"})
+                        for col in ["wRC+", "ISO"]:
+                            if col in fg_sub.columns and col not in result.columns:
+                                result = result.merge(fg_sub[["xMLBAMID", col]], on="xMLBAMID", how="left")
+                        st.session_state["_batting_source"] = "savant+mlbapi+fangraphs"
+                        break
+    except Exception:
+        pass
+
+    if "_batting_source" not in st.session_state or \
+       st.session_state.get("_batting_source") == "disk_cache_fresh":
+        src_parts = []
+        if got_savant: src_parts.append("savant")
+        if got_mlb:    src_parts.append("mlbapi")
+        st.session_state["_batting_source"] = "+".join(src_parts) if src_parts else "unknown"
+
+    _save_disk_cache("batting_stats", result)
+    return result
 
 
 @st.cache_data(ttl=10800)
 def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     """
-    Load pitcher stats from FanGraphs JSON API.
-    V1.4: Added disk-based persistence cache + error surfacing (same as batting loader).
-    Merges advanced (K%, ERA, FIP, WHIP, G, GS, Team) + statcast (Hard%, Barrel%).
-    pageitems=1000 ensures all relievers are captured (30 teams × ~25 pitchers = 750).
-    Also loads 2026 YTD for relievers active this season.
+    V1.5: FanGraphs-free pitching pipeline.
+    Primary sources:
+      1. Disk cache (< 6h)
+      2. Baseball Savant pitcher statcast leaderboard → K%, Barrel% allowed, Hard% allowed, EV
+      3. MLB Stats API season pitching → ERA, SO, BB, IP, WHIP (derived), Team
+      4. FanGraphs (bonus, if accessible) → FIP, xFIP, GS, full team name
+      5. Disk cache (< 7d) stale fallback
     """
-    import random as _random
-    base_url = "https://www.fangraphs.com/api/leaders/major-league/data"
-    _UA_LIST = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    ]
-    headers = {
-        "User-Agent": _random.choice(_UA_LIST),
-        "Referer": "https://www.fangraphs.com/leaders/major-league",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    _pit_errors = []
+    import io as _io
 
-    def _fetch_pit(season_yr: int, stat_type: str) -> pd.DataFrame:
+    # ── 1. Early disk cache ───────────────────────────────────────────────
+    _early = _load_disk_cache("pitching_stats", max_age_hours=6)
+    if _early is not None:
+        st.session_state["_pitching_source"] = "disk_cache_fresh"
+        return _early
+
+    _errs = []
+
+    def _fetch_savant_csv(url: str, label: str) -> pd.DataFrame:
         try:
-            params = {
-                "age": "", "pos": "all", "stats": "pit", "lg": "all",
-                "qual": "0", "season": season_yr, "season1": season_yr,
-                "ind": "0", "team": "0", "pageitems": "1000", "pagenum": "1",
-                "sortdir": "default", "minip": "0",
-                "type": stat_type,
-                "sortstat": "ERA" if stat_type == "8" else "xERA",
-            }
-            r = requests.get(base_url, params=params, headers=headers, timeout=25)
-            if r.status_code == 200:
-                rows = r.json().get("data", [])
-                if rows:
-                    return pd.DataFrame(rows)
-                else:
-                    _pit_errors.append(f"HTTP 200 but data=[] (season={season_yr} type={stat_type})")
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+            if r.status_code == 200 and r.content:
+                df = pd.read_csv(_io.StringIO(r.text))
+                if not df.empty:
+                    return df
+                _errs.append(f"{label}: empty")
             else:
-                _pit_errors.append(f"HTTP {r.status_code} (season={season_yr} type={stat_type})")
-        except requests.exceptions.ConnectionError as e:
-            _pit_errors.append(f"ConnectionError/ProxyBlock (season={season_yr}): {str(e)[:80]}")
+                _errs.append(f"{label}: HTTP {r.status_code}")
         except Exception as e:
-            _pit_errors.append(f"Error (season={season_yr}): {str(e)[:80]}")
+            _errs.append(f"{label}: {str(e)[:80]}")
         return pd.DataFrame()
 
-    # ── Check disk cache first if < 6h old ───────────────────────────────────
-    _early_pit_cache = _load_disk_cache("pitching_stats", max_age_hours=6)
-    if _early_pit_cache is not None:
-        st.session_state["_pitching_source"] = "disk_cache"
-        return _early_pit_cache
-
-    adv_2025 = _fetch_pit(season,     "8")
-    sc_2025  = _fetch_pit(season,     "24")
-    adv_2026 = _fetch_pit(season + 1, "8")
-
-    if _pit_errors:
-        st.session_state["_fg_pitching_errors"] = _pit_errors
-
-    # ── ALL calls failed — try disk cache first, then pybaseball ─────────
-    if adv_2025.empty and adv_2026.empty:
-        cached = _load_disk_cache("pitching_stats")
-        if cached is not None:
-            st.session_state["_pitching_source"] = "disk_cache"
-            return cached
+    def _fetch_mlb_pitching(season_yr: int) -> pd.DataFrame:
         try:
-            from pybaseball import pitching_stats
-            df = pitching_stats(season, qual=1)
-            if df is not None and not df.empty:
-                cleaned = clean_fangraphs_df(df)
-                _save_disk_cache("pitching_stats", cleaned)
-                return cleaned
-        except Exception:
-            pass
+            url = (
+                f"https://statsapi.mlb.com/api/v1/stats"
+                f"?stats=season&group=pitching&season={season_yr}"
+                f"&limit=2000&offset=0&sportId=1"
+            )
+            r = requests.get(url, timeout=25)
+            if r.status_code == 200:
+                splits = r.json().get("stats", [{}])[0].get("splits", [])
+                if splits:
+                    rows = []
+                    for s in splits:
+                        p   = s.get("player", {})
+                        st_ = s.get("stat", {})
+                        tm  = s.get("team", {})
+                        ip_str = str(st_.get("inningsPitched", "0") or "0")
+                        try:
+                            ip = float(ip_str)
+                        except:
+                            ip = 0.0
+                        so  = int(st_.get("strikeOuts", 0) or 0)
+                        bb  = int(st_.get("baseOnBalls", 0) or 0)
+                        tbf = int(st_.get("battersFaced", 0) or 0)
+                        h   = int(st_.get("hits", 0) or 0)
+                        er  = int(st_.get("earnedRuns", 0) or 0)
+                        gs  = int(st_.get("gamesStarted", 0) or 0)
+                        g   = int(st_.get("gamesPlayed", 0) or 0)
+                        era = round(er / ip * 9, 2) if ip > 0 else 4.50
+                        whip= round((h + bb) / ip, 3) if ip > 0 else 1.35
+                        rows.append({
+                            "mlbam_id": str(p.get("id", "")),
+                            "_name":    p.get("fullName", ""),
+                            "Team":     tm.get("abbreviation", ""),
+                            "ERA":      era,
+                            "WHIP":     whip,
+                            "K%":       round(so / tbf, 3) if tbf > 0 else 0.228,
+                            "BB%":      round(bb / tbf, 3) if tbf > 0 else 0.082,
+                            "GS":       gs,
+                            "G":        g,
+                            "IP":       ip,
+                        })
+                    df = pd.DataFrame(rows)
+                    df = df[df["IP"] > 0]
+                    return df
+                _errs.append(f"MLB pitching API {season_yr}: splits empty")
+        except Exception as e:
+            _errs.append(f"MLB pitching API {season_yr}: {str(e)[:80]}")
+        return pd.DataFrame()
+
+    # ── 2. Baseball Savant pitcher statcast leaderboard ───────────────────
+    sc_pit_cur = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/statcast"
+        f"?year={season+1}&position=SP-RP&team=&min=1&type=pitcher&csv=true",
+        f"Savant Pitcher {season+1}"
+    )
+    sc_pit_pri = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/statcast"
+        f"?year={season}&position=SP-RP&team=&min=1&type=pitcher&csv=true",
+        f"Savant Pitcher {season}"
+    )
+
+    # ── 3. Pitcher arsenal mix — % usage per pitch type ──────────────────
+    # n_ = percentage share for each pitch type (FF%, SL%, CH%, etc.)
+    arsenal_mix_cur = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/pitch-arsenals"
+        f"?year={season+1}&min=10&type=n_&hand=&csv=true",
+        f"Savant PitcherArsenal {season+1}"
+    )
+    arsenal_mix_pri = _fetch_savant_csv(
+        f"https://baseballsavant.mlb.com/leaderboard/pitch-arsenals"
+        f"?year={season}&min=50&type=n_&hand=&csv=true",
+        f"Savant PitcherArsenal {season}"
+    )
+
+    # ── 4. MLB Stats API pitching ──────────────────────────────────────────
+    mlb_pit_cur = _fetch_mlb_pitching(season + 1)
+    mlb_pit_pri = _fetch_mlb_pitching(season)
+
+    if _errs:
+        st.session_state["_fg_pitching_errors"] = _errs
+
+    got_savant = not sc_pit_cur.empty or not sc_pit_pri.empty
+    got_mlb    = not mlb_pit_cur.empty or not mlb_pit_pri.empty
+
+    if not got_savant and not got_mlb:
+        stale = _load_disk_cache("pitching_stats", max_age_hours=168)
+        if stale is not None:
+            st.session_state["_pitching_source"] = "disk_cache_stale"
+            return stale
         st.session_state["_pitching_source"] = "failed"
         return pd.DataFrame()
 
-    # Build result: prefer 2026 if meaningful (active season), else 2025
-    if not adv_2026.empty and len(adv_2026) > 50:
-        result = adv_2026.copy()
-        # Supplement with 2025 players not yet in 2026 (returning from IL etc)
-        if not adv_2025.empty:
-            for k in ["playerid", "PlayerID", "IDfg"]:
-                if k in result.columns and k in adv_2025.columns:
-                    existing = set(result[k].dropna().astype(str).str.split(".").str[0])
-                    extras = adv_2025[~adv_2025[k].astype(str).str.split(".").str[0].isin(existing)]
-                    if not extras.empty:
-                        result = pd.concat([result, extras], ignore_index=True, sort=False)
-                    break
-    elif not adv_2025.empty:
-        result = adv_2025.copy()
-    else:
+    def _normalize_savant_pit(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        df = df.copy()
+        for pid_col in ("player_id", "IDfg", "mlbam_id"):
+            if pid_col in df.columns:
+                df["mlbam_id"] = df[pid_col].apply(
+                    lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("","nan") else ""
+                )
+                break
+        for nc in ("last_name, first_name", "Name", "name", "PlayerName"):
+            if nc in df.columns:
+                if "," in nc:
+                    df["_name"] = df[nc].apply(
+                        lambda s: " ".join(reversed([p.strip() for p in str(s).split(",")])) if pd.notna(s) else ""
+                    )
+                else:
+                    df["_name"] = df[nc].astype(str)
+                break
+        return df
+
+    sc_pit_cur = _normalize_savant_pit(sc_pit_cur)
+    sc_pit_pri = _normalize_savant_pit(sc_pit_pri)
+
+    # Build result: prefer MLB API as base (has ERA, WHIP, Team, GS — critical for scoring)
+    base_mlb = mlb_pit_cur if (not mlb_pit_cur.empty and len(mlb_pit_cur) > 50) else mlb_pit_pri
+    base_sc  = sc_pit_pri  if not sc_pit_pri.empty else sc_pit_cur
+
+    result = base_mlb.copy() if not base_mlb.empty else base_sc.copy()
+    if result.empty:
+        stale = _load_disk_cache("pitching_stats", max_age_hours=168)
+        if stale is not None:
+            st.session_state["_pitching_source"] = "disk_cache_stale"
+            return stale
+        st.session_state["_pitching_source"] = "failed"
         return pd.DataFrame()
 
-    # Merge statcast columns (Hard%, Barrel%, xERA)
-    sc_frame = sc_2025 if not sc_2025.empty else pd.DataFrame()
-    if not sc_frame.empty:
-        for k in ["playerid", "PlayerID", "IDfg", "Name"]:
-            if k in result.columns and k in sc_frame.columns:
-                new_cols = [c for c in sc_frame.columns if c not in result.columns]
-                if new_cols:
-                    result = result.merge(sc_frame[[k] + new_cols], on=k, how="left")
+    # Merge Savant statcast cols (barrel% allowed, hard hit% allowed, EV)
+    savant_pit_cols = ["barrel_batted_rate", "hard_hit_percent", "avg_exit_velocity",
+                       "Barrel%", "Hard%", "EV", "xera", "xERA"]
+    for sc_frame in [base_sc, sc_pit_cur]:
+        if sc_frame is not None and not sc_frame.empty and "mlbam_id" in sc_frame.columns:
+            cols = [c for c in savant_pit_cols if c in sc_frame.columns and c not in result.columns]
+            if cols:
+                sub = sc_frame[["mlbam_id"] + cols].drop_duplicates("mlbam_id")
+                result = result.merge(sub, on="mlbam_id", how="left")
+
+    # Normalize Savant column names
+    pit_aliases = {
+        "barrel_batted_rate": "Barrel%",
+        "hard_hit_percent":   "Hard%",
+        "avg_exit_velocity":  "EV",
+        "xera":               "xERA",
+    }
+    for src, tgt in pit_aliases.items():
+        if src in result.columns and tgt not in result.columns:
+            result[tgt] = result[src]
+
+    # xMLBAMID alias for find_player_row()
+    if "mlbam_id" in result.columns and "xMLBAMID" not in result.columns:
+        result["xMLBAMID"] = result["mlbam_id"].astype(str)
+
+    # Normalize % columns
+    for col in ["K%", "BB%", "Barrel%", "Hard%"]:
+        if col in result.columns:
+            try:
+                vals = pd.to_numeric(result[col], errors="coerce").dropna()
+                if len(vals) > 0 and float(vals.max()) > 1.5:
+                    result[col] = pd.to_numeric(result[col], errors="coerce") / 100.0
+            except Exception:
+                pass
+
+    # ── Merge pitcher arsenal mix (pitch type usage %) ────────────────────
+    # Savant columns: n_FF, n_SL, n_CH, n_CU, n_SI, n_FC (usage % for each pitch type)
+    # We'll store as pct_FF, pct_SL etc. for clear naming
+    base_arsenal = arsenal_mix_cur if not arsenal_mix_cur.empty else arsenal_mix_pri
+    if not base_arsenal.empty:
+        # Normalize player_id
+        for pid_col in ("player_id", "IDfg", "mlbam_id"):
+            if pid_col in base_arsenal.columns:
+                base_arsenal = base_arsenal.copy()
+                base_arsenal["mlbam_id"] = base_arsenal[pid_col].apply(
+                    lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("","nan") else ""
+                )
                 break
+        # Find pitch % columns (named n_FF, n_SL, etc. in Savant)
+        _pit_mix_cols = [c for c in base_arsenal.columns
+                         if c.startswith("n_") and len(c) <= 6]
+        # Rename n_XX -> pct_XX for cleaner downstream access
+        _rename_mix = {c: f"pct_{c[2:]}" for c in _pit_mix_cols}
+        base_arsenal = base_arsenal.rename(columns=_rename_mix)
+        _pct_cols = list(_rename_mix.values())
+        if "mlbam_id" in result.columns and _pct_cols:
+            sub = base_arsenal[["mlbam_id"] + _pct_cols].drop_duplicates("mlbam_id")
+            # Normalize to decimals if stored as 0-100
+            for _pc in _pct_cols:
+                try:
+                    _v = pd.to_numeric(sub[_pc], errors="coerce").dropna()
+                    if len(_v) > 0 and float(_v.max()) > 1.5:
+                        sub[_pc] = pd.to_numeric(sub[_pc], errors="coerce") / 100.0
+                except Exception:
+                    pass
+            result = result.merge(sub, on="mlbam_id", how="left")
 
-    # Add K% alias if missing
-    if "K%" not in result.columns and "SO" in result.columns and "TBF" in result.columns:
-        try:
-            result["K%"] = result["SO"] / result["TBF"]
-        except Exception:
-            pass
+    # ── FanGraphs bonus layer (FIP, xFIP if accessible) ───────────────────
+    try:
+        import random as _random
+        fg_url = "https://www.fangraphs.com/api/leaders/major-league/data"
+        fg_r = requests.get(fg_url, params={
+            "age": "", "pos": "all", "stats": "pit", "lg": "all",
+            "qual": "0", "season": season, "season1": season, "ind": "0",
+            "team": "0", "pageitems": "1000", "pagenum": "1",
+            "sortdir": "default", "minip": "0", "type": "8", "sortstat": "ERA",
+        }, headers={
+            "User-Agent": _random.choice([
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+            ]),
+            "Referer": "https://www.fangraphs.com/leaders/major-league",
+            "Accept": "application/json",
+        }, timeout=10)
+        if fg_r.status_code == 200:
+            fg_rows = fg_r.json().get("data", [])
+            if fg_rows:
+                fg_df = pd.DataFrame(fg_rows)
+                fg_df = clean_fangraphs_df(fg_df)
+                for id_col in ("xMLBAMID", "MLBAMID"):
+                    if id_col in fg_df.columns and "xMLBAMID" in result.columns:
+                        bonus_cols = [c for c in ["FIP", "xFIP", "WHIP"] if c in fg_df.columns and c not in result.columns]
+                        if bonus_cols:
+                            sub = fg_df[[id_col] + bonus_cols].rename(columns={id_col: "xMLBAMID"})
+                            result = result.merge(sub, on="xMLBAMID", how="left")
+                        break
+    except Exception:
+        pass
 
-    cleaned = clean_fangraphs_df(result)
-    _save_disk_cache("pitching_stats", cleaned)
-    st.session_state["_pitching_source"] = "fangraphs_live"
-    return cleaned
+    src_parts = []
+    if got_mlb:    src_parts.append("mlbapi")
+    if got_savant: src_parts.append("savant")
+    st.session_state["_pitching_source"] = "+".join(src_parts) if src_parts else "unknown"
+
+    _save_disk_cache("pitching_stats", result)
+    return result
+
 
 
 def clean_fangraphs_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -1008,8 +1355,19 @@ def get_batter_stats(player_name: str, mlb_id: str,
         "hard_hit_rate":    0.370,
         "soft_hit_rate":    0.155,
         "exit_velocity_avg":88.5,
+        "ev50":             95.0,    # hardest 50% avg EV — better power signal
         "sweet_spot_rate":  0.305,
         "tb_per_game":      0.85,
+        "bat_speed":        71.0,    # MLB avg bat speed mph (Savant bat tracking)
+        "blast_rate":       0.210,   # MLB avg blast rate ~21%
+        "squared_up_rate":  0.265,   # MLB avg squared-up rate ~26.5%
+        # Pitch-type run values vs each pitch (league avg = 0.0 = neutral)
+        "rv_vs_FF":         0.0,     # vs 4-seam fastball
+        "rv_vs_SL":         0.0,     # vs slider
+        "rv_vs_CH":         0.0,     # vs changeup
+        "rv_vs_CU":         0.0,     # vs curveball
+        "rv_vs_SI":         0.0,     # vs sinker
+        "rv_vs_FC":         0.0,     # vs cutter
         "data_source":      "league_avg",
     }
 
@@ -1076,6 +1434,31 @@ def get_batter_stats(player_name: str, mlb_id: str,
 
         stats["data_source"] = "fangraphs"
 
+        # ── EV50 (hardest 50% avg exit velocity — better power signal) ─────
+        ev50 = safe_get(row, 'ev50', 'EV50', 'xEV50', default=None)
+        if ev50 and ev50 > 50:
+            stats["ev50"] = ev50
+
+        # ── Bat tracking (bat speed, blast rate) ──────────────────────────
+        bs = safe_get(row, 'bat_speed', 'BatSpeed', default=None)
+        if bs and bs > 30:
+            stats["bat_speed"] = bs
+        br = safe_get(row, 'blast_rate', 'BlastRate', default=None)
+        if br is not None and br >= 0:
+            stats["blast_rate"] = br if br < 1 else br / 100
+        sq = safe_get(row, 'squared_up_rate', default=None)
+        if sq is not None and sq >= 0:
+            stats["squared_up_rate"] = sq if sq < 1 else sq / 100
+
+        # ── Pitch-type run values (from pitch arsenal batter splits) ──────
+        for _pt in ("FF", "SL", "CH", "CU", "SI", "FC"):
+            rv = safe_get(row, f"rv_vs_{_pt}", default=None)
+            if rv is not None:
+                stats[f"rv_vs_{_pt}"] = float(rv)
+            woba_pt = safe_get(row, f"woba_vs_{_pt}", default=None)
+            if woba_pt and 0.100 < woba_pt < 0.900:
+                stats[f"woba_vs_{_pt}"] = float(woba_pt)
+
         # ── 2026 YTD blending (_2026 suffix from new merge strategy) ──────
         # Advanced stats blend (K%, SLG, ISO, wRC+)
         xslg_26  = safe_get(row, 'xSLG_2026', 'xSLG_2026sc', default=None)
@@ -1115,6 +1498,13 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         "fip":              4.10,
         "xfip":             4.10,
         "whip":             1.30,
+        # Pitch arsenal mix — MLB avg usage (2025 approx)
+        "pct_FF":           0.35,   # 4-seam fastball
+        "pct_SI":           0.17,   # sinker
+        "pct_SL":           0.20,   # slider
+        "pct_CH":           0.10,   # changeup
+        "pct_CU":           0.11,   # curveball
+        "pct_FC":           0.07,   # cutter
         "data_source":      "league_avg",
     }
 
@@ -1148,6 +1538,12 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         whip = safe_get(row, 'WHIP', default=None)
         if whip and 0 < whip < 5:
             stats["whip"] = whip
+
+        # ── Pitch arsenal mix (pct_FF, pct_SL, etc.) ─────────────────────
+        for _pt in ("FF", "SI", "SL", "CH", "CU", "FC"):
+            _pct = safe_get(row, f"pct_{_pt}", default=None)
+            if _pct is not None and _pct >= 0:
+                stats[f"pct_{_pt}"] = _pct if _pct < 1 else _pct / 100
 
         stats["data_source"] = "fangraphs"
 
@@ -1554,6 +1950,69 @@ def compute_lineup_score(lineup_slot: int) -> Tuple[float, str]:
     return score, f"#{lineup_slot} {slot_labels.get(lineup_slot, str(lineup_slot))}{bonus} ({expected_pa:.1f} PA/g)"
 
 
+def compute_pitch_matchup_score(batter_stats: Dict, pitcher_stats: Dict) -> Tuple[float, str]:
+    """
+    V1.5: Pitch matchup score 0-100.
+    Cross-references:
+      - Pitcher's arsenal mix (what % of each pitch type they throw)
+      - Batter's run value vs each pitch type
+    Produces a 0-100 score where:
+      50 = neutral (batter has avg performance vs pitcher's pitch mix)
+      70+ = strong edge (batter crushes pitcher's primary pitches)
+      30- = disadvantage (batter struggles vs pitcher's primary pitches)
+
+    Run value scale: -2.0 (terrible) to +2.0 (elite) per 100 pitches
+    Weighted by pitcher's usage % → usage-adjusted RV composite
+    """
+    PITCH_TYPES = ("FF", "SI", "SL", "CH", "CU", "FC")
+    # League avg run values vs each pitch type (approx 2025 baseline)
+    # Positive = batter-favorable, Negative = pitcher-favorable
+    LEAGUE_AVG_RV = {"FF": 0.0, "SI": -0.1, "SL": -0.2, "CH": -0.1, "CU": -0.2, "FC": -0.1}
+
+    try:
+        # Pitcher's arsenal mix (sum should ~= 1.0 after normalization)
+        total_pct = sum(
+            float(pitcher_stats.get(f"pct_{pt}", 0) or 0)
+            for pt in PITCH_TYPES
+        )
+        if total_pct < 0.01:
+            return 50.0, "Pitch mix: no data"
+
+        # Batter's run value vs each pitch type — usage-weighted composite
+        weighted_rv = 0.0
+        coverage = 0.0  # how much of pitcher's arsenal we have batter data for
+        pitch_details = []
+
+        for pt in PITCH_TYPES:
+            pct = float(pitcher_stats.get(f"pct_{pt}", 0) or 0)
+            if pct < 0.01:
+                continue
+            pct_norm = pct / total_pct  # normalize to sum=1
+            rv = float(batter_stats.get(f"rv_vs_{pt}", LEAGUE_AVG_RV.get(pt, 0.0)))
+            rv_relative = rv - LEAGUE_AVG_RV.get(pt, 0.0)  # relative to league avg
+            weighted_rv += pct_norm * rv_relative
+            coverage += pct_norm
+            if pct_norm > 0.15:  # only label pitches ≥15% usage
+                sign = "+" if rv > 0 else ""
+                pitch_details.append(f"{pt}({pct_norm*100:.0f}%): {sign}{rv:.2f}")
+
+        # weighted_rv range: roughly -1.5 to +1.5 in extreme cases
+        # Map to 0-100: -1.5 → 10, 0 → 50, +1.5 → 90
+        score = 50.0 + (weighted_rv / 1.5) * 40.0
+        score = max(10.0, min(90.0, score))
+
+        # Penalize low data coverage (batter without pitch-type splits)
+        if coverage < 0.5:
+            # Blend toward 50 proportionally
+            score = score * (coverage / 0.5) + 50.0 * (1 - coverage / 0.5)
+
+        label = "Pitch mix: " + " | ".join(pitch_details) if pitch_details else "Pitch mix: avg splits"
+        return round(score, 1), label
+
+    except Exception:
+        return 50.0, "Pitch mix: error"
+
+
 def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, str, Dict]:
     """
     Compute batter profile sub-score 0-100.
@@ -1573,6 +2032,9 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     k_rate      = f("k_rate",           0.228)
     iso         = f("iso_proxy",        0.165)
     wrc_plus    = f("wrc_plus",         100.0)
+    ev50        = f("ev50",             95.0)    # V1.5: hardest 50% EV
+    bat_speed   = f("bat_speed",        71.0)    # V1.5: Savant bat tracking
+    blast_rate  = f("blast_rate",       0.210)   # V1.5: fast swing + square contact
 
     details["xSLG"]     = round(xslg, 3)
     details["Barrel%"]  = f"{barrel_rate*100:.1f}%"
@@ -1580,6 +2042,9 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     details["K%"]       = f"{k_rate*100:.1f}%"
     details["ISO"]      = round(iso, 3)
     details["wRC+"]     = int(wrc_plus)
+    details["EV50"]     = round(ev50, 1)
+    details["BatSpd"]   = round(bat_speed, 1)
+    details["Blast%"]   = f"{blast_rate*100:.1f}%"
 
     # ── Sub-scores 0-100, calibrated to actual MLB distributions ──
 
@@ -1589,41 +2054,54 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     xslg_score = max(0, min(100, xslg_score))
 
     # wRC+: 60=0, 100=50, 180=100
-    # Judge 204 → 100 (capped), Avg 100 → 50, Weak 70 → ~13
     wrc_score = (wrc_plus - 60) / (180 - 60) * 100
     wrc_score = max(0, min(100, wrc_score))
 
     # Barrel%: 0%=0, 7%=44, 20%=100
-    # Judge 24.7% → 100 (capped), Avg 7% → 44, Weak 3% → 15
     barrel_score = barrel_rate / 0.20 * 100
     barrel_score = max(0, min(100, barrel_score))
 
     # Hard hit%: 28%=0, 38%=50, 56%=100
-    # Judge 45.6% → ~86, Avg 38% → 50, Weak 28% → 0
     hard_hit_score = (hard_hit - 0.28) / (0.56 - 0.28) * 100
     hard_hit_score = max(0, min(100, hard_hit_score))
 
     # K rate INVERSE: 8%=100, 23%=50, 38%=0
-    # Low K = more TB opportunities (no K = 0 TB guaranteed)
     k_score = max(0, min(100, (0.38 - k_rate) / (0.38 - 0.08) * 100))
 
     # ISO: .080=0, .165=50, .320=100
-    # Judge .357 → 100 (capped), Avg .165 → 50, Weak .080 → 0
     iso_score = (iso - 0.080) / (0.320 - 0.080) * 100
     iso_score = max(0, min(100, iso_score))
 
-    # Weighted composite — research-calibrated sub-weights
-    # Barrel% leads: r=0.93 with HR, better XBH predictor than xSLG
-    # xSLG secondary: r=0.87 Y-to-Y, best single contact quality metric
-    # HH% up slightly: r²=0.67 Y-to-Y, more predictive than ISO for TB
+    # V1.5: EV50 — hardest 50% avg exit velocity
+    # 88mph=0, 95mph=50, 103mph=100 (elite power ceiling)
+    ev50_score = (ev50 - 88.0) / (103.0 - 88.0) * 100
+    ev50_score = max(0, min(100, ev50_score))
+
+    # V1.5: Bat speed — mechanical power ceiling
+    # 65mph=0, 71mph=50, 78mph=100  (MLB range roughly 63-80mph)
+    bat_speed_score = (bat_speed - 65.0) / (78.0 - 65.0) * 100
+    bat_speed_score = max(0, min(100, bat_speed_score))
+
+    # V1.5: Blast rate — fast swing that squares up (best contact quality signal)
+    # 10%=0, 21%=50, 35%=100
+    blast_score = (blast_rate - 0.10) / (0.35 - 0.10) * 100
+    blast_score = max(0, min(100, blast_score))
+
+    # Weighted composite — V1.5 updated weights
+    # Added EV50, bat speed, blast rate; reduced wRC+ (FG-only stat)
+    # All weights re-normalized to sum=1.0
     composite = (
-        barrel_score  * 0.26 +   # barrel% — strongest XBH/HR predictor (r=0.93 w/ HR)
-        xslg_score    * 0.22 +   # xSLG — overall contact quality (r=0.87 Y-to-Y)
-        wrc_score     * 0.18 +   # wRC+ — offensive context (r=0.78 Y-to-Y)
-        hard_hit_score* 0.17 +   # hard hit% — sustainable contact (r²=0.67 Y-to-Y)
-        iso_score     * 0.10 +   # ISO — raw power (r=0.71 Y-to-Y)
-        k_score       * 0.07     # K% inverse — PA completion rate
-    )
+        barrel_score   * 0.22 +  # barrel% — strongest XBH/HR predictor
+        xslg_score     * 0.18 +  # xSLG — overall contact quality
+        hard_hit_score * 0.14 +  # hard hit% — sustainable contact
+        ev50_score     * 0.12 +  # EV50 — power ceiling (NEW — Savant only)
+        blast_score    * 0.10 +  # blast rate — swing quality (NEW — Savant only)
+        bat_speed_score* 0.08 +  # bat speed — mechanical floor (NEW — Savant only)
+        wrc_score      * 0.10 +  # wRC+ — offensive context
+        iso_score      * 0.07 +  # ISO — raw power
+        k_score        * 0.05    # K% inverse — PA completion rate (trim K = trim to 5%)
+    )  # sum = 1.06 -> normalize
+    composite = composite / 1.06  # keep true 0-100 scale
 
     return max(0, min(100, composite)), "Contact quality", details
 
@@ -1923,31 +2401,33 @@ def compute_final_score(
     weather_score: float,
     vegas_score: float,
     tto_bonus: float = 0.0,
+    pitch_matchup_score: float = 50.0,
 ) -> float:
     """
     Final weighted composite. Research-calibrated weights.
-    TTO bonus added as additional signal on top of base score.
-    
+    V1.5: Added pitch matchup score (batter RV vs pitcher's arsenal mix).
+
     Weight rationale:
-    - Batter 43%: dominant signal, most Y-to-Y stability
-    - Pitcher 25%: real but less predictive than batter for TB props
-      (pitchers suppress scoring but XBH vs them is less predictable than Ks)
-    - Platoon 7%: +56 SLG effect is large and well-documented
-    - Weather 4%: wind 15+ mph = ~12% more HRs (material)
+    - Batter 40%: dominant signal, most Y-to-Y stability (reduced 3% to make room for matchup)
+    - Pitcher 22%: real but less predictive than batter for TB props
+    - Pitch matchup 7%: batter's run value vs SP's actual pitch mix — direct edge signal
+    - Platoon 6%: +56 SLG effect (reduced slightly; matchup score partially captures this)
     - Park 7%: Coors/GABP vs pitcher's parks = real difference
     - TTO 5%: 3rd TTO +17-20 wOBA is well-documented
     - Vegas 5%: team total correlates r=0.61 with scoring
+    - Weather 4%: wind 15+ mph = ~12% more HRs
     - Lineup 4%: 1 extra PA from slot 1 vs 9 = real but small
     """
     raw = (
-        batter_score      * 0.43 +
-        pitcher_vuln_score* 0.25 +   # 28->25: pitcher matters less for TB than K props
-        platoon_score     * 0.07 +   # 6->7: +56 SLG effect is large, deserves more
-        lineup_score      * 0.04 +
-        park_score        * 0.07 +
-        weather_score     * 0.04 +   # 3->4: wind 15+ mph = 12% more HRs
-        vegas_score       * 0.05 +
-        tto_bonus         * 0.05    # 4->5: 3rd TTO +17-20 wOBA is well-documented
+        batter_score        * 0.40 +
+        pitcher_vuln_score  * 0.22 +
+        pitch_matchup_score * 0.07 +  # V1.5: pitch arsenal matchup (NEW)
+        platoon_score       * 0.06 +
+        lineup_score        * 0.04 +
+        park_score          * 0.07 +
+        weather_score       * 0.04 +
+        vegas_score         * 0.05 +
+        tto_bonus           * 0.05
     )
     # Calibration offset: raw league-avg matchup → target ~52
     calibrated = raw + 10.0
@@ -2462,6 +2942,8 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             opp_team = batter.get("opponent", "").strip().upper()
             bp_vuln = team_bullpen_scores.get(opp_team, 42.0)
             pit_score, pit_label = compute_pitcher_score(pitcher_statcast, bullpen_vuln=bp_vuln)
+            # V1.5: Pitch arsenal matchup — batter RV vs SP's actual pitch mix
+            matchup_sc, matchup_label = compute_pitch_matchup_score(batter_statcast, pitcher_statcast)
             plat_score, plat_label = compute_platoon_score(batter_hand, sp_hand)
             lineup_sc, lineup_label = compute_lineup_score(lineup_slot)
             park_sc, park_label = compute_park_score(park_team, True)
@@ -2472,7 +2954,8 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
             final_score = compute_final_score(
                 bat_score, pit_score, plat_score, lineup_sc,
-                park_sc, weather_sc, vegas_sc, tto_sc
+                park_sc, weather_sc, vegas_sc, tto_sc,
+                pitch_matchup_score=matchup_sc,
             )
 
             # Caps & flags
@@ -2549,6 +3032,8 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "sweet_spot_rate": batter_statcast.get("sweet_spot_rate", 0),
                 "sub_batter": round(bat_score, 1),
                 "sub_pitcher": round(pit_score, 1),
+                "sub_matchup": round(matchup_sc, 1),   # V1.5: pitch arsenal matchup
+                "matchup_label": matchup_label,
                 "sub_platoon": round(plat_score, 1),
                 "sub_lineup": round(lineup_sc, 1),
                 "sub_park": round(park_sc, 1),
@@ -2556,6 +3041,9 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "sub_vegas": round(vegas_sc, 1),
                 "bullpen_vuln": round(bp_vuln, 1),
                 "platoon_edge": plat_label,
+                "bat_speed": batter_statcast.get("bat_speed", 0),
+                "blast_rate": batter_statcast.get("blast_rate", 0),
+                "ev50": batter_statcast.get("ev50", 0),
                 "temperature": weather.get("temperature", 70),
                 "wind_speed": weather.get("wind_speed", 0),
                 "wind_dir": weather.get("wind_dir_label", ""),
@@ -2841,6 +3329,12 @@ def display_leaderboard(plays: List[Dict]):
                 st.write(f"• HardHit%: {p['hard_hit_rate']*100:.1f}%" if p["hard_hit_rate"] else "• HardHit%: —")
                 st.write(f"• K%: {p['k_rate']*100:.1f}%" if p["k_rate"] else "• K%: —")
                 st.write(f"• Exit Velo: {p['exit_velocity']:.1f} mph" if p["exit_velocity"] else "• Exit Velo: —")
+                ev50 = p.get("ev50", 0)
+                st.write(f"• EV50: {ev50:.1f} mph" if ev50 and ev50 > 50 else "• EV50: —")
+                bs = p.get("bat_speed", 0)
+                st.write(f"• Bat Speed: {bs:.1f} mph" if bs and bs > 30 else "• Bat Speed: —")
+                br = p.get("blast_rate", 0)
+                st.write(f"• Blast%: {br*100:.1f}%" if br and br > 0 else "• Blast%: —")
                 st.write(f"• Lineup: {p['lineup_label']}")
                 st.write(f"• Platoon: {p['platoon_label']}")
             
@@ -2858,14 +3352,18 @@ def display_leaderboard(plays: List[Dict]):
             with col_c:
                 st.markdown("**📊 Score Breakdown**")
                 sub_labels = {
-                    "🏏 Batter (45%)": p["sub_batter"],
-                    "⚾ Pitcher Vuln (30%)": p["sub_pitcher"],
+                    "🏏 Batter (40%)": p["sub_batter"],
+                    "⚾ Pitcher Vuln (22%)": p["sub_pitcher"],
+                    "🎯 Pitch Matchup (7%)": p.get("sub_matchup", 50),
                     "🤚 Platoon (6%)": p["sub_platoon"],
                     "📋 Lineup (4%)": p["sub_lineup"],
                     "🏟️ Park (7%)": p["sub_park"],
-                    "🌤️ Weather (3%)": p["sub_weather"],
+                    "🌤️ Weather (4%)": p["sub_weather"],
                     "💰 Vegas (5%)": p["sub_vegas"],
                 }
+                matchup_lbl = p.get("matchup_label", "")
+                if matchup_lbl and matchup_lbl != "Pitch mix: avg splits":
+                    st.caption(f"🎯 {matchup_lbl}")
                 for label, val in sub_labels.items():
                     bar_color = "#00ff88" if val >= 70 else "#ffdd00" if val >= 50 else "#ff4444"
                     bar_width = int(val)
@@ -5943,8 +6441,14 @@ Free tier (500/mo) is more than enough.
             # ── Data source status ─────────────────────────────────────────
             bat_src  = st.session_state.get("_batting_source", "not_run")
             pit_src  = st.session_state.get("_pitching_source", "not_run")
-            src_icon = {"fangraphs_live": "✅", "fangraphs+pybaseball": "✅",
-                        "disk_cache": "💾", "failed": "❌", "not_run": "⏳"}
+            src_icon = {
+                "fangraphs_live": "✅", "fangraphs+pybaseball": "✅",
+                "savant+mlbapi": "✅", "mlbapi+savant": "✅",
+                "savant+mlbapi+fangraphs": "✅", "mlbapi": "✅",
+                "disk_cache": "💾", "disk_cache_fresh": "💾 fresh",
+                "disk_cache_stale": "⚠️ stale",
+                "failed": "❌", "not_run": "⏳",
+            }
             st.markdown(f"**Batting stats source:** {src_icon.get(bat_src,'❓')} `{bat_src}`")
             st.markdown(f"**Pitching stats source:** {src_icon.get(pit_src,'❓')} `{pit_src}`")
 
@@ -6079,6 +6583,7 @@ Free tier (500/mo) is more than enough.
                         "Final":      p["score"],
                         "Batter":     p.get("sub_batter", "—"),
                         "Pitcher":    p.get("sub_pitcher", "—"),
+                        "Matchup":    p.get("sub_matchup", "—"),
                         "BP Vuln":    p.get("bullpen_vuln", "—"),
                         "Platoon":    p.get("sub_platoon", "—"),
                         "Park":       p.get("sub_park", "—"),
@@ -6090,11 +6595,11 @@ Free tier (500/mo) is more than enough.
             else:
                 st.info("Run the model to see per-player score breakdowns.")
 
-        st.caption(f"v1.4 | {datetime.now(EST).strftime('%I:%M %p EST')}")
+        st.caption(f"v1.6 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
     # ── MAIN CONTENT ──────────────────────────────────────
-    st.title("⚾ MLB Total Bases Analyzer V1.4")
-    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.4: Stat cache persistence + FG error surfacing")
+    st.title("⚾ MLB Total Bases Analyzer V1.6")
+    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.6: Pitch arsenal matchup + bat tracking + EV50")
     
     # Tabs
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
