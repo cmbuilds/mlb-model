@@ -1519,7 +1519,17 @@ def get_batter_stats(player_name: str, mlb_id: str,
         if sweet is not None and sweet > 0:
             stats["sweet_spot_rate"] = sweet if sweet < 1 else sweet / 100
 
-        stats["data_source"] = "fangraphs"
+        # Label source accurately based on what columns were actually found
+        if any(c in row.index for c in ('xSLG','est_slg','xslg','est_woba')):
+            stats["data_source"] = "savant_xstats"
+        elif any(c in row.index for c in ('Barrel%','Hard%','barrel_batted_rate','hard_hit_percent')):
+            stats["data_source"] = "savant_statcast"
+        elif any(c in row.index for c in ('hr_per_pa','hard_proxy','tb_per_pa')):
+            stats["data_source"] = "mlbapi"
+        else:
+            # Row found but columns unclear — could be FanGraphs if accessible,
+            # or a future data source. Label generically.
+            stats["data_source"] = "matched"
 
         # ── EV50 (hardest 50% avg exit velocity — better power signal) ─────
         ev50 = safe_get(row, 'ev50', 'EV50', 'xEV50', default=None)
@@ -1684,7 +1694,13 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         if hard_p is not None and stats["hard_hit_allowed"] == 0.360:
             stats["hard_hit_allowed"] = round(hard_p, 3)
 
-        stats["data_source"] = "fangraphs"
+        # Label pitcher source based on available columns
+        if any(c in row.index for c in ('barrel_proxy','hard_proxy_pit','H_per_9')):
+            stats["data_source"] = "mlbapi"
+        elif any(c in row.index for c in ('Barrel%','Hard%','barrel_batted_rate')):
+            stats["data_source"] = "savant_statcast"
+        else:
+            stats["data_source"] = "matched"
 
     return stats
 
@@ -2276,17 +2292,34 @@ def compute_team_bullpen_scores(pitching_df: pd.DataFrame) -> Dict[str, float]:
     if has_gs and has_g:
         df["_GS"] = pd.to_numeric(df["GS"], errors="coerce").fillna(0)
         df["_G"]  = pd.to_numeric(df["G"],  errors="coerce").fillna(0)
+        df["_IP"] = pd.to_numeric(df.get("IP", pd.Series(dtype=float)), errors="coerce").fillna(0)
         relievers = df[
             (df["_GS"] == 0) |
             ((df["_G"] > 0) & (df["_GS"] / df["_G"].replace(0, 1) < 0.30))
         ].copy()
+        # Early-season fallback: if < 5% of pitchers are classified as relievers,
+        # most likely everyone has GS=0 (season just started).
+        # Use IP threshold instead: relievers = IP < 3.0 per game avg
+        if not relievers.empty and len(relievers) / max(1, len(df)) > 0.70:
+            # >70% labeled reliever = early season artifact; use IP/G ratio instead
+            df["_ipg"] = df["_IP"] / df["_G"].replace(0, 1)
+            relievers = df[df["_ipg"] < 2.0].copy()  # < 2 IP/game = likely reliever
     elif has_gs:
         df["_GS"] = pd.to_numeric(df["GS"], errors="coerce").fillna(0)
         relievers = df[df["_GS"] == 0].copy()
     else:
-        # Can't distinguish starters from relievers — return empty, fall back to league avg
-        return {}
+        # No GS column — use IP/G if available, else use all pitchers as proxy
+        if "IP" in df.columns and "G" in df.columns:
+            df["_IP"] = pd.to_numeric(df["IP"], errors="coerce").fillna(0)
+            df["_G"]  = pd.to_numeric(df["G"],  errors="coerce").fillna(0)
+            df["_ipg"] = df["_IP"] / df["_G"].replace(0, 1)
+            relievers = df[df["_ipg"] < 2.0].copy()
+        else:
+            relievers = df.copy()  # Use all pitchers as proxy
 
+    if relievers.empty:
+        # Last resort: use all pitchers
+        relievers = df.copy()
     if relievers.empty:
         return {}
 
@@ -2807,6 +2840,42 @@ def run_model(date_str: str, status_container) -> List[Dict]:
     log("Loading 2025 season batting stats...", "run")
     batting_df = load_all_batting_stats(2025)
     pitching_df = load_all_pitching_stats(2025)
+
+    # ── Set source labels in run_model (not inside @st.cache_data) ───────
+    # @st.cache_data skips function body on cache HIT, so session_state
+    # assignments inside cached functions only fire on cache MISS.
+    # We detect source here based on what columns are present in the result.
+    if batting_df.empty:
+        st.session_state["_batting_source"] = "failed"
+    elif any(c in batting_df.columns for c in ('xSLG','est_slg','xslg','xMLBAMID')):
+        # Check disk cache age
+        import os as _os, time as _time
+        _cache_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "stat_cache")
+        _bat_cache = _os.path.join(_cache_dir, "batting_stats.pkl")
+        if _os.path.exists(_bat_cache):
+            _age_h = (_time.time() - _os.path.getmtime(_bat_cache)) / 3600
+            if _age_h < 6:
+                st.session_state["_batting_source"] = "disk_cache_fresh"
+            elif _age_h < 168:
+                st.session_state["_batting_source"] = "disk_cache_stale"
+            else:
+                st.session_state["_batting_source"] = "savant+mlbapi"
+        else:
+            st.session_state["_batting_source"] = "savant+mlbapi"
+    else:
+        st.session_state["_batting_source"] = "mlbapi_only"
+
+    if pitching_df.empty:
+        st.session_state["_pitching_source"] = "failed"
+    else:
+        import os as _os2, time as _time2
+        _cache_dir2 = _os2.path.join(_os2.path.dirname(_os2.path.abspath(__file__)), "stat_cache")
+        _pit_cache = _os2.path.join(_cache_dir2, "pitching_stats.pkl")
+        if _os2.path.exists(_pit_cache):
+            _age_h2 = (_time2.time() - _os2.path.getmtime(_pit_cache)) / 3600
+            st.session_state["_pitching_source"] = f"disk_cache_{('fresh' if _age_h2 < 6 else 'stale')}"
+        else:
+            st.session_state["_pitching_source"] = "mlbapi+savant"
     statcast_df = pd.DataFrame()  # merged into batting_df now
 
     if not batting_df.empty:
@@ -3051,7 +3120,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                     "id_col_used": xmlbam_col or "NONE — ID lookup disabled",
                     "xMLBAMID_sample": [str(v) for v in xmlbam_sample],
                     "data_source": batter_statcast.get("data_source"),
-                    "matched": batter_statcast.get("data_source") == "fangraphs",
+                    "matched": batter_statcast.get("data_source", "league_avg") != "league_avg",
                 }
 
             # Store first 5 searched names for debug
@@ -3062,7 +3131,8 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             st.session_state["search_sample"] = st.session_state["_search_names"]
 
             # Track match rate
-            if batter_statcast.get("data_source") == "fangraphs":
+            _ds = batter_statcast.get("data_source", "league_avg")
+            if _ds != "league_avg":
                 st.session_state["_matched"] = st.session_state.get("_matched", 0) + 1
             else:
                 st.session_state["_unmatched"] = st.session_state.get("_unmatched", 0) + 1
@@ -6571,8 +6641,15 @@ def main():
         except:
             has_odds_key = False
 
-        st.markdown(f"✅ MLB Stats API")
-        st.markdown(f"✅ FanGraphs (pybaseball)")
+        st.markdown(f"✅ MLB Stats API *(always accessible)*")
+        bat_src = st.session_state.get("_batting_source", "")
+        pit_src = st.session_state.get("_pitching_source", "")
+        if "savant" in bat_src or bat_src in ("disk_cache_fresh","disk_cache_stale"):
+            st.markdown(f"✅ Baseball Savant *(xStats + Statcast)*")
+        elif bat_src == "failed":
+            st.markdown(f"⚠️ Baseball Savant *(blocked — using MLB API proxies)*")
+        else:
+            st.markdown(f"⚠️ Baseball Savant *(run model to check)*")
         st.markdown(f"✅ Open-Meteo Weather")
         
         if has_odds_key:
@@ -6627,12 +6704,18 @@ Free tier (500/mo) is more than enough.
             bat_src  = st.session_state.get("_batting_source", "not_run")
             pit_src  = st.session_state.get("_pitching_source", "not_run")
             src_icon = {
+                # Live fetch sources
                 "fangraphs_live": "✅", "fangraphs+pybaseball": "✅",
                 "savant+mlbapi": "✅", "mlbapi+savant": "✅",
-                "savant+mlbapi+fangraphs": "✅", "mlbapi": "✅",
-                "disk_cache": "💾", "disk_cache_fresh": "💾 fresh",
-                "disk_cache_stale": "⚠️ stale",
-                "failed": "❌", "not_run": "⏳",
+                "savant+mlbapi+fangraphs": "✅",
+                "mlbapi": "✅", "mlbapi_only": "⚠️",
+                "savant_xstats": "✅", "savant_statcast": "✅",
+                "matched": "✅",
+                # Disk cache
+                "disk_cache": "💾", "disk_cache_fresh": "💾",
+                "disk_cache_stale": "⚠️",
+                # Failure states
+                "failed": "❌", "not_run": "⏳", "unknown": "❓",
             }
             st.markdown(f"**Batting stats source:** {src_icon.get(bat_src,'❓')} `{bat_src}`")
             st.markdown(f"**Pitching stats source:** {src_icon.get(pit_src,'❓')} `{pit_src}`")
@@ -6702,10 +6785,23 @@ Free tier (500/mo) is more than enough.
             if batting_cols:
                 critical_bat = ["SLG", "ISO", "K%", "BB%", "wRC+", "wOBA",
                                 "Barrel%", "Hard%", "EV", "xSLG", "xwOBA"]
+                # Proxy columns that fill in when Savant columns are missing
+                _proxy_map = {
+                    "Barrel%": "hr_per_pa",
+                    "Hard%":   "hard_proxy",
+                    "wRC+":    None,
+                    "wOBA":    "OBP",
+                    "EV":      None,
+                }
                 st.markdown("**Batting — critical columns:**")
                 for c in critical_bat:
-                    st.markdown(f"{'✅' if c in batting_cols else '❌'} `{c}`")
-                st.caption(f"Total columns loaded: {len(batting_cols)}")
+                    if c in batting_cols:
+                        st.markdown(f"✅ `{c}`")
+                    elif c in _proxy_map and _proxy_map[c] and _proxy_map[c] in batting_cols:
+                        st.markdown(f"🔄 `{c}` *(proxy from `{_proxy_map[c]}`)*")
+                    else:
+                        st.markdown(f"❌ `{c}` *(missing — score uses league avg)*")
+                st.caption(f"Total columns loaded: {len(batting_cols)} | 🔄 = derived proxy active")
             else:
                 st.info("Run the model to see batting column status.")
             if pitching_cols:
