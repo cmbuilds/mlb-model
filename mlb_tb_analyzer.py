@@ -552,15 +552,47 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
                             avg = float(st_.get("avg", 0) or 0)
                         except:
                             slg = avg = 0.0
+                        hr  = int(st_.get("homeRuns", 0) or 0)
+                        tb  = int(st_.get("totalBases", 0) or 0)
+                        d2  = int(st_.get("doubles", 0) or 0)
+                        d3  = int(st_.get("triples", 0) or 0)
+                        ab  = int(st_.get("atBats", 0) or 0)
+                        try:
+                            obp  = float(st_.get("obp", 0) or 0)
+                            bab  = float(st_.get("babip", 0) or 0)
+                        except:
+                            obp = bab = 0.0
+
+                        # Derive Statcast proxies from counting stats
+                        # HR/PA is the best barrel% proxy available without Savant
+                        # MLB avg HR/PA ~2.9% = ~7% barrel rate (1 barrel ≈ 0.41 HR)
+                        hr_pa       = hr / pa if pa > 0 else 0.0
+                        xbh_pa      = (d2 + d3 + hr) / pa if pa > 0 else 0.0
+                        tb_pa       = tb / pa if pa > 0 else 0.0
+                        # Hard hit proxy: high SLG + low K = contact quality
+                        # Not perfect but better than league average default
+                        hard_proxy  = min(0.55, max(0.25, slg * 0.55 + (1 - so/pa if pa > 0 else 0.77) * 0.20))
+
                         rows.append({
-                            "mlbam_id":  str(p.get("id", "")),
-                            "_name":     p.get("fullName", ""),
-                            "SLG":       slg,
-                            "AVG":       avg,
-                            "ISO":       round(slg - avg, 3),
-                            "K%":        round(so / pa, 3) if pa > 0 else 0.228,
-                            "BB%":       round(bb / pa, 3) if pa > 0 else 0.082,
-                            "PA":        pa,
+                            "mlbam_id":     str(p.get("id", "")),
+                            "_name":        p.get("fullName", ""),
+                            "SLG":          slg,
+                            "AVG":          avg,
+                            "OBP":          obp,
+                            "ISO":          round(slg - avg, 3),
+                            "K%":           round(so / pa, 3) if pa > 0 else 0.228,
+                            "BB%":          round(bb / pa, 3) if pa > 0 else 0.082,
+                            "PA":           pa,
+                            "HR":           hr,
+                            "doubles":      d2,
+                            "triples":      d3,
+                            "totalBases":   tb,
+                            "BABIP":        bab,
+                            # Derived Statcast proxies (used when Savant unavailable)
+                            "hr_per_pa":    round(hr_pa, 4),      # barrel% proxy
+                            "xbh_per_pa":   round(xbh_pa, 4),     # power contact proxy
+                            "tb_per_pa":    round(tb_pa, 4),       # direct TB rate
+                            "hard_proxy":   round(hard_proxy, 3),  # HH% proxy
                         })
                     df = pd.DataFrame(rows)
                     df = df[df["PA"] > 0]
@@ -717,7 +749,9 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     sc_cols     = ["barrel_batted_rate", "hard_hit_percent", "avg_exit_velocity",
                    "sweet_spot_percent", "Barrel%", "Hard%", "EV",
                    "avg_launch_speed", "launch_angle_avg"]
-    mlb_cols    = ["SLG", "ISO", "K%", "BB%", "AVG"]
+    mlb_cols    = ["SLG", "ISO", "K%", "BB%", "AVG", "OBP", "BABIP",
+                   "hr_per_pa", "xbh_per_pa", "tb_per_pa", "hard_proxy",
+                   "HR", "doubles", "triples", "totalBases"]
 
     for frame, cols in [(base_xstats, xstats_cols),
                         (base_sc,     sc_cols),
@@ -969,19 +1003,32 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                         er  = int(st_.get("earnedRuns", 0) or 0)
                         gs  = int(st_.get("gamesStarted", 0) or 0)
                         g   = int(st_.get("gamesPlayed", 0) or 0)
-                        era = round(er / ip * 9, 2) if ip > 0 else 4.50
-                        whip= round((h + bb) / ip, 3) if ip > 0 else 1.35
+                        era  = round(er / ip * 9, 2) if ip > 0 else 4.50
+                        whip = round((h + bb) / ip, 3) if ip > 0 else 1.35
+                        hr_a = int(st_.get("homeRuns", 0) or 0)
+                        # Derived Statcast proxies from counting stats
+                        # HR allowed / TBF → barrel% allowed proxy
+                        # League avg: HR/TBF ~2.9% → barrel_allowed ~6.5%
+                        barrel_proxy = min(0.18, hr_a / tbf / 0.029 * 0.065) if tbf > 0 else 0.065
+                        # H/9 → hard hit proxy: more hits = more hard contact
+                        h_per_9  = h / ip * 9 if ip > 0 else 9.0
+                        hard_proxy_pit = min(0.50, max(0.25, 0.28 + (h_per_9 - 9.0) * 0.012))
                         rows.append({
-                            "mlbam_id": str(p.get("id", "")),
-                            "_name":    p.get("fullName", ""),
-                            "Team":     tm.get("abbreviation", ""),
-                            "ERA":      era,
-                            "WHIP":     whip,
-                            "K%":       round(so / tbf, 3) if tbf > 0 else 0.228,
-                            "BB%":      round(bb / tbf, 3) if tbf > 0 else 0.082,
-                            "GS":       gs,
-                            "G":        g,
-                            "IP":       ip,
+                            "mlbam_id":      str(p.get("id", "")),
+                            "_name":         p.get("fullName", ""),
+                            "Team":          tm.get("abbreviation", ""),
+                            "ERA":           era,
+                            "WHIP":          whip,
+                            "K%":            round(so / tbf, 3) if tbf > 0 else 0.228,
+                            "BB%":           round(bb / tbf, 3) if tbf > 0 else 0.082,
+                            "GS":            gs,
+                            "G":             g,
+                            "IP":            ip,
+                            "HR_allowed":    hr_a,
+                            "H_per_9":       round(h_per_9, 2),
+                            # Proxies for Savant stats when Savant unavailable
+                            "barrel_proxy":  round(barrel_proxy, 4),
+                            "hard_proxy_pit":round(hard_proxy_pit, 3),
                         })
                     df = pd.DataFrame(rows)
                     df = df[df["IP"] > 0]
@@ -1479,6 +1526,43 @@ def get_batter_stats(player_name: str, mlb_id: str,
         if ev50 and ev50 > 50:
             stats["ev50"] = ev50
 
+        # ── MLB Stats API proxy fallback ──────────────────────────────────
+        # When Savant is blocked, use counting-stat-derived proxies for
+        # Barrel%, HH%, and xSLG rather than league-average defaults.
+        # Proxies are less accurate but far better than 7.0%/37.0% for everyone.
+
+        # Barrel% proxy: HR/PA scaled to barrel rate
+        # League: HR/PA ~2.9% = barrel ~7%; Judge HR/PA ~8% = barrel ~20%
+        # Formula: barrel_proxy = hr_per_pa / 0.029 * 0.07
+        hr_pa = safe_get(row, 'hr_per_pa', default=None)
+        if hr_pa is not None and stats["barrel_rate"] == 0.070:
+            # Only override if we're still at the default
+            barrel_proxy = min(0.25, hr_pa / 0.029 * 0.070)
+            if barrel_proxy > 0.010:  # at least some HR production
+                stats["barrel_rate"] = round(barrel_proxy, 4)
+
+        # Hard hit% proxy: derived from SLG-based formula in MLB API fetch
+        hard_p = safe_get(row, 'hard_proxy', default=None)
+        if hard_p is not None and stats["hard_hit_rate"] == 0.370:
+            stats["hard_hit_rate"] = round(hard_p, 4)
+
+        # xSLG proxy: SLG is a reasonable proxy when xSLG unavailable
+        # (xSLG ~ SLG * 1.02 on average; use direct SLG if nothing better)
+        slg_raw = safe_get(row, 'SLG', 'slg', default=None)
+        if slg_raw and 0.100 < slg_raw < 0.900 and stats["slg_proxy"] == 0.398:
+            stats["slg_proxy"] = slg_raw
+
+        # TB/PA proxy: direct total bases rate for power scoring
+        tb_pa = safe_get(row, 'tb_per_pa', default=None)
+        if tb_pa and tb_pa > 0:
+            stats["tb_per_game"] = tb_pa * 4.2  # approx PA/game
+
+        # OBP as wOBA proxy when xwOBA unavailable
+        obp = safe_get(row, 'OBP', 'obp', default=None)
+        if obp and 0.200 < obp < 0.600 and stats["woba"] == 0.315:
+            # wOBA ≈ OBP * 0.82 (rough linear scaling)
+            stats["woba"] = round(obp * 0.82, 3)
+
         # ── Bat tracking (bat speed, blast rate) ──────────────────────────
         bs = safe_get(row, 'bat_speed', 'BatSpeed', default=None)
         if bs and bs > 30:
@@ -1589,6 +1673,16 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
             _pct = safe_get(row, f"pct_{_pt}", default=None)
             if _pct is not None and _pct >= 0:
                 stats[f"pct_{_pt}"] = _pct if _pct < 1 else _pct / 100
+
+        # ── MLB Stats API proxy fallback for Barrel%/HH% allowed ──────────
+        # When Savant is blocked, use counting-stat proxies
+        barrel_p = safe_get(row, 'barrel_proxy', default=None)
+        if barrel_p is not None and stats["barrel_allowed"] == 0.065:
+            stats["barrel_allowed"] = round(max(0.010, barrel_p), 4)
+
+        hard_p = safe_get(row, 'hard_proxy_pit', default=None)
+        if hard_p is not None and stats["hard_hit_allowed"] == 0.360:
+            stats["hard_hit_allowed"] = round(hard_p, 3)
 
         stats["data_source"] = "fangraphs"
 
