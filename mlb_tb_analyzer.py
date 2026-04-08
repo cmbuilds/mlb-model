@@ -1361,6 +1361,7 @@ def get_batter_stats(player_name: str, mlb_id: str,
         "bat_speed":        71.0,    # MLB avg bat speed mph (Savant bat tracking)
         "blast_rate":       0.210,   # MLB avg blast rate ~21%
         "squared_up_rate":  0.265,   # MLB avg squared-up rate ~26.5%
+        "sprint_speed":     27.0,    # MLB avg sprint speed ft/sec (Savant)
         # Pitch-type run values vs each pitch (league avg = 0.0 = neutral)
         "rv_vs_FF":         0.0,     # vs 4-seam fastball
         "rv_vs_SL":         0.0,     # vs slider
@@ -1449,6 +1450,11 @@ def get_batter_stats(player_name: str, mlb_id: str,
         sq = safe_get(row, 'squared_up_rate', default=None)
         if sq is not None and sq >= 0:
             stats["squared_up_rate"] = sq if sq < 1 else sq / 100
+
+        # ── Sprint speed (ft/sec from Savant sprint speed leaderboard) ────
+        ss = safe_get(row, 'sprint_speed', 'SprintSpeed', 'hp_to_1b', default=None)
+        if ss and 15 < ss < 35:  # valid ft/sec range (MLB 23-31 typical)
+            stats["sprint_speed"] = ss
 
         # ── Pitch-type run values (from pitch arsenal batter splits) ──────
         for _pt in ("FF", "SL", "CH", "CU", "SI", "FC"):
@@ -2475,47 +2481,56 @@ def compute_hr_score(
     hard_hit: float = 0.37,
     exit_velocity: float = 88.5,
     iso: float = 0.165,
+    ev50: float = 95.0,
+    bat_speed: float = 71.0,
+    blast_rate: float = 0.21,
+    pitch_matchup_score: float = 50.0,
 ) -> float:
     """
     Compute dedicated HR upside score 0-100.
-    V1.3: Added exit velocity and ISO signals. Reduced sweet_spot weight
-    since it was defaulting to league avg for everyone.
+    V1.6: Added EV50, bat speed, blast rate, pitch matchup.
 
     Signal weights (research-backed):
-    - Barrel%      40% — r=0.93 with HR rate, #1 predictor
-    - Park factor  20% — Coors/GABP vs pitcher's parks = real difference
-    - Hard hit%    12% — exit velocity proxy, correlates with HR distance
-    - Exit velocity 8% — direct measurement of batted ball power
-    - ISO           8% — raw power history, stable year-to-year
-    - Vegas implied 7% — high-total games = more HR opportunities
-    - Wind/weather  5% — 15mph out = ~15-20% more HRs
-
-    Sweet spot removed as primary signal (was 20%) — defaults to 30.5%
-    for too many players. Barrel% already captures optimal launch angle.
+    - Barrel%        35% — r=0.93 with HR rate, #1 predictor
+    - Park factor    15% — Coors/GABP vs pitcher's parks
+    - EV50           10% — hardest 50% EV — best power ceiling signal (NEW Savant)
+    - Bat speed       8% — mechanical HR ceiling (75+ mph = HR capable) (NEW Savant)
+    - Hard hit%       8% — contact quality / exit velocity proxy
+    - ISO             7% — raw power history, stable Y-to-Y
+    - Blast rate      6% — fast + squared up = HR swing quality (NEW Savant)
+    - Vegas implied   5% — high-total games = more HR opportunities
+    - Pitch matchup   4% — favorable pitch type RV for FB/power pitches (NEW V1.6)
+    - Wind/weather dynamic
     """
     # ── Barrel% — #1 HR predictor (r=0.93) ────────────────────────────
-    # 0%=0, 10%=50, 20%=100 (Judge at 24.7% → capped at 100)
     barrel_score = max(0, min(100, barrel_rate / 0.20 * 100))
 
+    # ── EV50 — hardest 50% avg exit velocity (V1.6 NEW) ───────────────
+    # 88mph=0, 96mph=50, 104mph=100
+    ev50_score = max(0, min(100, (ev50 - 88.0) / (104.0 - 88.0) * 100))
+
+    # ── Bat speed — mechanical HR ceiling (V1.6 NEW) ──────────────────
+    # 65mph=0, 71mph=50, 78mph=100
+    bat_speed_score = max(0, min(100, (bat_speed - 65.0) / (78.0 - 65.0) * 100))
+
+    # ── Blast rate — fast swing + square contact (V1.6 NEW) ───────────
+    # 10%=0, 21%=50, 35%=100
+    blast_score = max(0, min(100, (blast_rate - 0.10) / (0.35 - 0.10) * 100))
+
     # ── Hard hit% — contact quality / power proxy ─────────────────────
-    # 28%=0, 42%=50, 56%=100
     hh_score = max(0, min(100, (hard_hit - 0.28) / (0.56 - 0.28) * 100))
 
-    # ── Exit velocity — direct power measurement ───────────────────────
-    # 82mph=0, 89mph=50, 96mph+=100
-    ev_score = max(0, min(100, (exit_velocity - 82.0) / (96.0 - 82.0) * 100))
-
     # ── ISO — raw power history ────────────────────────────────────────
-    # .080=0, .180=50, .320=100
     iso_score = max(0, min(100, (iso - 0.080) / (0.320 - 0.080) * 100))
 
     # ── Park HR factor ─────────────────────────────────────────────────
-    # 0.85=0, 1.00=30, 1.35=100
     park_score = max(0, min(100, (park_hr_factor - 0.85) / (1.35 - 0.85) * 100))
 
     # ── Vegas implied total ────────────────────────────────────────────
-    # 3.0=0, 4.5=50, 6.5=100
     vegas_score = max(0, min(100, (implied_total - 3.0) / (6.5 - 3.0) * 100)) if implied_total > 0 else 40.0
+
+    # ── Pitch matchup (V1.6) — already 0-100, wire in directly ────────
+    matchup_score = max(0, min(100, pitch_matchup_score))
 
     # ── Wind / weather — dynamic weight based on speed ────────────────
     # Wind is conditionally significant: 20mph out = ~25% more HRs, 7mph = noise.
@@ -2564,23 +2579,22 @@ def compute_hr_score(
         temp_adj = 0.0
 
     # Redistribute weight: wind steals from park_score when significant
-    # (a 20mph out wind matters more than a 1.05x park factor)
-    adjusted_park_weight = max(0.08, 0.20 - wind_weight)
+    adjusted_park_weight = max(0.06, 0.15 - wind_weight)
 
-    # ── Composite ─────────────────────────────────────────────────────
+    # ── Composite V1.6 ─────────────────────────────────────────────────
     base = (
-        barrel_score * 0.40 +
-        park_score   * adjusted_park_weight +
-        hh_score     * 0.12 +
-        ev_score     * 0.08 +
-        iso_score    * 0.08 +
-        vegas_score  * 0.07
+        barrel_score    * 0.35 +
+        ev50_score      * 0.10 +     # V1.6 NEW: best power ceiling signal
+        bat_speed_score * 0.08 +     # V1.6 NEW: mechanical HR ceiling
+        park_score      * adjusted_park_weight +
+        hh_score        * 0.08 +
+        iso_score       * 0.07 +
+        blast_score     * 0.06 +     # V1.6 NEW: swing quality
+        vegas_score     * 0.05 +
+        matchup_score   * 0.04       # V1.6 NEW: pitch type matchup
     )
 
-    # Remaining weight after dynamic redistribution goes to barrel (already dominant)
-    # Wind contribution: wind_raw is on a 0-100 scale, weighted dynamically
     wind_contribution = wind_raw * wind_weight if wind_weight > 0 else 0.0
-
     composite = base + wind_contribution + temp_adj
 
     return max(0, min(100, round(composite, 1)))
@@ -2991,6 +3005,10 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 hard_hit=batter_statcast.get("hard_hit_rate", 0.37),
                 exit_velocity=batter_statcast.get("exit_velocity_avg", 88.5),
                 iso=batter_statcast.get("iso_proxy", 0.165),
+                ev50=batter_statcast.get("ev50", 95.0),
+                bat_speed=batter_statcast.get("bat_speed", 71.0),
+                blast_rate=batter_statcast.get("blast_rate", 0.21),
+                pitch_matchup_score=matchup_sc,
             )
 
             results.append({
@@ -3041,9 +3059,10 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "sub_vegas": round(vegas_sc, 1),
                 "bullpen_vuln": round(bp_vuln, 1),
                 "platoon_edge": plat_label,
-                "bat_speed": batter_statcast.get("bat_speed", 0),
-                "blast_rate": batter_statcast.get("blast_rate", 0),
-                "ev50": batter_statcast.get("ev50", 0),
+                "bat_speed":    batter_statcast.get("bat_speed", 0),
+                "blast_rate":   batter_statcast.get("blast_rate", 0),
+                "ev50":         batter_statcast.get("ev50", 0),
+                "sprint_speed": batter_statcast.get("sprint_speed", 0),
                 "temperature": weather.get("temperature", 70),
                 "wind_speed": weather.get("wind_speed", 0),
                 "wind_dir": weather.get("wind_dir_label", ""),
@@ -3871,10 +3890,12 @@ def compute_hits_score_for_player(
     implied: float,
     sp_tbd: bool,
     lineup_confirmed: bool,
+    pitch_matchup_score: float = 50.0,
 ) -> Tuple[float, float, str, Dict]:
     """
     Compute O0.5 score, probability, tier, and details for a single player.
     Returns (score, prob, tier, details_dict).
+    V1.6: Added pitch matchup score.
     Calibrated: avg batter vs avg pitcher = ~58, elite bat vs weak pitcher = 75+
     """
     # Inject wRC+ proxy from xSLG if not present (fixes default=100 issue)
@@ -3885,6 +3906,8 @@ def compute_hits_score_for_player(
 
     bat_score, _, bat_details = compute_batter_score_hits(enriched)
     pit_score, pit_label = compute_pitcher_score_hits(pitcher_statcast)
+    # V1.6: pitch matchup — for O0.5, K-inducing pitch vs batter whiff matters most
+    # Scale matchup contribution: neutral at 50, but weight is modest (4%)
     plat_score, plat_label = compute_platoon_score(batter_hand, sp_hand)
     lineup_sc, lineup_label = compute_lineup_score(lineup_slot)
     park_sc, _ = compute_park_score(park_team, True)
@@ -3893,18 +3916,19 @@ def compute_hits_score_for_player(
     tto_sc, _ = compute_tto_bonus(lineup_slot)
 
     # O0.5 weights: K% dominates, park matters less than O1.5
+    # V1.6: pitch matchup added at 4%, taken from platoon (contact matters more than platoon for O0.5)
     raw = (
-        bat_score  * 0.42 +
-        pit_score  * 0.32 +
-        plat_score * 0.05 +
-        lineup_sc  * 0.05 +
-        park_sc    * 0.04 +
-        weather_sc * 0.02 +
-        vegas_sc   * 0.05 +
-        tto_sc     * 0.05
+        bat_score           * 0.42 +
+        pit_score           * 0.30 +
+        pitch_matchup_score * 0.04 +  # V1.6: pitch type matchup
+        plat_score          * 0.04 +
+        lineup_sc           * 0.05 +
+        park_sc             * 0.04 +
+        weather_sc          * 0.02 +
+        vegas_sc            * 0.05 +
+        tto_sc              * 0.04
     )
-    # Calibration offset: avg batter (bat=40) vs avg pitcher (pit=45) raw ~= 43
-    # Target: avg matchup = ~58, Tiers start at 58/68/78
+    # Calibration offset
     score = max(0, min(100, round(raw + 15.0, 1)))
 
     if sp_tbd:
@@ -3984,6 +4008,7 @@ def display_hits_tab(plays: List[Dict]):
             implied=p.get("implied_total", 0),
             sp_tbd=p.get("sp_tbd", False),
             lineup_confirmed=p.get("lineup_confirmed", True),
+            pitch_matchup_score=p.get("sub_matchup", 50.0),  # V1.6
         )
 
         hits_plays.append({**p, "h_score": h_score, "h_prob": h_prob,
@@ -5273,20 +5298,35 @@ def compute_pp_projection(statcast: Dict, pitcher_statcast: Dict,
     if implied_total > 0:
         est_pa += (implied_total - 4.5) * 0.08
 
-    k_rate   = f("k_rate",        0.228)
-    bb_rate  = f("bb_rate",       0.082)
-    slg      = f("slg_proxy",     0.398)
-    iso      = f("iso_proxy",     0.165)
-    woba     = f("woba",          0.315)
-    hard_hit = f("hard_hit_rate", 0.370)
-    barrel   = f("barrel_rate",   0.070)
-    # Sprint speed proxy for SB (default avg runner ~0.05 SB/game)
-    # Will be refined when sprint speed data added; power hitters ~0.02, speedsters ~0.15
-    sb_rate  = max(0, min(0.20, (iso - 0.100) * -0.3 + 0.05))  # inverse of ISO = more speed
+    k_rate     = f("k_rate",        0.228)
+    bb_rate    = f("bb_rate",       0.082)
+    slg        = f("slg_proxy",     0.398)
+    iso        = f("iso_proxy",     0.165)
+    woba       = f("woba",          0.315)
+    hard_hit   = f("hard_hit_rate", 0.370)
+    barrel     = f("barrel_rate",   0.070)
+    ev50       = f("ev50",          95.0)    # V1.6: hardest 50% EV for power proj
+    bat_speed  = f("bat_speed",     71.0)    # V1.6: bat tracking
+    blast_rate = f("blast_rate",    0.21)    # V1.6: swing quality
+    sprint_spd = f("sprint_speed",  27.0)    # V1.6: Savant sprint speed (ft/sec)
+
+    # V1.6: Sprint speed-based SB rate (replaces ISO proxy — much more accurate)
+    # <24 ft/s = no threat (0.01/game), 27 = avg (0.05), 29+ = elite (0.12+)
+    if sprint_spd > 0 and sprint_spd < 10:
+        sprint_spd = sprint_spd * 3.28  # m/s to ft/s conversion if needed
+    sb_rate = max(0.01, min(0.18,
+        0.01 + max(0, sprint_spd - 24.0) * 0.017  # ~0.017/game per ft/s above 24
+    ))
+
+    # V1.6: EV50-adjusted HR rate — EV50 > 98 = elite HR ceiling
+    ev50_hr_boost = max(0, (ev50 - 95.0) / 100.0 * 0.03)  # up to +3% HR/PA for elite EV50
 
     hit_rate   = max(0.180, woba * 0.85)
-    hr_per_pa  = barrel * 0.35
-    xbh_per_pa = iso * 0.6 * (1 - k_rate)
+    # V1.6: EV50 boost on HR rate — elite EV50 = more deep fly balls = more HRs
+    hr_per_pa  = barrel * 0.35 + ev50_hr_boost
+    # V1.6: blast_rate adjusts XBH rate — better swing quality = more extra bases
+    blast_xbh_boost = max(0, (blast_rate - 0.21) * 0.15)  # up to ~3% at elite blast
+    xbh_per_pa = iso * 0.6 * (1 - k_rate) + blast_xbh_boost
     single_per_pa = max(0, hit_rate - hr_per_pa - xbh_per_pa)
     doubles_per_pa = xbh_per_pa * 0.65
     triples_per_pa = xbh_per_pa * 0.05
@@ -5304,12 +5344,15 @@ def compute_pp_projection(statcast: Dict, pitcher_statcast: Dict,
         elif we == "out":      hr_per_pa *= 1.15
         elif we == "in":       hr_per_pa *= 0.80
 
-    # Pitcher quality
+    # Pitcher quality — V1.6: blend in pitch matchup score as an additional multiplier
     pit_k   = float(pitcher_statcast.get("k_rate_allowed", 0.228))
     pit_fip = float(pitcher_statcast.get("fip", 4.10))
     quality_adj = 1.0 + (pit_fip - 4.0) * 0.04
     k_adj       = 1.0 - (pit_k - 0.228) * 1.5
-    adj = (quality_adj + k_adj) / 2
+    # pitch_matchup: 50=neutral(1.0), 70=favorable(1.04), 30=unfavorable(0.96)
+    matchup_sc = float(pitcher_statcast.get("_matchup_score", 50.0))
+    matchup_adj = 1.0 + (matchup_sc - 50.0) / 50.0 * 0.05  # ±5% on total output
+    adj = (quality_adj + k_adj) / 2 * matchup_adj
 
     # Scale to PA
     proj_hr      = hr_per_pa * est_pa * adj
@@ -5412,8 +5455,17 @@ def display_prizepicks_tab(plays: List[Dict]):
             "hard_hit_rate":   p.get("hard_hit_rate",    0.370),
             "barrel_rate":     p.get("barrel_rate",      0.070),
             "sweet_spot_rate": p.get("sweet_spot_rate",  0.305),
+            # V1.6: Savant bat tracking + EV50 + sprint speed
+            "ev50":            p.get("ev50",             95.0),
+            "bat_speed":       p.get("bat_speed",        71.0),
+            "blast_rate":      p.get("blast_rate",       0.21),
+            "sprint_speed":    p.get("sprint_speed",     27.0),
         }
-        pit_mock = {"k_rate_allowed": 0.228, "fip": 4.10}
+        pit_mock = {
+            "k_rate_allowed":   0.228,
+            "fip":              4.10,
+            "_matchup_score":   p.get("sub_matchup", 50.0),  # V1.6
+        }
         try:
             pl = p.get("pitcher_label", "")
             if "K%:" in pl:
