@@ -776,7 +776,20 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
 
     # ── Merge bat tracking (bat speed, blast rate, squared-up%) ─────────
     base_bat = bat_pri if not bat_pri.empty else bat_cur
-    base_bat = _normalize_savant(base_bat, "bat") if not base_bat.empty else base_bat
+    if not base_bat.empty:
+        base_bat = _normalize_savant(base_bat.copy(), "bat")
+        # Savant bat tracking may use different column names — alias them
+        _bat_col_aliases = {
+            "bat_speed_avg": "bat_speed",
+            "avg_bat_speed": "bat_speed",
+            "blast":         "blast_rate",
+            "blasts_per_swing": "blast_rate",
+            "squared_up":    "squared_up_rate",
+            "sq_up_percent": "squared_up_rate",
+        }
+        for _src, _tgt in _bat_col_aliases.items():
+            if _src in base_bat.columns and _tgt not in base_bat.columns:
+                base_bat[_tgt] = base_bat[_src]
     bat_cols = ["bat_speed", "blast_rate", "squared_up_rate",
                 "swing_length", "fast_swing_rate"]
     result = _merge_on_id(result, base_bat, bat_cols)
@@ -796,38 +809,53 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
                 pass
 
     # ── Merge pitch arsenal batter splits → per-pitch run value columns ───
-    # Build a single frame with mlbam_id + rv_vs_FF + rv_vs_SL + ... columns
     # Savant columns: run_value_per100, ba, slg, woba, whiff_percent (per pitch type)
     if _pitch_type_frames:
-        _arsenal_rows = {}  # keyed by mlbam_id
-        for _pt, _df in _pitch_type_frames.items():
-            _df = _normalize_savant(_df.copy(), f"arsenal_{_pt}")
-            if "mlbam_id" not in _df.columns:
-                continue
-            # Column names vary: run_value_per100, run_value, rv, etc.
-            _rv_col = next((c for c in _df.columns if "run_value" in c.lower()), None)
-            _woba_col = next((c for c in _df.columns if c.lower() in ("woba", "est_woba", "xwoba")), None)
-            _slg_col  = next((c for c in _df.columns if c.lower() == "slg"), None)
-            _whiff_col = next((c for c in _df.columns if "whiff" in c.lower()), None)
-            for _, _row in _df.iterrows():
-                _mid = str(_row.get("mlbam_id", "")).strip()
-                if not _mid:
+        try:
+            _arsenal_rows = {}  # keyed by mlbam_id
+            for _pt, _df in _pitch_type_frames.items():
+                if _df.empty:
                     continue
-                if _mid not in _arsenal_rows:
-                    _arsenal_rows[_mid] = {"mlbam_id": _mid}
-                if _rv_col and pd.notna(_row.get(_rv_col)):
-                    _arsenal_rows[_mid][f"rv_vs_{_pt}"]   = float(_row[_rv_col])
-                if _woba_col and pd.notna(_row.get(_woba_col)):
-                    _arsenal_rows[_mid][f"woba_vs_{_pt}"] = float(_row[_woba_col])
-                if _slg_col and pd.notna(_row.get(_slg_col)):
-                    _arsenal_rows[_mid][f"slg_vs_{_pt}"]  = float(_row[_slg_col])
-                if _whiff_col and pd.notna(_row.get(_whiff_col)):
-                    _w = float(_row[_whiff_col])
-                    _arsenal_rows[_mid][f"whiff_vs_{_pt}"] = _w / 100.0 if _w > 1.5 else _w
-        if _arsenal_rows:
-            _arsenal_df = pd.DataFrame(list(_arsenal_rows.values()))
-            _arsenal_cols = [c for c in _arsenal_df.columns if c != "mlbam_id"]
-            result = _merge_on_id(result, _arsenal_df, _arsenal_cols)
+                _df = _normalize_savant(_df.copy(), f"arsenal_{_pt}")
+                if "mlbam_id" not in _df.columns:
+                    continue
+                # Column names vary across Savant API versions
+                # run_value_per100 is the primary — also check rv, run_value
+                _rv_col = next((c for c in _df.columns
+                                if "run_value" in c.lower() or c.lower() in ("rv",)), None)
+                _woba_col = next((c for c in _df.columns
+                                  if c.lower() in ("woba", "est_woba", "xwoba", "xwoba_by_ls")), None)
+                _slg_col  = next((c for c in _df.columns
+                                  if c.lower() in ("slg", "xslg")), None)
+                _whiff_col = next((c for c in _df.columns
+                                   if "whiff" in c.lower()), None)
+                for _, _row in _df.iterrows():
+                    try:
+                        _mid = str(_row.get("mlbam_id", "")).strip()
+                        if not _mid or _mid in ("", "nan"):
+                            continue
+                        if _mid not in _arsenal_rows:
+                            _arsenal_rows[_mid] = {"mlbam_id": _mid}
+                        if _rv_col and pd.notna(_row.get(_rv_col)):
+                            _arsenal_rows[_mid][f"rv_vs_{_pt}"] = float(_row[_rv_col])
+                        if _woba_col and pd.notna(_row.get(_woba_col)):
+                            _w = float(_row[_woba_col])
+                            # Some Savant versions return wOBA as 0-1, others 0-1000
+                            _arsenal_rows[_mid][f"woba_vs_{_pt}"] = _w / 1000 if _w > 10 else _w
+                        if _slg_col and pd.notna(_row.get(_slg_col)):
+                            _arsenal_rows[_mid][f"slg_vs_{_pt}"] = float(_row[_slg_col])
+                        if _whiff_col and pd.notna(_row.get(_whiff_col)):
+                            _wh = float(_row[_whiff_col])
+                            _arsenal_rows[_mid][f"whiff_vs_{_pt}"] = _wh / 100.0 if _wh > 1.5 else _wh
+                    except Exception:
+                        continue
+            if _arsenal_rows:
+                _arsenal_df = pd.DataFrame(list(_arsenal_rows.values()))
+                _arsenal_cols = [c for c in _arsenal_df.columns if c != "mlbam_id"]
+                if _arsenal_cols and "mlbam_id" in result.columns:
+                    result = _merge_on_id(result, _arsenal_df, _arsenal_cols)
+        except Exception as _ae:
+            st.session_state["_batter_arsenal_err"] = str(_ae)[:120]
 
     # ── Try FanGraphs as bonus layer (wRC+, ISO refinement) ───────────────
     try:
@@ -1079,36 +1107,47 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                 pass
 
     # ── Merge pitcher arsenal mix (pitch type usage %) ────────────────────
-    # Savant columns: n_FF, n_SL, n_CH, n_CU, n_SI, n_FC (usage % for each pitch type)
-    # We'll store as pct_FF, pct_SL etc. for clear naming
+    # Savant columns: n_FF, n_SL, n_CH, n_CU, n_SI, n_FC, n_ST, etc.
+    # Stored as pct_FF, pct_SL etc. for downstream get_pitcher_stats()
     base_arsenal = arsenal_mix_cur if not arsenal_mix_cur.empty else arsenal_mix_pri
     if not base_arsenal.empty:
-        # Normalize player_id
-        for pid_col in ("player_id", "IDfg", "mlbam_id"):
+        base_arsenal = base_arsenal.copy()
+        # Expand ID column search — Savant uses player_id; also check alternatives
+        _arsenal_id_found = False
+        for pid_col in ("player_id", "pitcher", "mlb_id", "IDfg", "mlbam_id", "MLBAM"):
             if pid_col in base_arsenal.columns:
-                base_arsenal = base_arsenal.copy()
                 base_arsenal["mlbam_id"] = base_arsenal[pid_col].apply(
                     lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("","nan") else ""
                 )
+                _arsenal_id_found = True
                 break
-        # Find pitch % columns (named n_FF, n_SL, etc. in Savant)
+        # Find pitch % columns: n_FF, n_SI, n_SL, n_CH, n_CU, n_FC, n_ST, n_SV etc.
+        # Savant names them n_XX where XX is 2-3 char pitch code
         _pit_mix_cols = [c for c in base_arsenal.columns
-                         if c.startswith("n_") and len(c) <= 6]
-        # Rename n_XX -> pct_XX for cleaner downstream access
+                         if c.startswith("n_") and 2 <= len(c) <= 7
+                         and c[2:].isalpha()]
         _rename_mix = {c: f"pct_{c[2:]}" for c in _pit_mix_cols}
         base_arsenal = base_arsenal.rename(columns=_rename_mix)
         _pct_cols = list(_rename_mix.values())
-        if "mlbam_id" in result.columns and _pct_cols:
-            sub = base_arsenal[["mlbam_id"] + _pct_cols].drop_duplicates("mlbam_id")
-            # Normalize to decimals if stored as 0-100
-            for _pc in _pct_cols:
-                try:
-                    _v = pd.to_numeric(sub[_pc], errors="coerce").dropna()
-                    if len(_v) > 0 and float(_v.max()) > 1.5:
-                        sub[_pc] = pd.to_numeric(sub[_pc], errors="coerce") / 100.0
-                except Exception:
-                    pass
-            result = result.merge(sub, on="mlbam_id", how="left")
+        # GUARD: only proceed if mlbam_id exists in BOTH frames and we have pct cols
+        if (_arsenal_id_found
+                and "mlbam_id" in base_arsenal.columns
+                and "mlbam_id" in result.columns
+                and _pct_cols):
+            try:
+                sub = base_arsenal[["mlbam_id"] + _pct_cols].drop_duplicates("mlbam_id")
+                # Normalize to decimals if stored as 0-100
+                for _pc in _pct_cols:
+                    try:
+                        _v = pd.to_numeric(sub[_pc], errors="coerce").dropna()
+                        if len(_v) > 0 and float(_v.max()) > 1.5:
+                            sub[_pc] = pd.to_numeric(sub[_pc], errors="coerce") / 100.0
+                    except Exception:
+                        pass
+                result = result.merge(sub, on="mlbam_id", how="left")
+            except Exception as _e:
+                # Never crash the whole model on arsenal merge failure
+                st.session_state["_arsenal_merge_err"] = str(_e)[:120]
 
     # ── FanGraphs bonus layer (FIP, xFIP if accessible) ───────────────────
     try:
@@ -6511,6 +6550,14 @@ Free tier (500/mo) is more than enough.
                 st.error("**FanGraphs batting fetch errors:**\n" + "\n".join(fg_bat_errs))
             if fg_pit_errs:
                 st.error("**FanGraphs pitching fetch errors:**\n" + "\n".join(fg_pit_errs))
+
+            # Arsenal merge error surfacing
+            _am_err = st.session_state.get("_arsenal_merge_err")
+            _ba_err = st.session_state.get("_batter_arsenal_err")
+            if _am_err:
+                st.error(f"⚠️ Pitcher arsenal merge error (non-fatal): {_am_err}")
+            if _ba_err:
+                st.error(f"⚠️ Batter arsenal merge error (non-fatal): {_ba_err}")
 
             # Disk cache status
             import os as _os, time as _time
