@@ -1222,9 +1222,7 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     mlb_pit_pri = _fetch_mlb_pitching(season)
 
     if _errs:
-        st.session_state["_fg_pitching_errors"] = _errs
-
-    got_savant = not sc_pit_cur.empty or not sc_pit_pri.empty
+        got_savant = not sc_pit_cur.empty or not sc_pit_pri.empty
     got_mlb    = not mlb_pit_cur.empty or not mlb_pit_pri.empty
 
     if not got_savant and not got_mlb:
@@ -1365,54 +1363,90 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     }
     _fg_pit_url = "https://www.fangraphs.com/api/leaders/major-league/data"
 
-    # Try type=8 (advanced: FIP, xFIP, K%, BB%, WHIP) for current AND prior season
+    def _normalize_fg_pit(df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize FanGraphs pitching df: strip HTML, set mlbam_id from any ID column."""
+        df = clean_fangraphs_df(df)
+        # FG pitching may use xMLBAMID, MLBAMID, IDfg, or playerid
+        for _c in ("xMLBAMID", "MLBAMID", "IDfg", "playerid", "PlayerID"):
+            if _c in df.columns:
+                df["_fg_mlbam"] = df[_c].apply(
+                    lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("","nan") else ""
+                )
+                break
+        else:
+            # Last resort: try _fg_id extracted from HTML playerid by clean_fangraphs_df
+            if "_fg_id" in df.columns:
+                df["_fg_mlbam"] = df["_fg_id"].astype(str)
+        return df
+
+    def _fg_merge(base: pd.DataFrame, fg: pd.DataFrame, cols: list, label: str) -> pd.DataFrame:
+        """Merge FG pitching data into result on mlbam_id/xMLBAMID. Logs result."""
+        if fg.empty:
+            _errs.append(f"{label}: empty df")
+            return base
+        if "_fg_mlbam" not in fg.columns:
+            _errs.append(f"{label}: no ID column found in {list(fg.columns[:8])}")
+            return base
+        avail = [c for c in cols if c in fg.columns and c not in base.columns]
+        if not avail:
+            _errs.append(f"{label}: no new cols (wanted {cols[:4]}, fg has {list(fg.columns[:8])})")
+            return base
+        sub = fg[["_fg_mlbam"] + avail].drop_duplicates("_fg_mlbam")
+        sub = sub.rename(columns={"_fg_mlbam": "mlbam_id"})
+        if "mlbam_id" not in base.columns:
+            _errs.append(f"{label}: base has no mlbam_id")
+            return base
+        try:
+            merged = base.merge(sub, on="mlbam_id", how="left")
+            hit = merged[avail[0]].notna().sum()
+            _errs.append(f"{label}: OK merged {hit}/{len(base)} pitchers, cols={avail}")
+            return merged
+        except Exception as _me:
+            _errs.append(f"{label}: merge error {str(_me)[:60]}")
+            return base
+
+    # Type=8: FIP, xFIP, K%, BB%, WHIP, SIERA
     for _yr in [season + 1, season]:
         try:
             _r8 = requests.get(_fg_pit_url, params={
                 "pos": "all", "stats": "pit", "lg": "all", "qual": "0",
                 "type": "8", "season": _yr, "season1": _yr, "ind": "0",
                 "team": "0", "pageitems": "1000", "pagenum": "1", "minip": "0",
-            }, headers=_fg_pit_headers, timeout=10)
+            }, headers=_fg_pit_headers, timeout=12)
             if _r8.status_code == 200 and _r8.json().get("data"):
-                _fg8 = clean_fangraphs_df(pd.DataFrame(_r8.json()["data"]))
-                for _id in ("xMLBAMID", "MLBAMID"):
-                    if _id in _fg8.columns and "xMLBAMID" in result.columns:
-                        _adv = [c for c in ["FIP","xFIP","SIERA","K%","BB%","WHIP","ERA"]
-                                if c in _fg8.columns and c not in result.columns]
-                        if _adv:
-                            _sub = _fg8[[_id]+_adv].rename(columns={_id:"xMLBAMID"})
-                            try: result = result.merge(_sub, on="xMLBAMID", how="left")
-                            except Exception: pass
-                        break
-                if any(c in result.columns for c in ["FIP","xFIP"]):
-                    break  # got what we needed
+                _fg8 = _normalize_fg_pit(pd.DataFrame(_r8.json()["data"]))
+                result = _fg_merge(result, _fg8,
+                    ["FIP","xFIP","SIERA","SwStr%","O-Swing%"],
+                    f"FG pit type=8 {_yr}")
+            else:
+                _errs.append(f"FG pit type=8 {_yr}: HTTP {_r8.status_code}")
         except Exception as _e:
-            _errs.append(f"FG pit type=8 {_yr}: {str(_e)[:50]}")
+            _errs.append(f"FG pit type=8 {_yr}: {str(_e)[:60]}")
+        if any(c in result.columns for c in ["FIP","xFIP"]):
+            break
 
-    # Try type=24 (Statcast: Barrel% allowed, HH% allowed, EV allowed)
+    # Type=24: Barrel% allowed, HH% allowed, EV allowed (Statcast)
     for _yr in [season + 1, season]:
         try:
             _r24 = requests.get(_fg_pit_url, params={
                 "pos": "all", "stats": "pit", "lg": "all", "qual": "0",
                 "type": "24", "season": _yr, "season1": _yr, "ind": "0",
                 "team": "0", "pageitems": "1000", "pagenum": "1", "minip": "0",
-            }, headers=_fg_pit_headers, timeout=10)
+            }, headers=_fg_pit_headers, timeout=12)
             if _r24.status_code == 200 and _r24.json().get("data"):
-                _fg24 = clean_fangraphs_df(pd.DataFrame(_r24.json()["data"]))
-                for _id in ("xMLBAMID", "MLBAMID"):
-                    if _id in _fg24.columns and "xMLBAMID" in result.columns:
-                        _sc_cols = [c for c in _fg24.columns
-                                    if any(k in c.lower() for k in ("barrel","hard","ev","exit"))
-                                    and c not in result.columns]
-                        if _sc_cols:
-                            _sub24 = _fg24[[_id]+_sc_cols].rename(columns={_id:"xMLBAMID"})
-                            try: result = result.merge(_sub24, on="xMLBAMID", how="left")
-                            except Exception: pass
-                        break
-                if any(c in result.columns for c in ["Barrel%","Hard%","HardHit%"]):
-                    break  # got Statcast data
+                _fg24 = _normalize_fg_pit(pd.DataFrame(_r24.json()["data"]))
+                _sc_want = [c for c in _fg24.columns
+                            if any(k in c.lower() for k in ("barrel","hard","ev","exit","xera"))]
+                result = _fg_merge(result, _fg24, _sc_want, f"FG pit type=24 {_yr}")
+            else:
+                _errs.append(f"FG pit type=24 {_yr}: HTTP {_r24.status_code}")
         except Exception as _e:
-            _errs.append(f"FG pit type=24 {_yr}: {str(_e)[:50]}")
+            _errs.append(f"FG pit type=24 {_yr}: {str(_e)[:60]}")
+        if any(c in result.columns for c in ["Barrel%","Hard%","HardHit%"]):
+            break
+
+    # Store ALL errors including FG block errors (must be after FG block runs)
+    st.session_state["_fg_pitching_errors"] = _errs
 
     src_parts = []
     if got_mlb:    src_parts.append("mlbapi")
