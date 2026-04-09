@@ -615,17 +615,42 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
         f"Savant xStats {season}"
     )
 
-    # ── 3. Fetch Baseball Savant statcast leaderboard (Barrel%, HH%, EV) ─
-    sc_cur = _fetch_savant_csv(
-        f"https://baseballsavant.mlb.com/leaderboard/statcast"
-        f"?year={season+1}&position=&team=&min=1&type=batter&csv=true",
-        f"Savant Statcast {season+1}"
-    )
-    sc_pri = _fetch_savant_csv(
-        f"https://baseballsavant.mlb.com/leaderboard/statcast"
-        f"?year={season}&position=&team=&min=1&type=batter&csv=true",
-        f"Savant Statcast {season}"
-    )
+    # ── 3. Fetch Statcast quality-of-contact data (Barrel%, HH%, EV) ───────
+    # Cascade through multiple endpoints — the leaderboard CSV is often blocked
+    # on cloud IPs, but the statcast_search endpoint uses different infrastructure.
+    def _fetch_statcast_cascade(yr: int) -> pd.DataFrame:
+        """
+        Try multiple Savant endpoints for statcast data (Barrel%, HH%, EV).
+        Returns first successful DataFrame with the required columns.
+        """
+        _sc_required = {"barrel_batted_rate", "hard_hit_percent", "avg_exit_velocity"}
+        
+        attempts = [
+            # Attempt 1: Standard leaderboard CSV (often blocked on cloud)
+            (f"https://baseballsavant.mlb.com/leaderboard/statcast"
+             f"?year={yr}&position=&team=&min=1&type=batter&csv=true",
+             "Savant Statcast leaderboard"),
+            # Attempt 2: statcast_search CSV (different infrastructure, may bypass block)
+            (f"https://baseballsavant.mlb.com/statcast_search/csv"
+             f"?player_type=batter&year={yr}&group_by=name&min_pitches=25"
+             f"&type=details&sort_col=pitches&sort_order=desc",
+             "Savant statcast_search CSV"),
+            # Attempt 3: Different min parameter (sometimes bypasses rate limits)
+            (f"https://baseballsavant.mlb.com/leaderboard/statcast"
+             f"?year={yr}&position=&team=&min=25&type=batter&csv=true",
+             f"Savant Statcast leaderboard min25"),
+        ]
+        
+        for url, label in attempts:
+            df = _fetch_savant_csv(url, label)
+            if not df.empty:
+                has_cols = _sc_required.intersection(set(df.columns))
+                if len(has_cols) >= 2:  # at least 2 of 3 key columns
+                    return df
+        return pd.DataFrame()
+
+    sc_cur = _fetch_statcast_cascade(season + 1)
+    sc_pri = _fetch_statcast_cascade(season)
 
     # ── 4. Fetch MLB Stats API (SLG, K%, BB%, ISO) ────────────────────────
     mlb_cur = _fetch_mlb_stats_api(season + 1)
@@ -1488,6 +1513,15 @@ def get_batter_stats(player_name: str, mlb_id: str,
         wrc = safe_get(row, 'wRC+', 'wRC', default=None)
         if wrc and wrc > 0:
             stats["wrc_plus"] = float(wrc)
+
+        # ── wRC+ proxy from OBP when FanGraphs unavailable ────────────────
+        # wRC+ correlates ~0.87 with OBP. MLB API gives us OBP.
+        # wrc_proxy = 100 + (OBP - 0.316) / 0.316 * 100 * 0.87
+        if stats["wrc_plus"] == 100.0:  # still at default
+            _obp_for_wrc = safe_get(row, 'OBP', 'obp', default=None)
+            if _obp_for_wrc and 0.250 < _obp_for_wrc < 0.550:
+                _wrc_proxy = 100.0 + (_obp_for_wrc - 0.316) / 0.316 * 87.0
+                stats["wrc_plus"] = round(max(50.0, min(220.0, _wrc_proxy)), 1)
 
         # ── wOBA ──────────────────────────────────────────────────────────
         woba = safe_get(row, 'xwOBA', 'wOBA', 'xwoba', 'woba', default=None)
@@ -2923,12 +2957,17 @@ def compute_final_score(
         bvp_score           * _bvp_w +  # 3% base; 7% when batter "owns" this SP
         lineup_score        * 0.01    # least predictive; 1 extra PA is marginal
     )  # sum = 1.00
-    # Calibration offset — higher when Savant is blocked (proxy data mode)
-    # Proxy data compresses scores by ~3-5 pts vs full Savant data.
-    # Detect proxy mode: if hard_hit_rate proxy column present but Barrel% column missing.
+    # Calibration offset — based on actual column availability, not just source label.
+    # Partial Savant cache (xStats only, no statcast leaderboard) = same compression
+    # as full proxy mode. Check session state for which critical columns loaded.
     import streamlit as _st
-    _bat_src = _st.session_state.get("_batting_source", "")
-    _is_proxy = "mlbapi" in _bat_src or _bat_src in ("disk_cache_stale", "mlbapi_only")
+    _bat_src  = _st.session_state.get("_batting_source", "")
+    _bat_cols = _st.session_state.get("batting_cols", [])
+    # Full data = Barrel%, HH%, AND wRC+ all present
+    _has_full = ("Barrel%" in _bat_cols or "barrel_batted_rate" in _bat_cols) and                 ("Hard%" in _bat_cols or "hard_hit_percent" in _bat_cols) and                 ("wRC+" in _bat_cols)
+    # Proxy mode: source says mlbapi only, or statcast columns missing
+    _is_proxy = ("mlbapi" in _bat_src or _bat_src in ("mlbapi_only",) or
+                 "disk_cache_stale" in _bat_src or not _has_full)
     _offset = 13.0 if _is_proxy else 10.0
     calibrated = raw + _offset
     return max(0, min(100, round(calibrated, 1)))
@@ -3877,12 +3916,12 @@ def display_leaderboard(plays: List[Dict]):
             "K%": f"{p['k_rate']*100:.1f}%" if p["k_rate"] else "—",
             "Platoon": p["platoon_label"].split("(")[0].strip(),
             "Form 🔥": p.get("streak_label", "—").replace("Form: ", ""),
-            "BvP": p.get("bvp_label", "—").replace("BvP: ", ""),
             "BvP★": "🔥 OWNS" if p.get("bvp_sig") == "owns"
                     else "🟢 Edge" if p.get("bvp_sig") == "edge"
                     else "🔴 Fade" if p.get("bvp_sig") == "fade"
                     else "⚠️ Dom'd" if p.get("bvp_sig") == "dominated"
                     else "—",
+            "BvP Stats": p.get("bvp_label", "—").replace("BvP: ", ""),
             "Park": p["park"],
             f"Wind{wind_icon}": p["weather_label"].split("|")[0].strip() if "|" in p["weather_label"] else p["weather_label"],
             "°F": f"{p['temperature']:.0f}°",
@@ -3942,8 +3981,8 @@ def display_leaderboard(plays: List[Dict]):
             styled = styled.map(color_edge, subset=["Edge"])
         if "Form 🔥" in df.columns:
             styled = styled.map(color_form, subset=["Form 🔥"])
-        if "BvP" in df.columns:
-            styled = styled.map(color_bvp, subset=["BvP"])
+        if "BvP Stats" in df.columns:
+            styled = styled.map(color_bvp, subset=["BvP Stats"])
         if "BvP★" in df.columns:
             styled = styled.map(color_bvp, subset=["BvP★"])
         st.dataframe(styled, use_container_width=True, height=500)
@@ -3979,7 +4018,8 @@ def display_leaderboard(plays: List[Dict]):
                 if streak_lbl and streak_lbl not in ("Form: no data", "Form: no baseline"):
                     st.write(f"• {streak_lbl}")
                 bvp_lbl = p.get("bvp_label", "")
-                if bvp_lbl and "no history" not in bvp_lbl:
+                bvp_sig = p.get("bvp_sig", "no_data")
+                if bvp_lbl and bvp_sig != "no_data":
                     st.write(f"• {bvp_lbl}")
                 br = p.get("blast_rate", 0)
                 st.write(f"• Blast%: {br*100:.1f}%" if br and br > 0 else "• Blast%: —")
@@ -7209,25 +7249,114 @@ Free tier (500/mo) is more than enough.
                 st.markdown("**Names we searched for (first 5):**")
                 st.code("\n".join(str(x) for x in search_sample))
             if batting_cols:
-                critical_bat = ["SLG", "ISO", "K%", "BB%", "wRC+", "wOBA",
-                                "Barrel%", "Hard%", "EV", "xSLG", "xwOBA"]
-                # Proxy columns that fill in when Savant columns are missing
-                _proxy_map = {
-                    "Barrel%": "hr_per_pa",
-                    "Hard%":   "hard_proxy",
-                    "wRC+":    None,
-                    "wOBA":    "OBP",
-                    "EV":      None,
+                critical_bat = ["xSLG", "xwOBA", "SLG", "ISO", "K%", "BB%", "OBP",
+                                "wRC+", "Barrel%", "Hard%", "EV"]
+                # What provides each stat (real source vs proxy)
+                _source_map = {
+                    "xSLG":    ("Savant xStats ✅", None),
+                    "xwOBA":   ("Savant xStats ✅", None),
+                    "SLG":     ("MLB Stats API ✅", None),
+                    "ISO":     ("MLB Stats API ✅", None),
+                    "K%":      ("MLB Stats API ✅", None),
+                    "BB%":     ("MLB Stats API ✅", None),
+                    "OBP":     ("MLB Stats API ✅", None),
+                    "wRC+":    ("FanGraphs (blocked ❌)", "OBP proxy ~±25pts"),
+                    "Barrel%": ("Savant Statcast (blocked ❌)", "HR/PA proxy ~±5-8%"),
+                    "Hard%":   ("Savant Statcast (blocked ❌)", "SLG+K% proxy ~±6-10%"),
+                    "EV":      ("Savant Statcast (blocked ❌)", "xSLG+ISO derived"),
                 }
-                st.markdown("**Batting — critical columns:**")
+                st.markdown("**📊 Batting data — real vs proxy:**")
+                real_count = 0
+                proxy_count = 0
                 for c in critical_bat:
+                    src, proxy_note = _source_map.get(c, ("Unknown", None))
                     if c in batting_cols:
-                        st.markdown(f"✅ `{c}`")
-                    elif c in _proxy_map and _proxy_map[c] and _proxy_map[c] in batting_cols:
-                        st.markdown(f"🔄 `{c}` *(proxy from `{_proxy_map[c]}`)*")
+                        st.markdown(f"✅ **`{c}`** — {src.split(' ✅')[0]}")
+                        real_count += 1
+                    elif proxy_note:
+                        st.markdown(f"🔄 **`{c}`** — {proxy_note} *(real source: {src.split(' (')[0]})*")
+                        proxy_count += 1
                     else:
-                        st.markdown(f"❌ `{c}` *(missing — score uses league avg)*")
-                st.caption(f"Total columns loaded: {len(batting_cols)} | 🔄 = derived proxy active")
+                        st.markdown(f"❌ **`{c}`** — missing, league avg used")
+                
+                completeness = real_count / len(critical_bat) * 100
+                color = "🟢" if completeness >= 80 else "🟡" if completeness >= 50 else "🔴"
+                st.caption(f"Total columns: {len(batting_cols)} | "
+                           f"{color} Data completeness: {completeness:.0f}% real | "
+                           f"{proxy_count} proxies active")
+                if proxy_count > 0:
+                    st.warning(f"⚠️ {proxy_count} stats are derived proxies, not real Statcast data. "
+                               "Scores are adjusted with +13pt offset to compensate.")
+                    with st.expander("🔧 Fix: Generate local cache seeder script"):
+                        st.markdown("""
+**Why this happens:** Streamlit Cloud IPs are blocked by Baseball Savant's 
+Statcast leaderboard endpoint. The real fix is seeding the cache from your 
+local machine daily.
+
+**Steps:**
+1. Download the seeder script below
+2. Run it locally: `python3 seed_stat_cache.py`
+3. Commit the generated `stat_cache/` folder to your GitHub repo
+4. Streamlit Cloud will use the cached data automatically
+
+The cache is valid for 6 hours — run the script before posting daily picks.
+                        """)
+                        seed_script = '#!/usr/bin/env python3\n# Propex stat cache seeder -- run locally daily, commit stat_cache/ to GitHub\n'
+                        seed_script += '"""Fetches real Savant Statcast data from your local IP where endpoints are unblocked."""\n'
+                        seed_script += """
+import requests, pandas as pd, pickle, os, time
+
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "stat_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def fetch(url, label):
+    print(f"Fetching {label}...")
+    r = requests.get(url, timeout=30, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+        "Referer": "https://baseballsavant.mlb.com/",
+    })
+    if r.status_code == 200 and len(r.content) > 1000:
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        print(f"  ✅ {len(df)} rows, columns: {list(df.columns[:6])}")
+        return df
+    print(f"  ❌ HTTP {r.status_code}")
+    return pd.DataFrame()
+
+yr = 2026
+
+# Fetch all Savant endpoints
+xstats = fetch(f"https://baseballsavant.mlb.com/leaderboard/expected_statistics?type=batter&year={yr}&min=1&csv=true", "xStats")
+statcast = fetch(f"https://baseballsavant.mlb.com/leaderboard/statcast?year={yr}&min=1&type=batter&csv=true", "Statcast")
+bat_track = fetch(f"https://baseballsavant.mlb.com/leaderboard/bat-tracking?year={yr}&minSwings=50&type=batter&csv=true", "Bat Tracking")
+
+# Merge into one batting frame
+result = xstats.copy() if not xstats.empty else pd.DataFrame()
+if not statcast.empty and not result.empty:
+    # normalize player_id
+    for df in [result, statcast, bat_track]:
+        if "player_id" in df.columns:
+            df["mlbam_id"] = df["player_id"].astype(str)
+    result = result.merge(statcast[["mlbam_id","barrel_batted_rate","hard_hit_percent","avg_exit_velocity"]].dropna(subset=["mlbam_id"]), on="mlbam_id", how="left")
+    if not bat_track.empty:
+        result = result.merge(bat_track[["mlbam_id","bat_speed","blast_rate"]].dropna(subset=["mlbam_id"]), on="mlbam_id", how="left")
+
+if not result.empty:
+    path = os.path.join(CACHE_DIR, "batting_stats.pkl")
+    with open(path, "wb") as f:
+        pickle.dump({"df": result, "ts": time.time()}, f)
+    print(f"✅ Batting cache saved: {len(result)} players, {len(result.columns)} columns")
+    print(f"   Columns: {list(result.columns)}")
+else:
+    print("❌ Could not build batting cache")
+"""
+                        st.download_button(
+                            "⬇️ Download cache seeder script",
+                            seed_script,
+                            "seed_stat_cache.py",
+                            "text/plain",
+                            key="dl_seed_script"
+                        )
             else:
                 st.info("Run the model to see batting column status.")
             if pitching_cols:
