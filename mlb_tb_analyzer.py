@@ -746,12 +746,21 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
                 _fg_rows = _fg_r.json().get("data", [])
                 if _fg_rows:
                     _fg_df = pd.DataFrame(_fg_rows)
-                    # FanGraphs Statcast type=24 has Barrel%, HardHit%, AvgEV
-                    _fg_sc_cols = {c for c in _fg_df.columns
-                                   if any(k in c.lower() for k in ("barrel","hardhit","hard%","ev","exit"))}
-                    if len(_fg_sc_cols) >= 1:
-                        _errs.append(f"FanGraphs Statcast {yr}: OK {len(_fg_df)} players")
-                        return _fg_df
+                    # FanGraphs uses xMLBAMID — normalize to mlbam_id before returning
+                    for _id_col in ("xMLBAMID", "MLBAMID", "player_id", "IDfg"):
+                        if _id_col in _fg_df.columns:
+                            _fg_df["mlbam_id"] = _fg_df[_id_col].apply(
+                                lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("","nan") else ""
+                            )
+                            break
+                    if "mlbam_id" not in _fg_df.columns:
+                        _errs.append(f"FanGraphs Statcast {yr}: no ID column found, skipping")
+                    else:
+                        _fg_sc_cols = {c for c in _fg_df.columns
+                                       if any(k in c.lower() for k in ("barrel","hardhit","hard%","ev","exit"))}
+                        if len(_fg_sc_cols) >= 1:
+                            _errs.append(f"FanGraphs Statcast {yr}: OK {len(_fg_df)} players")
+                            return _fg_df
         except Exception as _e:
             _errs.append(f"FanGraphs Statcast {yr}: {str(_e)[:60]}")
 
@@ -818,11 +827,12 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
         if df.empty:
             return df
         df = df.copy()
-        # Savant uses "player_id" or "IDfg" as the MLBAM key
-        for pid_col in ("player_id", "IDfg", "mlbam_id"):
+        # Normalize any known ID column to mlbam_id
+        for pid_col in ("player_id", "IDfg", "mlbam_id", "xMLBAMID", "MLBAMID",
+                        "mlb_id", "MLBAM", "pitcher", "batter_id"):
             if pid_col in df.columns:
                 df["mlbam_id"] = df[pid_col].apply(
-                    lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("", "nan") else ""
+                    lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("", "nan", "None") else ""
                 )
                 break
         # Normalize name to _name
@@ -850,8 +860,9 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     base_sc     = sc_pri     if not sc_pri.empty     else sc_cur
     base_mlb    = mlb_pri    if not mlb_pri.empty    else mlb_cur
 
-    # Pick whichever base has the most players
-    bases = [(len(f), f) for f in [base_xstats, base_sc, base_mlb] if not f.empty]
+    # Pick whichever base has the most players AND has mlbam_id (required for all merges)
+    bases = [(len(f), f) for f in [base_xstats, base_sc, base_mlb]
+             if not f.empty and "mlbam_id" in f.columns]
     if not bases:
         stale = _load_disk_cache("batting_stats", max_age_hours=168)
         if stale is not None:
@@ -865,17 +876,22 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     # ── Merge remaining frames on mlbam_id ────────────────────────────────
     def _merge_on_id(base: pd.DataFrame, other: pd.DataFrame,
                      keep_cols: list, suffix: str = "") -> pd.DataFrame:
+        # Guard both frames — crash if either is missing mlbam_id
         if other.empty or "mlbam_id" not in other.columns:
             return base
+        if "mlbam_id" not in base.columns:
+            return base  # can't merge without join key on left side
         cols = [c for c in keep_cols if c in other.columns and
                 (c not in base.columns or suffix)]
         if not cols:
             return base
-        rename = {c: f"{c}{suffix}" for c in cols} if suffix else {}
-        sub = other[["mlbam_id"] + cols].rename(columns=rename)
-        # Avoid duplicate mlbam_id in sub
-        sub = sub.drop_duplicates(subset=["mlbam_id"])
-        return base.merge(sub, on="mlbam_id", how="left")
+        try:
+            rename = {c: f"{c}{suffix}" for c in cols} if suffix else {}
+            sub = other[["mlbam_id"] + cols].rename(columns=rename)
+            sub = sub.drop_duplicates(subset=["mlbam_id"])
+            return base.merge(sub, on="mlbam_id", how="left")
+        except Exception:
+            return base  # never crash the whole model on a merge failure
 
     xstats_cols = ["est_slg", "xslg", "est_woba", "xwoba", "est_ba",
                    "xba", "est_slg_minus_slg_diff", "xSLG", "xwOBA"]
