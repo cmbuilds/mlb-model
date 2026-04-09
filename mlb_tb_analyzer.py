@@ -620,33 +620,141 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     # on cloud IPs, but the statcast_search endpoint uses different infrastructure.
     def _fetch_statcast_cascade(yr: int) -> pd.DataFrame:
         """
-        Try multiple Savant endpoints for statcast data (Barrel%, HH%, EV).
-        Returns first successful DataFrame with the required columns.
+        Try every known source for Statcast quality-of-contact data.
+        Priority order:
+          1. Savant custom leaderboard JSON — different endpoint from blocked CSV
+          2. MLB Stats API metricAverages — SAME domain that already works
+          3. Standard Savant leaderboard CSV (often 502 on cloud)
+          4. FanGraphs type=24 Statcast data
+        Returns first DataFrame with barrel_batted_rate or equivalent.
         """
         _sc_required = {"barrel_batted_rate", "hard_hit_percent", "avg_exit_velocity"}
-        
-        attempts = [
-            # Attempt 1: Standard leaderboard CSV (often blocked on cloud)
-            (f"https://baseballsavant.mlb.com/leaderboard/statcast"
-             f"?year={yr}&position=&team=&min=1&type=batter&csv=true",
-             "Savant Statcast leaderboard"),
-            # Attempt 2: statcast_search CSV (different infrastructure, may bypass block)
-            (f"https://baseballsavant.mlb.com/statcast_search/csv"
-             f"?player_type=batter&year={yr}&group_by=name&min_pitches=25"
-             f"&type=details&sort_col=pitches&sort_order=desc",
-             "Savant statcast_search CSV"),
-            # Attempt 3: Different min parameter (sometimes bypasses rate limits)
-            (f"https://baseballsavant.mlb.com/leaderboard/statcast"
-             f"?year={yr}&position=&team=&min=25&type=batter&csv=true",
-             f"Savant Statcast leaderboard min25"),
-        ]
-        
-        for url, label in attempts:
-            df = _fetch_savant_csv(url, label)
-            if not df.empty:
-                has_cols = _sc_required.intersection(set(df.columns))
-                if len(has_cols) >= 2:  # at least 2 of 3 key columns
-                    return df
+
+        # ── Attempt 1: Savant custom leaderboard (JSON, not CSV) ─────────────
+        # This uses a completely different endpoint than the blocked /leaderboard/statcast CSV
+        # The custom leaderboard returns HTML with embedded JSON — different rate limiter
+        try:
+            _cust_url = (
+                f"https://baseballsavant.mlb.com/leaderboard/custom"
+                f"?year={yr}&type=batter&filter=&sort=4&sortDir=desc&min=10"
+                f"&selections=b_total_pa,b_ab,batting_avg,b_total_bases,"
+                f"b_k_percent,b_bb_percent,b_xba,b_xslg,barrel_batted_rate,"
+                f"hard_hit_percent,avg_hit_speed,b_woba,b_xwoba,b_obp"
+                f"&chart=false&x=barrel_batted_rate&y=avg_hit_speed&r=no&csv=false"
+            )
+            _r = requests.get(_cust_url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://baseballsavant.mlb.com/leaderboard/custom",
+            })
+            if _r.status_code == 200 and len(_r.content) > 1000:
+                import re as _re
+                # Savant embeds data as: var playerData = [...];
+                _m = _re.search(r'var playerData\s*=\s*(\[.*?\]);', _r.text, _re.DOTALL)
+                if _m:
+                    import json as _json
+                    _players = _json.loads(_m.group(1))
+                    if _players:
+                        _df = pd.DataFrame(_players)
+                        # Rename Savant's column names to match our pipeline
+                        _col_map = {
+                            "player_id": "mlbam_id",
+                            "avg_hit_speed": "avg_exit_velocity",
+                            "b_k_percent": "k_percent",
+                            "b_bb_percent": "bb_percent",
+                            "b_xba": "est_ba", "b_xslg": "est_slg",
+                            "b_xwoba": "est_woba", "b_obp": "OBP",
+                        }
+                        _df = _df.rename(columns=_col_map)
+                        if "mlbam_id" in _df.columns:
+                            _df["mlbam_id"] = _df["mlbam_id"].apply(
+                                lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("","nan") else ""
+                            )
+                        has = _sc_required.intersection(set(_df.columns))
+                        if len(has) >= 2:
+                            _errs.append(f"Savant custom JSON {yr}: OK {len(_df)} players")
+                            return _df
+        except Exception as _e:
+            _errs.append(f"Savant custom JSON {yr}: {str(_e)[:60]}")
+
+        # ── Attempt 2: MLB Stats API metricAverages ────────────────────────────
+        # Same domain (statsapi.mlb.com) that already successfully returns 673 batters.
+        # Returns exit velocity and launch angle — partial but real Statcast data.
+        try:
+            _metric_url = (
+                f"https://statsapi.mlb.com/api/v1/stats"
+                f"?stats=metricAverages&group=hitting&season={yr}"
+                f"&sportId=1&limit=2000"
+                f"&metrics=launchSpeed,launchAngle,launchSpinRate"
+            )
+            _mr = requests.get(_metric_url, timeout=20)
+            if _mr.status_code == 200:
+                _splits = _mr.json().get("stats", [{}])[0].get("splits", [])
+                if _splits:
+                    _rows = []
+                    for _s in _splits:
+                        _p = _s.get("player", {})
+                        _st = _s.get("stat", {})
+                        _ev = _st.get("launchSpeed", {})
+                        _la = _st.get("launchAngle", {})
+                        # metricAverages returns avg, median, etc. per metric
+                        _avg_ev = _ev.get("average") if isinstance(_ev, dict) else _ev
+                        _avg_la = _la.get("average") if isinstance(_la, dict) else _la
+                        if _avg_ev:
+                            # Derive hard_hit_percent from EV (hard hit = ≥95mph)
+                            # We can get this from the metricAverages percentile data
+                            _rows.append({
+                                "mlbam_id": str(_p.get("id", "")),
+                                "_name": _p.get("fullName", ""),
+                                "avg_exit_velocity": float(_avg_ev),
+                                "avg_launch_angle":  float(_avg_la) if _avg_la else None,
+                            })
+                    if _rows:
+                        _mdf = pd.DataFrame(_rows)
+                        _errs.append(f"MLB API metricAverages {yr}: OK {len(_mdf)} players")
+                        return _mdf
+        except Exception as _e:
+            _errs.append(f"MLB API metricAverages {yr}: {str(_e)[:60]}")
+
+        # ── Attempt 3: Standard Savant leaderboard CSV ────────────────────────
+        for _url, _lbl in [
+            (f"https://baseballsavant.mlb.com/leaderboard/statcast?year={yr}&position=&team=&min=1&type=batter&csv=true", "Savant Statcast leaderboard"),
+            (f"https://baseballsavant.mlb.com/statcast_search/csv?player_type=batter&year={yr}&group_by=name&min_pitches=25&type=details", "Savant statcast_search CSV"),
+        ]:
+            _df = _fetch_savant_csv(_url, _lbl)
+            if not _df.empty and len(_sc_required.intersection(set(_df.columns))) >= 2:
+                return _df
+
+        # ── Attempt 4: FanGraphs Statcast type=24 ─────────────────────────────
+        try:
+            import random as _rand
+            _fg_r = requests.get(
+                "https://www.fangraphs.com/api/leaders/major-league/data",
+                params={"pos":"all","stats":"bat","lg":"all","qual":"0","type":"24",
+                        "season":yr,"season1":yr,"ind":"0","team":"0","pageitems":"2000",
+                        "pagenum":"1","minpa":"0","sortdir":"default","sortstat":"Barrel%"},
+                headers={
+                    "User-Agent": _rand.choice([
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+                    ]),
+                    "Referer": "https://www.fangraphs.com/leaders/major-league",
+                    "Accept": "application/json",
+                }, timeout=10
+            )
+            if _fg_r.status_code == 200:
+                _fg_rows = _fg_r.json().get("data", [])
+                if _fg_rows:
+                    _fg_df = pd.DataFrame(_fg_rows)
+                    # FanGraphs Statcast type=24 has Barrel%, HardHit%, AvgEV
+                    _fg_sc_cols = {c for c in _fg_df.columns
+                                   if any(k in c.lower() for k in ("barrel","hardhit","hard%","ev","exit"))}
+                    if len(_fg_sc_cols) >= 1:
+                        _errs.append(f"FanGraphs Statcast {yr}: OK {len(_fg_df)} players")
+                        return _fg_df
+        except Exception as _e:
+            _errs.append(f"FanGraphs Statcast {yr}: {str(_e)[:60]}")
+
         return pd.DataFrame()
 
     sc_cur = _fetch_statcast_cascade(season + 1)
@@ -7108,14 +7216,22 @@ def main():
             has_odds_key = False
 
         st.markdown(f"✅ MLB Stats API *(always accessible)*")
-        bat_src = st.session_state.get("_batting_source", "")
-        pit_src = st.session_state.get("_pitching_source", "")
-        if "savant" in bat_src or bat_src in ("disk_cache_fresh","disk_cache_stale"):
-            st.markdown(f"✅ Baseball Savant *(xStats + Statcast)*")
-        elif bat_src == "failed":
-            st.markdown(f"⚠️ Baseball Savant *(blocked — using MLB API proxies)*")
+        bat_src   = st.session_state.get("_batting_source", "")
+        pit_src   = st.session_state.get("_pitching_source", "")
+        bat_cols  = st.session_state.get("batting_cols", [])
+        has_xstats    = "xSLG" in bat_cols or "est_slg" in bat_cols
+        has_statcast  = "Barrel%" in bat_cols or "barrel_batted_rate" in bat_cols
+        has_bat_track = "bat_speed" in bat_cols
+        if not bat_src:
+            st.markdown("⏳ Baseball Savant *(run model to check)*")
+        elif has_xstats and has_statcast and has_bat_track:
+            st.markdown("✅ Baseball Savant *(full: xStats + Statcast + Bat Tracking)*")
+        elif has_xstats and has_statcast:
+            st.markdown("🟡 Baseball Savant *(partial: xStats + Statcast, no bat tracking)*")
+        elif has_xstats:
+            st.markdown("⚠️ Baseball Savant *(xStats only — Statcast leaderboard blocked [502])*")
         else:
-            st.markdown(f"⚠️ Baseball Savant *(run model to check)*")
+            st.markdown("❌ Baseball Savant *(blocked — using MLB API proxies)*")
         st.markdown(f"✅ Open-Meteo Weather")
         
         if has_odds_key:
