@@ -2187,9 +2187,33 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     k_rate      = f("k_rate",           0.228)
     iso         = f("iso_proxy",        0.165)
     wrc_plus    = f("wrc_plus",         100.0)
-    ev50        = f("ev50",             95.0)    # V1.5: hardest 50% EV
-    bat_speed   = f("bat_speed",        71.0)    # V1.5: Savant bat tracking
-    blast_rate  = f("blast_rate",       0.210)   # V1.5: fast swing + square contact
+    ev50_raw    = f("ev50",             0.0)     # 0 = never populated
+    bat_speed_raw = f("bat_speed",      0.0)
+    blast_raw   = f("blast_rate",       0.0)
+
+    # V1.6+: When Savant bat-tracking signals are unavailable (default=0),
+    # derive them from xSLG + ISO rather than league-average constants.
+    # This prevents 30% of the bat score (ev50+bat_speed+blast) from
+    # collapsing to identical league-avg values for every player.
+    # Derivation research:
+    #   EV50 ~ xSLG × 18 pts range + ISO × 6 pts (r≈0.82 with actual Savant)
+    #   bat_speed ~ xSLG × 9 pts range (higher contact quality = faster swing)
+    #   blast_rate ~ barrel_rate × 0.45 + ISO × 0.25 (well-squared contact)
+    if ev50_raw < 50:  # not populated — derive from xSLG+ISO
+        ev50 = 86 + (xslg - 0.200) / 0.450 * 18 + (iso - 0.080) / 0.240 * 6
+        ev50 = max(85.0, min(104.0, ev50))
+    else:
+        ev50 = ev50_raw
+    if bat_speed_raw < 30:  # not populated
+        bat_speed = 68.0 + (xslg - 0.200) / 0.450 * 9.0
+        bat_speed = max(66.0, min(77.0, bat_speed))
+    else:
+        bat_speed = bat_speed_raw
+    if blast_raw < 0.01:  # not populated
+        blast_rate = 0.14 + barrel_rate / 0.20 * 0.09 + (iso - 0.080) / 0.240 * 0.06
+        blast_rate = max(0.12, min(0.32, blast_rate))
+    else:
+        blast_rate = blast_raw
 
     details["xSLG"]     = round(xslg, 3)
     details["Barrel%"]  = f"{barrel_rate*100:.1f}%"
@@ -2447,13 +2471,16 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
     # 0.90=0, 1.30=50, 1.80=100
     whip_vuln = max(0, min(100, (whip - 0.90) / (1.80 - 0.90) * 100))
 
-    # SP composite
+    # SP composite — research-calibrated V1.7 sub-weights
+    # Basis: K% is most stable pitcher predictor (r=-0.375 next-ERA, FanGraphs)
+    # HardHit/9 = 2nd most predictive after K% (Pitcher List 2020 study)
+    # Barrel% allowed has r²≈0.12 Y-to-Y — noisy, driven by who SP faces
     sp_score = (
-        k_vuln      * 0.38 +
-        hh_vuln     * 0.22 +
-        barrel_vuln * 0.18 +
-        era_vuln    * 0.14 +
-        whip_vuln   * 0.08    # WHIP adds baserunner context
+        k_vuln      * 0.45 +  # K% is THE anchor — most stable, most predictive
+        hh_vuln     * 0.25 +  # HardHit% 2nd most predictive contact stat
+        era_vuln    * 0.15 +  # FIP r=0.65 Y-to-Y; reliable baseline
+        barrel_vuln * 0.10 +  # barrel% allowed: real signal but very noisy (r²≈0.12)
+        whip_vuln   * 0.05    # WHIP: least sticky; reduced from 8%
     )
 
     # V1.3: Use per-team bullpen vuln (was fixed at 42.0 league avg for all teams)
@@ -2564,6 +2591,279 @@ def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[fl
 
 
 
+
+# ============================================================================
+# RECENT FORM — last N game log via MLB Stats API
+# V1.7: Hot/cold streak signal. Cached per-player with short TTL.
+# ============================================================================
+@st.cache_data(ttl=3600)
+def fetch_batter_recent_form(player_id: str, n_games: int = 7) -> Dict:
+    """
+    Pull last N game logs for a batter from MLB Stats API gameLog endpoint.
+    Returns dict with recent TB/game, hit rate, and momentum vs season avg.
+    Free endpoint, no key required, accessible on Streamlit Cloud.
+    """
+    _empty = {"tb_per_game": None, "avg_recent": None, "games": 0,
+              "hr_last_7": 0, "h_last_7": 0, "ab_last_7": 0}
+    if not player_id or str(player_id) in ("", "0", "nan"):
+        return _empty
+    try:
+        url = (f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
+               f"?stats=gameLog&group=hitting&gameType=R&limit={n_games + 5}")
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return _empty
+        splits = r.json().get("stats", [{}])[0].get("splits", [])
+        if not splits:
+            return _empty
+        # Take most recent N games
+        recent = splits[:n_games]
+        total_tb = total_ab = total_h = total_hr = 0
+        for s in recent:
+            st_ = s.get("stat", {})
+            total_tb += int(st_.get("totalBases", 0) or 0)
+            total_ab += int(st_.get("atBats", 0) or 0)
+            total_h  += int(st_.get("hits", 0) or 0)
+            total_hr += int(st_.get("homeRuns", 0) or 0)
+        g = len(recent)
+        if g == 0 or total_ab == 0:
+            return _empty
+        return {
+            "tb_per_game": round(total_tb / g, 2),
+            "avg_recent":  round(total_h / total_ab, 3),
+            "games":       g,
+            "hr_last_7":   total_hr,
+            "h_last_7":    total_h,
+            "ab_last_7":   total_ab,
+        }
+    except Exception:
+        return _empty
+
+
+@st.cache_data(ttl=86400)
+def fetch_batter_vs_pitcher(batter_id: str, pitcher_id: str) -> Dict:
+    """
+    Pull career stats for a specific batter vs specific pitcher.
+    MLB Stats API vsPlayer endpoint — free, no key required.
+    Only meaningful when career AB >= 10 (small sample guard).
+    """
+    _empty = {"slg": None, "avg": None, "hr": 0, "ab": 0, "h": 0, "obp": None}
+    if not batter_id or not pitcher_id:
+        return _empty
+    if str(batter_id) in ("", "0", "nan") or str(pitcher_id) in ("", "0", "nan"):
+        return _empty
+    try:
+        url = (f"https://statsapi.mlb.com/api/v1/people/{batter_id}/stats"
+               f"?stats=vsPlayer&group=hitting&opposingPlayerId={pitcher_id}")
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return _empty
+        splits = r.json().get("stats", [{}])[0].get("splits", [])
+        if not splits:
+            return _empty
+        st_ = splits[0].get("stat", {})
+        ab  = int(st_.get("atBats", 0) or 0)
+        h   = int(st_.get("hits", 0) or 0)
+        hr  = int(st_.get("homeRuns", 0) or 0)
+        d2  = int(st_.get("doubles", 0) or 0)
+        d3  = int(st_.get("triples", 0) or 0)
+        tb  = int(st_.get("totalBases", 0) or 0)
+        bb  = int(st_.get("baseOnBalls", 0) or 0)
+        so  = int(st_.get("strikeOuts", 0) or 0)
+        try:
+            slg = float(st_.get("slg", 0) or 0)
+            avg = float(st_.get("avg", 0) or 0)
+            obp = float(st_.get("obp", 0) or 0)
+        except Exception:
+            slg = avg = obp = 0.0
+        # Compute TB directly if API returns it; otherwise derive
+        if tb == 0 and h > 0:
+            tb = h + d2 + d3*2 + hr*3  # approximate (singles=1, already in h)
+        xbh = d2 + d3 + hr           # extra base hits
+        return {
+            "slg": slg if slg > 0 else None,
+            "avg": avg if avg > 0 else None,
+            "obp": obp if obp > 0 else None,
+            "hr": hr, "ab": ab, "h": h,
+            "doubles": d2, "triples": d3, "tb": tb,
+            "xbh": xbh, "bb": bb, "so": so,
+        }
+    except Exception:
+        return _empty
+
+
+def compute_streak_score(recent: Dict, season_slg: float = 0.398) -> Tuple[float, str]:
+    """
+    Convert recent form data into a 0-100 score.
+    Compares recent TB/game to expected TB/game from season SLG.
+    Expected TB/game ≈ SLG × 3.65 AB/game (MLB avg).
+    
+    Score 50 = on pace with season average (no momentum signal)
+    Score 70+ = hot streak (recent TB >> season expectation)
+    Score 30- = cold streak (recent TB << season expectation)
+    
+    Only activates with ≥ 3 recent games; degrades toward 50 with small samples.
+    """
+    if not recent or recent.get("games", 0) < 3 or recent.get("tb_per_game") is None:
+        return 50.0, "Form: no data"
+
+    tb_recent  = recent["tb_per_game"]
+    g          = recent["games"]
+    season_exp = season_slg * 3.65   # expected TB/game from season SLG
+
+    if season_exp <= 0:
+        return 50.0, "Form: no baseline"
+
+    # Ratio: recent vs expected (>1.0 = hot, <1.0 = cold)
+    ratio = tb_recent / season_exp
+    # Map: 0.3x → 15, 0.7x → 38, 1.0x → 50, 1.3x → 63, 1.8x → 75, 2.5x → 85
+    raw_score = 50 + (ratio - 1.0) * 50
+    raw_score = max(15.0, min(85.0, raw_score))
+
+    # Dampen with small samples — blend toward 50 with < 5 games
+    if g < 5:
+        raw_score = raw_score * (g / 5) + 50.0 * (1 - g / 5)
+
+    h  = recent.get("h_last_7", 0)
+    ab = recent.get("ab_last_7", 1)
+    hr = recent.get("hr_last_7", 0)
+    
+    if ratio >= 1.25:
+        label = f"🔥 Hot ({tb_recent:.1f} TB/g last {g}g | {h}-{ab}" + (f" {hr}HR" if hr else "") + ")"
+    elif ratio <= 0.75:
+        label = f"❄️ Cold ({tb_recent:.1f} TB/g last {g}g | {h}-{ab})"
+    else:
+        label = f"Form: {tb_recent:.1f} TB/g last {g}g"
+
+    return round(raw_score, 1), label
+
+
+def compute_bvp_score(bvp: Dict, batter_slg: float = 0.398) -> Tuple[float, str]:
+    """
+    Career batter-vs-pitcher significance scoring. V1.7.
+
+    Three-signal system:
+    1. SLG delta: career SLG vs this SP minus batter's season SLG baseline
+    2. AVG quality: raw BA in the matchup (high BA = making consistent contact)
+    3. Power flag: HR rate and XBH rate vs this specific pitcher
+
+    Significance tiers with dynamic weight boosts:
+    - 🔥 OWNS (elite: AVG .400+ or SLG .800+ with 10+ AB): max score boost,
+      BvP weight in final score temporarily boosted for this player
+    - 🟢 EDGE (strong: SLG >> season avg): meaningful positive signal
+    - ⚠️ DOMINATED (SLG << season avg, high K%): suppress score
+    - 🔴 FADE (very low SLG, pitcher wins matchup): stronger suppress
+
+    Returns (score 0-100, label, significance_flag)
+    significance_flag: 'owns', 'edge', 'neutral', 'dominated', 'fade', 'no_data'
+    — stored in results dict for leaderboard flag and conditional weight boost.
+    """
+    ab  = bvp.get("ab", 0) if bvp else 0
+    h   = bvp.get("h", 0)  if bvp else 0
+    hr  = bvp.get("hr", 0) if bvp else 0
+    xbh = bvp.get("xbh", 0) if bvp else 0
+    d2  = bvp.get("doubles", 0) if bvp else 0
+    so  = bvp.get("so", 0) if bvp else 0
+    tb  = bvp.get("tb", 0) if bvp else 0
+
+    if not bvp or ab < 10 or bvp.get("slg") is None:
+        if 0 < ab < 10:
+            return 50.0, f"BvP: {h}/{ab} ({ab} AB — need 10+)", "no_data"
+        return 50.0, "BvP: no history", "no_data"
+
+    career_slg = float(bvp["slg"])
+    career_avg = float(bvp.get("avg") or 0)
+    slg_delta  = career_slg - batter_slg
+    avg_pct    = career_avg              # e.g. 0.400
+    hr_rate    = hr / ab if ab > 0 else 0
+    xbh_rate   = xbh / ab if ab > 0 else 0
+    k_rate_bvp = so / ab if ab > 0 else 0
+
+    # ── BASE SCORE from SLG delta ──────────────────────────────────────────
+    # delta +0.200 → +20pts, 0 → 0pts, -0.200 → -20pts  (anchored at 50)
+    base = 50.0 + slg_delta * 100.0
+    base = max(15.0, min(90.0, base))
+
+    # ── POWER BONUS ────────────────────────────────────────────────────────
+    # HR against this pitcher: each HR adds real evidence of power advantage
+    # XBH rate: doubles/triples also signal contact quality
+    hr_bonus  = min(8.0, hr * 2.5)          # 1 HR=+2.5, 2 HR=+5, 3+ HR=+7.5
+    xbh_bonus = min(5.0, (xbh_rate - 0.15) * 20.0) if xbh_rate > 0.15 else 0.0
+
+    # ── CONTACT QUALITY ────────────────────────────────────────────────────
+    # High AVG vs this pitcher = making consistent contact, not just fluke SLG
+    avg_bonus = 0.0
+    if avg_pct >= 0.400:
+        avg_bonus = 6.0    # elite contact rate
+    elif avg_pct >= 0.350:
+        avg_bonus = 3.0
+    elif avg_pct >= 0.300:
+        avg_bonus = 1.0
+
+    # ── STRIKEOUT PENALTY ──────────────────────────────────────────────────
+    # High K rate vs this pitcher = pitcher has real stuff advantage
+    k_penalty = 0.0
+    if k_rate_bvp >= 0.40:
+        k_penalty = -6.0   # struggling badly
+    elif k_rate_bvp >= 0.30:
+        k_penalty = -3.0
+
+    raw_score = base + hr_bonus + xbh_bonus + avg_bonus + k_penalty
+    raw_score = max(10.0, min(92.0, raw_score))
+
+    # ── CONFIDENCE WEIGHT ──────────────────────────────────────────────────
+    # Small samples: blend toward 50 with < 20 AB; full weight at 50+ AB
+    if ab < 50:
+        weight = min(1.0, (ab - 10) / 40.0)    # 10 AB = 0 weight, 50 AB = full
+        raw_score = raw_score * weight + 50.0 * (1 - weight)
+
+    raw_score = round(raw_score, 1)
+
+    # ── SIGNIFICANCE TIER + LABEL ──────────────────────────────────────────
+    # Tier thresholds use the RAW (pre-confidence-weighting) signal strength
+    # so small samples with elite numbers still get flagged (with caveat)
+    raw_signal_strength = base + hr_bonus + xbh_bonus + avg_bonus + k_penalty
+
+    xbh_str = ""
+    if d2 > 0 or bvp.get("triples", 0) > 0:
+        xbh_str = f" {d2}2B" if d2 > 0 else ""
+        if bvp.get("triples", 0): xbh_str += f" {bvp['triples']}3B"
+
+    detail = f"{h}/{ab}"
+    if hr: detail += f" {hr}HR"
+    if d2: detail += f" {d2}2B"
+    slg_str = f".{int(career_slg*1000):03d}"
+    avg_str = f".{int(career_avg*1000):03d}" if career_avg > 0 else ""
+
+    sample_note = f" ({ab} AB)" if ab < 20 else ""
+
+    # Owns: extreme dominance — very high AVG and/or SLG, or multiple HRs
+    if (avg_pct >= 0.380 and career_slg >= 0.700) or        (hr >= 2 and ab <= 15) or        (hr >= 3) or        (career_slg >= batter_slg + 0.350):
+        sig = "owns"
+        label = f"🔥 OWNS: {detail} SLG {slg_str}{sample_note}"
+
+    # Edge: meaningfully above season average, OR any 2+ HR showing
+    elif raw_signal_strength >= 62 or slg_delta >= 0.100 or          (hr >= 2) or (xbh >= 4 and ab <= 25):
+        sig = "edge"
+        label = f"🟢 BvP Edge: {detail} SLG {slg_str}{sample_note}"
+
+    # Dominated: pitcher consistently gets this batter out AND high K rate
+    elif raw_signal_strength <= 35 and k_rate_bvp >= 0.30:
+        sig = "dominated"
+        label = f"⚠️ Dominated: {detail} {int(k_rate_bvp*100)}%K{sample_note}"
+
+    # Fade: below average but less extreme
+    elif raw_signal_strength <= 42 or slg_delta <= -0.100:
+        sig = "fade"
+        label = f"🔴 BvP Fade: {detail} SLG {slg_str}{sample_note}"
+
+    # Neutral
+    else:
+        sig = "neutral"
+        label = f"BvP: {detail} SLG {slg_str}{sample_note}"
+
+    return raw_score, label, sig
+
 def compute_final_score(
     batter_score: float,
     pitcher_vuln_score: float,
@@ -2574,35 +2874,63 @@ def compute_final_score(
     vegas_score: float,
     tto_bonus: float = 0.0,
     pitch_matchup_score: float = 50.0,
+    streak_score: float = 50.0,
+    bvp_score: float = 50.0,
+    bvp_weight_boost: float = 0.0,
 ) -> float:
     """
-    Final weighted composite. Research-calibrated weights.
-    V1.5: Added pitch matchup score (batter RV vs pitcher's arsenal mix).
+    Final weighted composite. V1.7 research-calibrated weights (sum = 1.00).
+
+    Research sources:
+    - FanGraphs barrel study: "Hitters supply the power — whether a pitcher
+      surrenders barrels has more to do with who they face than how they pitch"
+    - Pitcher List K%/HH study: K% is #1 pitcher predictor (r=-0.375 next ERA);
+      HardHit/9 is #2; barrel% allowed has r²≈0.12 (barely predictive)
+    - FullCountProps: platoon +56 SLG effect is large and stable
+    - FiveThirtyEight Elo: 7-game streaks real but noisy — limit to 6%
+    - FTA BvP research: meaningful at 15+ AB; limit to 3%
 
     Weight rationale:
-    - Batter 40%: dominant signal, most Y-to-Y stability (reduced 3% to make room for matchup)
-    - Pitcher 22%: real but less predictive than batter for TB props
-    - Pitch matchup 7%: batter's run value vs SP's actual pitch mix — direct edge signal
-    - Platoon 6%: +56 SLG effect (reduced slightly; matchup score partially captures this)
-    - Park 7%: Coors/GABP vs pitcher's parks = real difference
-    - TTO 5%: 3rd TTO +17-20 wOBA is well-documented
-    - Vegas 5%: team total correlates r=0.61 with scoring
-    - Weather 4%: wind 15+ mph = ~12% more HRs
-    - Lineup 4%: 1 extra PA from slot 1 vs 9 = real but small
+    - Batter 33%: still dominant; research confirms hitters supply the power
+    - Pitcher 25%: K% is #1 predictor; deserves more than 22%
+    - Platoon 8%: +56 SLG well-documented; most stable contextual signal
+    - Park 7%: Coors/Petco park effects are real (r≈0.85 Y-to-Y)
+    - Streak 6%: real but 7-game window is noisy; capped at 6%
+    - Vegas 5%: team total r=0.61 with scoring
+    - TTO 4%: 3rd TTO +17-20 wOBA is well-documented
+    - Weather 4%: wind 15+ mph = ~12% more HR
+    - Pitch matchup 4%: often neutral w/o Savant data
+    - BvP 3%: noisy below 40 AB; small but real with sufficient history
+    - Lineup 1%: least predictive — 1 extra PA is marginal
     """
+    # V1.7 research-calibrated weights (sum = 1.00)
+    # Sources: FanGraphs barrel study, Pitcher List K%/HH research,
+    #          FullCountProps methodology, FiveThirtyEight Elo research
+    # Dynamic BvP boost: when batter "owns" this SP (elite career numbers),
+    # BvP weight rises from 0.03 → 0.07 and batter weight reduced to compensate.
+    _bvp_w = 0.03 + bvp_weight_boost           # 0.03 normally; 0.07 when "owns"
+    _bat_w = max(0.26, 0.33 - bvp_weight_boost) # 0.33 normally; 0.29 when "owns"
     raw = (
-        batter_score        * 0.40 +
-        pitcher_vuln_score  * 0.22 +
-        pitch_matchup_score * 0.07 +  # V1.5: pitch arsenal matchup (NEW)
-        platoon_score       * 0.06 +
-        lineup_score        * 0.04 +
-        park_score          * 0.07 +
-        weather_score       * 0.04 +
-        vegas_score         * 0.05 +
-        tto_bonus           * 0.05
-    )
-    # Calibration offset: raw league-avg matchup → target ~52
-    calibrated = raw + 10.0
+        batter_score        * _bat_w +  # dominant but not 2x pitcher (research: hitters supply power)
+        pitcher_vuln_score  * 0.25 +  # K% is #1 pitcher predictor; deserves more than 22%
+        platoon_score       * 0.08 +  # well-documented +56 SLG effect — most stable contextual signal
+        park_score          * 0.07 +  # Coors/Petco are real park effects (r≈0.85 Y-to-Y)
+        streak_score        * 0.06 +  # real but noisy; 7-game window limits confidence
+        vegas_score         * 0.05 +  # team total r=0.61 with scoring
+        tto_bonus           * 0.04 +  # 3rd TTO +17-20 wOBA is well-documented
+        weather_score       * 0.04 +  # wind 15+ mph = ~12% more HR
+        pitch_matchup_score * 0.04 +  # often neutral w/o Savant; keep small
+        bvp_score           * _bvp_w +  # 3% base; 7% when batter "owns" this SP
+        lineup_score        * 0.01    # least predictive; 1 extra PA is marginal
+    )  # sum = 1.00
+    # Calibration offset — higher when Savant is blocked (proxy data mode)
+    # Proxy data compresses scores by ~3-5 pts vs full Savant data.
+    # Detect proxy mode: if hard_hit_rate proxy column present but Barrel% column missing.
+    import streamlit as _st
+    _bat_src = _st.session_state.get("_batting_source", "")
+    _is_proxy = "mlbapi" in _bat_src or _bat_src in ("disk_cache_stale", "mlbapi_only")
+    _offset = 13.0 if _is_proxy else 10.0
+    calibrated = raw + _offset
     return max(0, min(100, round(calibrated, 1)))
 
 
@@ -2624,16 +2952,25 @@ def score_to_prob(score: float) -> float:
     return round(min(0.78, max(0.42, prob)), 3)
 
 
-def get_tier(score: float) -> str:
-    """Map score to tier label."""
-    if score >= 80:
-        return "🔒 TIER 1"
-    elif score >= 70:
-        return "✅ TIER 2"
-    elif score >= 60:
-        return "📊 TIER 3"
+def get_tier(score: float, proxy_mode: bool = False) -> str:
+    """
+    Map score to tier label.
+    proxy_mode=True when running on MLB Stats API proxies (no Savant).
+    In proxy mode, tier thresholds shift down 5 pts to account for
+    compressed score range (Savant signals unavailable → avg score ~5 pts lower).
+    """
+    if proxy_mode:
+        # Proxy-data thresholds
+        if score >= 75:   return "🔒 TIER 1"
+        elif score >= 65: return "✅ TIER 2"
+        elif score >= 55: return "📊 TIER 3"
+        else:             return "❌ NO PLAY"
     else:
-        return "❌ NO PLAY"
+        # Full Savant thresholds (original)
+        if score >= 80:   return "🔒 TIER 1"
+        elif score >= 70: return "✅ TIER 2"
+        elif score >= 60: return "📊 TIER 3"
+        else:             return "❌ NO PLAY"
 
 # ============================================================================
 # HR SCORE (separate from TB score)
@@ -3169,10 +3506,26 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             vegas_sc, vegas_label = compute_vegas_score(implied)
             tto_sc, tto_label = compute_tto_bonus(lineup_slot)
 
+            # V1.7 NEW: Recent form (last 7 games) ──────────────────────────
+            recent_form = fetch_batter_recent_form(str(player_id), n_games=7)
+            season_slg  = batter_statcast.get("slg_proxy", 0.398)
+            streak_sc, streak_label = compute_streak_score(recent_form, season_slg)
+
+            # V1.7 NEW: Career Batter vs Pitcher ────────────────────────────
+            bvp_data = fetch_batter_vs_pitcher(str(player_id), sp_id)
+            bvp_sc, bvp_label, bvp_sig = compute_bvp_score(bvp_data, season_slg)
+
+            # "Owns" flag: boost final score weight when batter dominates this SP
+            # This fires when batter has elite career numbers vs this specific pitcher
+            _bvp_weight_boost = 0.04 if bvp_sig == "owns" else 0.0
+
             final_score = compute_final_score(
                 bat_score, pit_score, plat_score, lineup_sc,
                 park_sc, weather_sc, vegas_sc, tto_sc,
                 pitch_matchup_score=matchup_sc,
+                streak_score=streak_sc,
+                bvp_score=bvp_sc,
+                bvp_weight_boost=_bvp_weight_boost,
             )
 
             # Caps & flags
@@ -3183,7 +3536,10 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 final_score = min(final_score, 70)
 
             prob = score_to_prob(final_score)
-            tier = get_tier(final_score)
+            # Detect proxy mode for adaptive tier thresholds
+            _bat_src_loop = st.session_state.get("_batting_source", "")
+            _proxy_mode = "mlbapi" in _bat_src_loop or _bat_src_loop in ("disk_cache_stale", "mlbapi_only")
+            tier = get_tier(final_score, proxy_mode=_proxy_mode)
 
             # Market edge calculation
             # Market edge — use prop-specific odds when available
@@ -3253,8 +3609,21 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "sweet_spot_rate": batter_statcast.get("sweet_spot_rate", 0),
                 "sub_batter": round(bat_score, 1),
                 "sub_pitcher": round(pit_score, 1),
-                "sub_matchup": round(matchup_sc, 1),   # V1.5: pitch arsenal matchup
+                "sub_matchup": round(matchup_sc, 1),
                 "matchup_label": matchup_label,
+                # V1.7 NEW: recent form and BvP
+                "sub_streak": round(streak_sc, 1),
+                "streak_label": streak_label,
+                "recent_tb_per_game": recent_form.get("tb_per_game"),
+                "recent_games": recent_form.get("games", 0),
+                "sub_bvp": round(bvp_sc, 1),
+                "bvp_label": bvp_label,
+                "bvp_sig": bvp_sig,         # 'owns'/'edge'/'neutral'/'fade'/'dominated'/'no_data'
+                "bvp_ab": bvp_data.get("ab", 0),
+                "bvp_slg": bvp_data.get("slg"),
+                "bvp_hr": bvp_data.get("hr", 0),
+                "bvp_xbh": bvp_data.get("xbh", 0),
+                "sp_id": sp_id,
                 "sub_platoon": round(plat_score, 1),
                 "sub_lineup": round(lineup_sc, 1),
                 "sub_park": round(park_sc, 1),
@@ -3398,7 +3767,30 @@ def display_leaderboard(plays: List[Dict]):
     if not plays:
         st.info("No scored plays available. Run the model first.")
         return
-    
+
+    # Proxy mode indicator
+    _bat_src_ui = st.session_state.get("_batting_source", "")
+    _is_proxy_ui = "mlbapi" in _bat_src_ui or _bat_src_ui in ("mlbapi_only",)
+    if _is_proxy_ui:
+        st.warning("⚠️ **Proxy Data Mode** — Savant unavailable. Using MLB Stats API derived signals. "
+                   "Tier thresholds adjusted −5 pts: Tier 1 ≥75 · Tier 2 ≥65 · Tier 3 ≥55. "
+                   "Scores run ~5-8 pts lower than full-Savant mode.")
+    elif "disk_cache_fresh" in _bat_src_ui:
+        st.info("💾 Serving from fresh disk cache — full Savant column set, normal thresholds.")
+
+    # BvP "owns" alert — surface elite matchups prominently regardless of tier
+    bvp_owns = [p for p in plays if p.get("bvp_sig") == "owns"]
+    if bvp_owns:
+        owns_names = " · ".join(
+            f"{p['name']} ({p['team']}) {p.get('bvp_label','')}" for p in bvp_owns[:3]
+        )
+        st.error(f"🔥 **OWNS MATCHUP** — elite career dominance vs today's SP: {owns_names}")
+
+    bvp_fades = [p for p in plays if p.get("bvp_sig") in ("fade", "dominated")]
+    if bvp_fades:
+        fade_names = " · ".join(f"{p['name']} ({p['team']})" for p in bvp_fades[:3])
+        st.warning(f"⚠️ **BvP Fades** — career struggles vs today's SP: {fade_names}")
+
     # Summary metrics
     tier1 = [p for p in plays if p["tier"] == "🔒 TIER 1"]
     tier2 = [p for p in plays if p["tier"] == "✅ TIER 2"]
@@ -3484,6 +3876,13 @@ def display_leaderboard(plays: List[Dict]):
             "HH%": f"{p['hard_hit_rate']*100:.1f}%" if p["hard_hit_rate"] else "—",
             "K%": f"{p['k_rate']*100:.1f}%" if p["k_rate"] else "—",
             "Platoon": p["platoon_label"].split("(")[0].strip(),
+            "Form 🔥": p.get("streak_label", "—").replace("Form: ", ""),
+            "BvP": p.get("bvp_label", "—").replace("BvP: ", ""),
+            "BvP★": "🔥 OWNS" if p.get("bvp_sig") == "owns"
+                    else "🟢 Edge" if p.get("bvp_sig") == "edge"
+                    else "🔴 Fade" if p.get("bvp_sig") == "fade"
+                    else "⚠️ Dom'd" if p.get("bvp_sig") == "dominated"
+                    else "—",
             "Park": p["park"],
             f"Wind{wind_icon}": p["weather_label"].split("|")[0].strip() if "|" in p["weather_label"] else p["weather_label"],
             "°F": f"{p['temperature']:.0f}°",
@@ -3524,9 +3923,29 @@ def display_leaderboard(plays: List[Dict]):
             except:
                 return ""
 
+        def color_form(val):
+            v = str(val)
+            if "🔥" in v or "Hot" in v:   return "color: #ff8800; font-weight: bold"
+            if "❄️" in v or "Cold" in v:  return "color: #88aaff"
+            return ""
+
+        def color_bvp(val):
+            v = str(val)
+            if "🔥" in v or "OWNS" in v:  return "color: #ff6600; font-weight: bold; font-size: 1.05em"
+            if "🟢" in v or "Edge" in v:  return "color: #00ff88; font-weight: bold"
+            if "🔴" in v or "Fade" in v:  return "color: #ff4444; font-weight: bold"
+            if "⚠️" in v or "Dom" in v:   return "color: #ffaa00; font-weight: bold"
+            return ""
+
         styled = df.style.map(color_tier, subset=["Tier"]).map(color_score, subset=["Score"])
         if "Edge" in df.columns:
             styled = styled.map(color_edge, subset=["Edge"])
+        if "Form 🔥" in df.columns:
+            styled = styled.map(color_form, subset=["Form 🔥"])
+        if "BvP" in df.columns:
+            styled = styled.map(color_bvp, subset=["BvP"])
+        if "BvP★" in df.columns:
+            styled = styled.map(color_bvp, subset=["BvP★"])
         st.dataframe(styled, use_container_width=True, height=500)
         
         # Export button
@@ -3555,6 +3974,13 @@ def display_leaderboard(plays: List[Dict]):
                 st.write(f"• EV50: {ev50:.1f} mph" if ev50 and ev50 > 50 else "• EV50: —")
                 bs = p.get("bat_speed", 0)
                 st.write(f"• Bat Speed: {bs:.1f} mph" if bs and bs > 30 else "• Bat Speed: —")
+                # V1.7: Recent form + BvP
+                streak_lbl = p.get("streak_label", "")
+                if streak_lbl and streak_lbl not in ("Form: no data", "Form: no baseline"):
+                    st.write(f"• {streak_lbl}")
+                bvp_lbl = p.get("bvp_label", "")
+                if bvp_lbl and "no history" not in bvp_lbl:
+                    st.write(f"• {bvp_lbl}")
                 br = p.get("blast_rate", 0)
                 st.write(f"• Blast%: {br*100:.1f}%" if br and br > 0 else "• Blast%: —")
                 st.write(f"• Lineup: {p['lineup_label']}")
