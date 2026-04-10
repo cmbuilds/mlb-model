@@ -3177,7 +3177,7 @@ def compute_final_score(
     # Proxy mode: source says mlbapi only, or statcast columns missing
     _is_proxy = ("mlbapi" in _bat_src or _bat_src in ("mlbapi_only",) or
                  "disk_cache_stale" in _bat_src or not _has_full)
-    _offset = 6.0 if _is_proxy else 3.0   # V1.8: Z-score centers at 50; small positive lean for over props
+    _offset = 9.5 if _is_proxy else 6.5   # V1.8: calibrated so avg batter vs avg SP = 55
     calibrated = raw + _offset
     return max(0, min(100, round(calibrated, 1)))
 
@@ -4812,7 +4812,7 @@ def compute_hits_score_for_player(
         tto_sc              * 0.04
     )
     # Calibration offset
-    score = max(0, min(100, round(raw + 3.0, 1)))  # V1.8: Z-score centered; small positive lean
+    score = max(0, min(100, round(raw + 6.5, 1)))  # V1.8: calibrated; avg batter vs avg SP = 55
 
     if sp_tbd:
         score = min(score, 74)
