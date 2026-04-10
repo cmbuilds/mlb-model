@@ -40,7 +40,7 @@ import pytz
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="⚾ MLB TB Analyzer V1.6",
+    page_title="⚾ MLB TB Analyzer V1.8",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="auto"
@@ -2449,9 +2449,13 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     details["K%"]       = f"{k_rate*100:.1f}%"
     details["ISO"]      = round(iso, 3)
     details["wRC+"]     = int(wrc_plus)
-    details["EV50"]     = round(ev50, 1)
-    details["BatSpd"]   = round(bat_speed, 1)
-    details["Blast%"]   = f"{blast_rate*100:.1f}%"
+    # V1.8: EV50/bat_speed/blast only shown when real Savant data present
+    if ev50_raw >= 50:
+        details["EV50"]   = round(ev50_raw, 1)
+    if bat_speed_raw >= 30:
+        details["BatSpd"] = round(bat_speed_raw, 1)
+    if blast_raw >= 0.01:
+        details["Blast%"] = f"{blast_raw*100:.1f}%"
 
     # ── Sub-scores 0-100, calibrated to actual MLB distributions ──
 
@@ -2479,36 +2483,38 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     iso_score = (iso - 0.080) / (0.320 - 0.080) * 100
     iso_score = max(0, min(100, iso_score))
 
-    # V1.5: EV50 — hardest 50% avg exit velocity
-    # 88mph=0, 95mph=50, 103mph=100 (elite power ceiling)
-    ev50_score = (ev50 - 88.0) / (103.0 - 88.0) * 100
-    ev50_score = max(0, min(100, ev50_score))
+    # V1.8: When real Savant bat-tracking data available, add EV50/bat_speed/blast.
+    # When unavailable, do NOT fake them — derived proxies (ev50~xSLG, bat_speed~xSLG)
+    # are correlated duplicates that compress score variance without adding information.
+    has_bat_tracking = (ev50_raw >= 50 and bat_speed_raw >= 30 and blast_raw >= 0.01)
 
-    # V1.5: Bat speed — mechanical power ceiling
-    # 65mph=0, 71mph=50, 78mph=100  (MLB range roughly 63-80mph)
-    bat_speed_score = (bat_speed - 65.0) / (78.0 - 65.0) * 100
-    bat_speed_score = max(0, min(100, bat_speed_score))
-
-    # V1.5: Blast rate — fast swing that squares up (best contact quality signal)
-    # 10%=0, 21%=50, 35%=100
-    blast_score = (blast_rate - 0.10) / (0.35 - 0.10) * 100
-    blast_score = max(0, min(100, blast_score))
-
-    # Weighted composite — V1.5 updated weights
-    # Added EV50, bat speed, blast rate; reduced wRC+ (FG-only stat)
-    # All weights re-normalized to sum=1.0
-    composite = (
-        barrel_score   * 0.22 +  # barrel% — strongest XBH/HR predictor
-        xslg_score     * 0.18 +  # xSLG — overall contact quality
-        hard_hit_score * 0.14 +  # hard hit% — sustainable contact
-        ev50_score     * 0.12 +  # EV50 — power ceiling (NEW — Savant only)
-        blast_score    * 0.10 +  # blast rate — swing quality (NEW — Savant only)
-        bat_speed_score* 0.08 +  # bat speed — mechanical floor (NEW — Savant only)
-        wrc_score      * 0.10 +  # wRC+ — offensive context
-        iso_score      * 0.07 +  # ISO — raw power
-        k_score        * 0.05    # K% inverse — PA completion rate (trim K = trim to 5%)
-    )  # sum = 1.06 -> normalize
-    composite = composite / 1.06  # keep true 0-100 scale
+    if has_bat_tracking:
+        ev50_score = max(0, min(100, (ev50_raw - 88.0) / (103.0 - 88.0) * 100))
+        bat_speed_score = max(0, min(100, (bat_speed_raw - 65.0) / (78.0 - 65.0) * 100))
+        blast_score = max(0, min(100, (blast_raw - 0.10) / (0.35 - 0.10) * 100))
+        # Full Savant: distribute weight across all 9 signals
+        composite = (
+            barrel_score    * 0.20 +
+            xslg_score      * 0.16 +
+            hard_hit_score  * 0.14 +
+            ev50_score      * 0.14 +
+            blast_score     * 0.12 +
+            bat_speed_score * 0.10 +
+            wrc_score       * 0.08 +
+            iso_score       * 0.04 +
+            k_score         * 0.02
+        )  # sum = 1.00
+    else:
+        # V1.8: No bat-tracking data — use 6 real signals only (sum = 1.00)
+        # barrel=0.26, xslg=0.24, hardhit=0.20, wrc=0.14, iso=0.10, k=0.06
+        composite = (
+            barrel_score   * 0.26 +  # barrel% — strongest XBH/HR predictor
+            xslg_score     * 0.24 +  # xSLG — overall contact quality
+            hard_hit_score * 0.20 +  # hard hit% — sustainable contact
+            wrc_score      * 0.14 +  # wRC+ — full offensive context
+            iso_score      * 0.10 +  # ISO — raw power
+            k_score        * 0.06    # K% inverse — PA completion rate
+        )  # sum = 1.00
 
     return max(0, min(100, composite)), "Contact quality", details
 
@@ -2683,32 +2689,35 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
     whip     = f("whip",             1.30)
 
     # K% INVERSE — high K pitcher = low vulnerability
-    k_vuln = max(0, min(100, (0.35 - k_rate) / (0.35 - 0.10) * 100))
+    # V1.8: ceiling tightened 0.35→0.32 (elite K arms score lower = correctly harder to hit)
+    # Scale: elite (32%)=0, avg (22%)=45, low (10%)=100
+    k_vuln = max(0, min(100, (0.32 - k_rate) / (0.32 - 0.10) * 100))
 
-    # Hard hit allowed
-    hh_vuln = max(0, min(100, (hard_hit - 0.28) / (0.50 - 0.28) * 100))
+    # Hard hit allowed — V1.8: widen scale for more spread
+    # Low (29%)=0, Avg (37%)=47, High (52%)=100
+    hh_vuln = max(0, min(100, (hard_hit - 0.29) / (0.52 - 0.29) * 100))
 
-    # Barrel% allowed
-    barrel_vuln = max(0, min(100, (barrel - 0.03) / (0.14 - 0.03) * 100))
+    # Barrel% allowed — V1.8: widen ceiling 0.14→0.16
+    # Low (3%)=0, Avg (7%)=33, High (16%)=100
+    barrel_vuln = max(0, min(100, (barrel - 0.03) / (0.16 - 0.03) * 100))
 
-    # ERA/FIP quality
+    # ERA/FIP quality — V1.8: widen ceiling 7.0→8.5 for bad SP separation
+    # Elite (2.0)=0, Avg (4.2)=48, Bad (8.5)=100
     era_use = fip if fip > 0 else era
-    era_vuln = max(0, min(100, (era_use - 2.0) / (7.0 - 2.0) * 100))
+    era_vuln = max(0, min(100, (era_use - 2.0) / (8.5 - 2.0) * 100))
 
-    # WHIP — contacts + walks per inning (new signal)
-    # 0.90=0, 1.30=50, 1.80=100
-    whip_vuln = max(0, min(100, (whip - 0.90) / (1.80 - 0.90) * 100))
+    # WHIP — V1.8: wider scale for better spread
+    # Elite (0.85)=0, Avg (1.30)=47, Bad (2.10)=100
+    whip_vuln = max(0, min(100, (whip - 0.85) / (2.10 - 0.85) * 100))
 
-    # SP composite — research-calibrated V1.7 sub-weights
-    # Basis: K% is most stable pitcher predictor (r=-0.375 next-ERA, FanGraphs)
-    # HardHit/9 = 2nd most predictive after K% (Pitcher List 2020 study)
-    # Barrel% allowed has r²≈0.12 Y-to-Y — noisy, driven by who SP faces
+    # SP composite — V1.8 weights: HH% gets more (2nd best predictor), K% trimmed slightly
+    # Wider scales above mean a bad SP now scores ~65-75 vs elite SP ~20-25 (was 58 vs 32)
     sp_score = (
-        k_vuln      * 0.45 +  # K% is THE anchor — most stable, most predictive
-        hh_vuln     * 0.25 +  # HardHit% 2nd most predictive contact stat
-        era_vuln    * 0.15 +  # FIP r=0.65 Y-to-Y; reliable baseline
-        barrel_vuln * 0.10 +  # barrel% allowed: real signal but very noisy (r²≈0.12)
-        whip_vuln   * 0.05    # WHIP: least sticky; reduced from 8%
+        k_vuln      * 0.40 +  # K% anchor — most stable predictor (trimmed from 0.45)
+        hh_vuln     * 0.28 +  # HardHit% — 2nd most predictive (bumped from 0.25)
+        era_vuln    * 0.18 +  # FIP/ERA — reliable baseline (bumped from 0.15)
+        barrel_vuln * 0.09 +  # barrel% allowed — noisy, keep small
+        whip_vuln   * 0.05    # WHIP — least sticky signal
     )
 
     # V1.3: Use per-team bullpen vuln (was fixed at 42.0 league avg for all teams)
@@ -3107,7 +3116,7 @@ def compute_final_score(
     bvp_weight_boost: float = 0.0,
 ) -> float:
     """
-    Final weighted composite. V1.7 research-calibrated weights (sum = 1.00).
+    Final weighted composite. V1.8 research-calibrated weights.
 
     Research sources:
     - FanGraphs barrel study: "Hitters supply the power — whether a pitcher
@@ -3115,54 +3124,62 @@ def compute_final_score(
     - Pitcher List K%/HH study: K% is #1 pitcher predictor (r=-0.375 next ERA);
       HardHit/9 is #2; barrel% allowed has r²≈0.12 (barely predictive)
     - FullCountProps: platoon +56 SLG effect is large and stable
-    - FiveThirtyEight Elo: 7-game streaks real but noisy — limit to 6%
-    - FTA BvP research: meaningful at 15+ AB; limit to 3%
+    - FiveThirtyEight Elo: 7-game streaks real but noisy — limit to 5%
+    - FTA BvP research: meaningful at 15+ AB; limit to 2%
 
-    Weight rationale:
-    - Batter 33%: still dominant; research confirms hitters supply the power
-    - Pitcher 25%: K% is #1 predictor; deserves more than 22%
-    - Platoon 8%: +56 SLG well-documented; most stable contextual signal
-    - Park 7%: Coors/Petco park effects are real (r≈0.85 Y-to-Y)
-    - Streak 6%: real but 7-game window is noisy; capped at 6%
-    - Vegas 5%: team total r=0.61 with scoring
-    - TTO 4%: 3rd TTO +17-20 wOBA is well-documented
+    V1.8 weight rationale:
+    - Pitcher 30%: primary matchup driver — wider scale now gives real separation
+    - Batter 28%: quality matters but shouldn't override bad matchup
+    - Platoon 12%: +56 SLG well-documented; most stable contextual signal
+    - Vegas 8%: team total r=0.61 with scoring — was underweighted at 5%
+    - Park 7%: Coors/Petco park effects real (r≈0.85 Y-to-Y)
+    - Streak 5%: real but 7-game window is noisy
+    - TTO 4%: 3rd TTO +17-20 wOBA documented
     - Weather 4%: wind 15+ mph = ~12% more HR
-    - Pitch matchup 4%: often neutral w/o Savant data
-    - BvP 3%: noisy below 40 AB; small but real with sufficient history
+    - Pitch matchup 2%: rarely has data; was placeholder at 4%
+    - BvP 2%: very small samples; dynamic boost preserved for "owns" cases
     - Lineup 1%: least predictive — 1 extra PA is marginal
     """
-    # V1.7 research-calibrated weights (sum = 1.00)
-    # Sources: FanGraphs barrel study, Pitcher List K%/HH research,
-    #          FullCountProps methodology, FiveThirtyEight Elo research
+    # V1.8 research-calibrated weights (sum ≈ 1.03, normalized below)
+    # Key changes from V1.7:
+    #   Batter  0.33→0.28: less dominance — matchup should drive picks, not career quality
+    #   Pitcher 0.25→0.30: primary matchup signal; wider scale now gives real separation
+    #   Platoon 0.08→0.12: most stable contextual signal (+56 SLG well-documented)
+    #   Vegas   0.05→0.08: implied total r=0.61 with scoring — was underweighted
+    #   Streak  0.06→0.05: 7-game window is noisy, trim
+    #   Matchup 0.04→0.02: pitch-type splits rarely available, reduce placeholder weight
+    #   BvP     0.03→0.02: very small samples, reduce (dynamic boost preserved)
     # Dynamic BvP boost: when batter "owns" this SP (elite career numbers),
-    # BvP weight rises from 0.03 → 0.07 and batter weight reduced to compensate.
-    _bvp_w = 0.03 + bvp_weight_boost           # 0.03 normally; 0.07 when "owns"
-    _bat_w = max(0.26, 0.33 - bvp_weight_boost) # 0.33 normally; 0.29 when "owns"
+    # BvP weight rises from 0.02 → 0.06 and batter weight reduced to compensate.
+    _bvp_w = 0.02 + bvp_weight_boost           # 0.02 normally; 0.06 when "owns"
+    _bat_w = max(0.24, 0.28 - bvp_weight_boost) # 0.28 normally; 0.24 when "owns"
     raw = (
-        batter_score        * _bat_w +  # dominant but not 2x pitcher (research: hitters supply power)
-        pitcher_vuln_score  * 0.25 +  # K% is #1 pitcher predictor; deserves more than 22%
-        platoon_score       * 0.08 +  # well-documented +56 SLG effect — most stable contextual signal
-        park_score          * 0.07 +  # Coors/Petco are real park effects (r≈0.85 Y-to-Y)
-        streak_score        * 0.06 +  # real but noisy; 7-game window limits confidence
-        vegas_score         * 0.05 +  # team total r=0.61 with scoring
-        tto_bonus           * 0.04 +  # 3rd TTO +17-20 wOBA is well-documented
-        weather_score       * 0.04 +  # wind 15+ mph = ~12% more HR
-        pitch_matchup_score * 0.04 +  # often neutral w/o Savant; keep small
-        bvp_score           * _bvp_w +  # 3% base; 7% when batter "owns" this SP
-        lineup_score        * 0.01    # least predictive; 1 extra PA is marginal
-    )  # sum = 1.00
-    # Calibration offset — based on actual column availability, not just source label.
-    # Partial Savant cache (xStats only, no statcast leaderboard) = same compression
-    # as full proxy mode. Check session state for which critical columns loaded.
+        batter_score        * _bat_w +  # batter quality: important but matchup matters more
+        pitcher_vuln_score  * 0.30 +  # pitcher matchup: primary pick driver (bumped from 0.25)
+        platoon_score       * 0.12 +  # platoon: most stable contextual signal (bumped from 0.08)
+        vegas_score         * 0.08 +  # implied total: r=0.61 with scoring (bumped from 0.05)
+        park_score          * 0.07 +  # park: Coors/Petco real (r≈0.85 Y-to-Y)
+        streak_score        * 0.05 +  # streak: real but noisy 7-game window (trimmed from 0.06)
+        tto_bonus           * 0.04 +  # TTO: 3rd TTO +17-20 wOBA documented
+        weather_score       * 0.04 +  # weather: wind 15+ mph = ~12% more HR
+        pitch_matchup_score * 0.02 +  # pitch matchup: often no data — keep small (trimmed from 0.04)
+        bvp_score           * _bvp_w +  # BvP: 2% base; 6% when batter "owns" this SP
+        lineup_score        * 0.01    # lineup: least predictive; 1 extra PA is marginal
+    )  # sum = 1.03 → normalize
+    raw = raw / 1.03  # normalize to true 0-100 scale
+    # V1.8 offset: reduced from 10→7 (less artificial inflation, more room above 80 for elite matchups)
+    # Proxy mode offset also reduced: 13→10
     import streamlit as _st
     _bat_src  = _st.session_state.get("_batting_source", "")
     _bat_cols = _st.session_state.get("batting_cols", [])
     # Full data = Barrel%, HH%, AND wRC+ all present
-    _has_full = ("Barrel%" in _bat_cols or "barrel_batted_rate" in _bat_cols) and                 ("Hard%" in _bat_cols or "hard_hit_percent" in _bat_cols) and                 ("wRC+" in _bat_cols)
+    _has_full = ("Barrel%" in _bat_cols or "barrel_batted_rate" in _bat_cols) and \
+                ("Hard%" in _bat_cols or "hard_hit_percent" in _bat_cols) and \
+                ("wRC+" in _bat_cols)
     # Proxy mode: source says mlbapi only, or statcast columns missing
     _is_proxy = ("mlbapi" in _bat_src or _bat_src in ("mlbapi_only",) or
                  "disk_cache_stale" in _bat_src or not _has_full)
-    _offset = 13.0 if _is_proxy else 10.0
+    _offset = 10.0 if _is_proxy else 7.0
     calibrated = raw + _offset
     return max(0, min(100, round(calibrated, 1)))
 
@@ -3194,15 +3211,15 @@ def get_tier(score: float, proxy_mode: bool = False) -> str:
     """
     if proxy_mode:
         # Proxy-data thresholds
-        if score >= 75:   return "🔒 TIER 1"
-        elif score >= 65: return "✅ TIER 2"
-        elif score >= 55: return "📊 TIER 3"
+        if score >= 73:   return "🔒 TIER 1"
+        elif score >= 63: return "✅ TIER 2"
+        elif score >= 53: return "📊 TIER 3"
         else:             return "❌ NO PLAY"
     else:
-        # Full Savant thresholds (original)
-        if score >= 80:   return "🔒 TIER 1"
-        elif score >= 70: return "✅ TIER 2"
-        elif score >= 60: return "📊 TIER 3"
+        # Full Savant thresholds — V1.8: shifted -2 to match reduced offset
+        if score >= 78:   return "🔒 TIER 1"
+        elif score >= 68: return "✅ TIER 2"
+        elif score >= 58: return "📊 TIER 3"
         else:             return "❌ NO PLAY"
 
 # ============================================================================
@@ -3575,7 +3592,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         except Exception:
             pass
     else:
-        log("⚠️ No Odds API key — Vegas signal (5% weight) zeroed out. Add key in sidebar for full model.", "warn")
+        log("⚠️ No Odds API key — Vegas signal (8% weight) zeroed out. Add key in sidebar for full model.", "warn")
 
     # ── 3. PROCESS EACH GAME ─────────────────────────────
     total_batters = 0
@@ -4234,14 +4251,17 @@ def display_leaderboard(plays: List[Dict]):
             with col_c:
                 st.markdown("**📊 Score Breakdown**")
                 sub_labels = {
-                    "🏏 Batter (40%)": p["sub_batter"],
-                    "⚾ Pitcher Vuln (22%)": p["sub_pitcher"],
-                    "🎯 Pitch Matchup (7%)": p.get("sub_matchup", 50),
-                    "🤚 Platoon (6%)": p["sub_platoon"],
-                    "📋 Lineup (4%)": p["sub_lineup"],
+                    "⚾ Pitcher Vuln (30%)": p["sub_pitcher"],
+                    "🏏 Batter (28%)": p["sub_batter"],
+                    "🤚 Platoon (12%)": p["sub_platoon"],
+                    "💰 Vegas (8%)": p["sub_vegas"],
                     "🏟️ Park (7%)": p["sub_park"],
+                    "📈 Streak (5%)": p.get("sub_streak", 50),
+                    "🔄 TTO (4%)": p.get("sub_tto", 50),
                     "🌤️ Weather (4%)": p["sub_weather"],
-                    "💰 Vegas (5%)": p["sub_vegas"],
+                    "🎯 Pitch Mix (2%)": p.get("sub_matchup", 50),
+                    "📊 BvP (2%)": p.get("sub_bvp", 50),
+                    "📋 Lineup (1%)": p["sub_lineup"],
                 }
                 matchup_lbl = p.get("matchup_label", "")
                 if matchup_lbl and matchup_lbl != "Pitch mix: avg splits":
@@ -7349,20 +7369,24 @@ Free tier (500/mo) is more than enough.
             **Scoring: 1B=1, 2B=2, 3B=3, HR=4**
             Walks, HBP, SB = 0 TB (never counted)
             
-            **Weights:**
-            - 🏏 Batter: 45% (xSLG, barrel, HH%, ISO, K%)
-            - ⚾ Pitcher Vuln: 30% (K%, barrel allowed, HH allowed)
-            - 🤚 Platoon: 6%
-            - 📋 Lineup: 4%
-            - 🏟️ Park: 7%
-            - 🌤️ Weather: 3%
-            - 💰 Vegas: 5%
+            **V1.8 Weights:**
+            - ⚾ Pitcher Vuln: 30% (K%, HH%, FIP, barrel, WHIP — wider scale)
+            - 🏏 Batter: 28% (xSLG, barrel, HH%, wRC+, ISO, K%)
+            - 🤚 Platoon: 12% (LHB vs RHP = +56 SLG documented)
+            - 💰 Vegas: 8% (implied total r=0.61 with scoring)
+            - 🏟️ Park: 7% (Coors/Petco effects real)
+            - 📈 Streak: 5% (last 7 games form)
+            - 🔄 TTO: 4% (times through order bonus)
+            - 🌤️ Weather: 4% (wind direction/speed)
+            - 🎯 Pitch Mix: 2%
+            - 📊 BvP: 2% (career vs SP)
+            - 📋 Lineup: 1%
             
-            **Tiers:**
-            - 🔒 Tier 1 (85+): Parlay anchor
-            - ✅ Tier 2 (75-84): Parlay filler
-            - 📊 Tier 3 (65-74): Single only
-            - ❌ Below 65: Fade
+            **V1.8 Tiers:**
+            - 🔒 Tier 1 (78+): Strong play, parlay anchor
+            - ✅ Tier 2 (68-77): Viable, parlay filler
+            - 📊 Tier 3 (58-67): Marginal, single only
+            - ❌ Below 58: Fade
             """)
         
         with st.expander("🔍 Debug: Data Quality Check"):
@@ -7644,8 +7668,8 @@ else:
         st.caption(f"v1.6 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
     # ── MAIN CONTENT ──────────────────────────────────────
-    st.title("⚾ MLB Total Bases Analyzer V1.6")
-    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.6: Pitch arsenal matchup + bat tracking + EV50")
+    st.title("⚾ MLB Total Bases Analyzer V1.8")
+    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.8: Pitcher-weighted matchup model | Wider signal range | No fake bat-tracking proxies")
     
     # Tabs
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
