@@ -1221,8 +1221,7 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     mlb_pit_cur = _fetch_mlb_pitching(season + 1)
     mlb_pit_pri = _fetch_mlb_pitching(season)
 
-    if _errs:
-        got_savant = not sc_pit_cur.empty or not sc_pit_pri.empty
+    got_savant = not sc_pit_cur.empty or not sc_pit_pri.empty
     got_mlb    = not mlb_pit_cur.empty or not mlb_pit_pri.empty
 
     if not got_savant and not got_mlb:
