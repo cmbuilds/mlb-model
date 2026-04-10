@@ -2457,42 +2457,42 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     if blast_raw >= 0.01:
         details["Blast%"] = f"{blast_raw*100:.1f}%"
 
-    # ── Sub-scores 0-100, calibrated to actual MLB distributions ──
+    # ── Sub-scores 0-100, Z-score normalized so LEAGUE AVG BATTER = 50 ──
+    # V1.8: Switched from range-based to Z-score style normalization.
+    # Old approach (e.g. barrel 0%→0, 7%→35, 20%→100) produced avg batter = ~38,
+    # compressing everyone upward and making elite vs avg indistinguishable.
+    # Z-score: avg = 50, ±1 MLB std dev = ±25 pts. Capped 0-100.
+    # League avg benchmarks (2024 MLB): xSLG=.398, wRC+=100, barrel=7%, HH=37%, K=22.8%, ISO=.165
 
-    # xSLG: .200=0, .398=50, .650=100
-    # Judge .708 → ~96, Avg .398 → 50, Weak .250 → ~13
-    xslg_score = (xslg - 0.200) / (0.650 - 0.200) * 100
-    xslg_score = max(0, min(100, xslg_score))
+    # xSLG: avg=.398, sd≈.080 → Judge(.708)=~148→100, avg→50, weak(.250)→~8
+    xslg_score = max(0, min(100, 50 + (xslg - 0.398) / 0.080 * 25))
 
-    # wRC+: 60=0, 100=50, 180=100
-    wrc_score = (wrc_plus - 60) / (180 - 60) * 100
-    wrc_score = max(0, min(100, wrc_score))
+    # wRC+: avg=100, sd≈35 → 200=~121→100, avg→50, 65→~-25→0
+    wrc_score = max(0, min(100, 50 + (wrc_plus - 100) / 35.0 * 25))
 
-    # Barrel%: 0%=0, 7%=44, 20%=100
-    barrel_score = barrel_rate / 0.20 * 100
-    barrel_score = max(0, min(100, barrel_score))
+    # Barrel%: avg=7%, sd≈4% → 20%=~131→100, avg→50, 2%=~19→19
+    barrel_score = max(0, min(100, 50 + (barrel_rate - 0.070) / 0.040 * 25))
 
-    # Hard hit%: 28%=0, 38%=50, 56%=100
-    hard_hit_score = (hard_hit - 0.28) / (0.56 - 0.28) * 100
-    hard_hit_score = max(0, min(100, hard_hit_score))
+    # Hard hit%: avg=37%, sd≈5.5% → 56%=~136→100, avg→50, 25%=~5→5
+    hard_hit_score = max(0, min(100, 50 + (hard_hit - 0.370) / 0.055 * 25))
 
-    # K rate INVERSE: 8%=100, 23%=50, 38%=0
-    k_score = max(0, min(100, (0.38 - k_rate) / (0.38 - 0.08) * 100))
+    # K rate INVERSE: avg=22.8%, sd≈6% → high K = low score
+    k_score = max(0, min(100, 50 - (k_rate - 0.228) / 0.060 * 25))
 
-    # ISO: .080=0, .165=50, .320=100
-    iso_score = (iso - 0.080) / (0.320 - 0.080) * 100
-    iso_score = max(0, min(100, iso_score))
+    # ISO: avg=.165, sd≈.065 → .320=~110→100, avg→50, .050→~6
+    iso_score = max(0, min(100, 50 + (iso - 0.165) / 0.065 * 25))
 
     # V1.8: When real Savant bat-tracking data available, add EV50/bat_speed/blast.
-    # When unavailable, do NOT fake them — derived proxies (ev50~xSLG, bat_speed~xSLG)
-    # are correlated duplicates that compress score variance without adding information.
+    # When unavailable, do NOT fake them — derived proxies are correlated with xSLG.
     has_bat_tracking = (ev50_raw >= 50 and bat_speed_raw >= 30 and blast_raw >= 0.01)
 
     if has_bat_tracking:
-        ev50_score = max(0, min(100, (ev50_raw - 88.0) / (103.0 - 88.0) * 100))
-        bat_speed_score = max(0, min(100, (bat_speed_raw - 65.0) / (78.0 - 65.0) * 100))
-        blast_score = max(0, min(100, (blast_raw - 0.10) / (0.35 - 0.10) * 100))
-        # Full Savant: distribute weight across all 9 signals
+        # EV50: avg≈95mph, sd≈3mph
+        ev50_score = max(0, min(100, 50 + (ev50_raw - 95.0) / 3.0 * 25))
+        # Bat speed: avg≈71mph, sd≈3mph
+        bat_speed_score = max(0, min(100, 50 + (bat_speed_raw - 71.0) / 3.0 * 25))
+        # Blast rate: avg≈21%, sd≈5%
+        blast_score = max(0, min(100, 50 + (blast_raw - 0.21) / 0.050 * 25))
         composite = (
             barrel_score    * 0.20 +
             xslg_score      * 0.16 +
@@ -2505,16 +2505,15 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
             k_score         * 0.02
         )  # sum = 1.00
     else:
-        # V1.8: No bat-tracking data — use 6 real signals only (sum = 1.00)
-        # barrel=0.26, xslg=0.24, hardhit=0.20, wrc=0.14, iso=0.10, k=0.06
+        # No bat-tracking: 6 real signals, sum = 1.00
         composite = (
-            barrel_score   * 0.26 +  # barrel% — strongest XBH/HR predictor
-            xslg_score     * 0.24 +  # xSLG — overall contact quality
-            hard_hit_score * 0.20 +  # hard hit% — sustainable contact
-            wrc_score      * 0.14 +  # wRC+ — full offensive context
-            iso_score      * 0.10 +  # ISO — raw power
-            k_score        * 0.06    # K% inverse — PA completion rate
-        )  # sum = 1.00
+            barrel_score   * 0.26 +
+            xslg_score     * 0.24 +
+            hard_hit_score * 0.20 +
+            wrc_score      * 0.14 +
+            iso_score      * 0.10 +
+            k_score        * 0.06
+        )
 
     return max(0, min(100, composite)), "Contact quality", details
 
@@ -2688,36 +2687,35 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
     fip      = f("fip",              4.10)
     whip     = f("whip",             1.30)
 
-    # K% INVERSE — high K pitcher = low vulnerability
-    # V1.8: ceiling tightened 0.35→0.32 (elite K arms score lower = correctly harder to hit)
-    # Scale: elite (32%)=0, avg (22%)=45, low (10%)=100
-    k_vuln = max(0, min(100, (0.32 - k_rate) / (0.32 - 0.10) * 100))
+    # ── Pitcher VULNERABILITY sub-scores — Z-score normalized, avg pitcher = 50 ──
+    # V1.8: Z-score style so league avg pitcher = 50 (hittable), ace = 20, mop-up = 80.
+    # High score = pitcher is hittable = good for batter TB prop.
+    # League avg benchmarks (2024): K%=22%, HH%=37%, barrel%=7%, FIP=4.2, WHIP=1.30
+    # Std deviations: K%≈5pp, HH%≈5.5pp, barrel%≈3pp, FIP≈0.80, WHIP≈0.20
 
-    # Hard hit allowed — V1.8: widen scale for more spread
-    # Low (29%)=0, Avg (37%)=47, High (52%)=100
-    hh_vuln = max(0, min(100, (hard_hit - 0.29) / (0.52 - 0.29) * 100))
+    # K% INVERSE: high K = low vulnerability. avg=22%, sd=5%
+    k_vuln = max(0, min(100, 50 - (k_rate - 0.220) / 0.050 * 25))
 
-    # Barrel% allowed — V1.8: widen ceiling 0.14→0.16
-    # Low (3%)=0, Avg (7%)=33, High (16%)=100
-    barrel_vuln = max(0, min(100, (barrel - 0.03) / (0.16 - 0.03) * 100))
+    # HH% allowed: high HH = high vulnerability. avg=37%, sd=5.5%
+    hh_vuln = max(0, min(100, 50 + (hard_hit - 0.370) / 0.055 * 25))
 
-    # ERA/FIP quality — V1.8: widen ceiling 7.0→8.5 for bad SP separation
-    # Elite (2.0)=0, Avg (4.2)=48, Bad (8.5)=100
+    # Barrel% allowed: high barrel = high vulnerability. avg=7%, sd=3%
+    barrel_vuln = max(0, min(100, 50 + (barrel - 0.070) / 0.030 * 25))
+
+    # FIP: high FIP = high vulnerability. avg=4.2, sd=0.80
     era_use = fip if fip > 0 else era
-    era_vuln = max(0, min(100, (era_use - 2.0) / (8.5 - 2.0) * 100))
+    era_vuln = max(0, min(100, 50 + (era_use - 4.20) / 0.80 * 25))
 
-    # WHIP — V1.8: wider scale for better spread
-    # Elite (0.85)=0, Avg (1.30)=47, Bad (2.10)=100
-    whip_vuln = max(0, min(100, (whip - 0.85) / (2.10 - 0.85) * 100))
+    # WHIP: high WHIP = high vulnerability. avg=1.30, sd=0.20
+    whip_vuln = max(0, min(100, 50 + (whip - 1.30) / 0.20 * 25))
 
-    # SP composite — V1.8 weights: HH% gets more (2nd best predictor), K% trimmed slightly
-    # Wider scales above mean a bad SP now scores ~65-75 vs elite SP ~20-25 (was 58 vs 32)
+    # SP composite — V1.8 weights
     sp_score = (
-        k_vuln      * 0.40 +  # K% anchor — most stable predictor (trimmed from 0.45)
-        hh_vuln     * 0.28 +  # HardHit% — 2nd most predictive (bumped from 0.25)
-        era_vuln    * 0.18 +  # FIP/ERA — reliable baseline (bumped from 0.15)
-        barrel_vuln * 0.09 +  # barrel% allowed — noisy, keep small
-        whip_vuln   * 0.05    # WHIP — least sticky signal
+        k_vuln      * 0.40 +  # K% — most stable pitcher predictor
+        hh_vuln     * 0.28 +  # HH% — 2nd most predictive
+        era_vuln    * 0.18 +  # FIP — reliable baseline
+        barrel_vuln * 0.09 +  # barrel% — noisy but real
+        whip_vuln   * 0.05    # WHIP — least sticky
     )
 
     # V1.3: Use per-team bullpen vuln (was fixed at 42.0 league avg for all teams)
@@ -3179,7 +3177,7 @@ def compute_final_score(
     # Proxy mode: source says mlbapi only, or statcast columns missing
     _is_proxy = ("mlbapi" in _bat_src or _bat_src in ("mlbapi_only",) or
                  "disk_cache_stale" in _bat_src or not _has_full)
-    _offset = 10.0 if _is_proxy else 7.0
+    _offset = 6.0 if _is_proxy else 3.0   # V1.8: Z-score centers at 50; small positive lean for over props
     calibrated = raw + _offset
     return max(0, min(100, round(calibrated, 1)))
 
@@ -4206,7 +4204,7 @@ def display_leaderboard(plays: List[Dict]):
     st.markdown("---")
     st.subheader("🏆 Top Plays — Full Breakdown")
     
-    top5 = [p for p in filtered if p["score"] >= 65][:5]
+    top5 = [p for p in filtered if p["score"] >= 58][:5]
     for i, p in enumerate(top5, 1):
         tier_color = "#00ff88" if p["tier"] == "🔒 TIER 1" else "#ffdd00" if p["tier"] == "✅ TIER 2" else "#ff8800"
         
@@ -4615,7 +4613,7 @@ def display_hr_plays(plays: List[Dict]):
                 st.write(f"**Total Bases Score:** {p['score']:.0f}")
             
             # SGP opportunity check
-            if p["score"] >= 65:
+            if p["score"] >= 58:
                 same_game = [op for op in hr_sorted if op["game_id"] == p["game_id"] and op["name"] != p["name"]]
                 if same_game:
                     st.success(f"⭐ SGP Opportunity: {p['name']} HR + {same_game[0]['name']} O1.5 TB in same game!")
@@ -4657,27 +4655,27 @@ def compute_batter_score_hits(statcast: Dict) -> Tuple[float, str, Dict]:
     details["wOBA"]  = f"{woba:.3f}"
     details["HH%"]   = f"{hard_hit*100:.1f}%"
 
-    # K rate: MOST critical for O0.5 — K = 0 hits, period
-    # 8%=100, 20%=60, 35%=0  (tighter range — even "good" K% matters)
-    k_score = max(0, min(100, (0.35 - k_rate) / (0.35 - 0.08) * 100))
+    # ── Z-score normalized sub-scores — avg batter = 50 on each metric ──
+    # V1.8: Matches O1.5 normalization approach. League avg = 50, ±1 sd = ±25 pts.
 
-    # wRC+: 60=0, 100=50, 170=100
-    wrc_score = max(0, min(100, (wrc_plus - 60) / (170 - 60) * 100))
+    # K rate INVERSE — most critical for O0.5. avg=22.8%, sd=6%
+    k_score = max(0, min(100, 50 - (k_rate - 0.228) / 0.060 * 25))
 
-    # BB%: 3%=0, 8%=50, 18%=100 (discipline = PA completion = more chances)
-    bb_score = max(0, min(100, (bb_rate - 0.03) / (0.18 - 0.03) * 100))
+    # wRC+: avg=100, sd=35
+    wrc_score = max(0, min(100, 50 + (wrc_plus - 100) / 35.0 * 25))
 
-    # wOBA: .250=0, .315=50, .420=100
-    woba_score = max(0, min(100, (woba - 0.250) / (0.420 - 0.250) * 100))
+    # BB%: avg=8.2%, sd=3% — plate discipline = more PA completions
+    bb_score = max(0, min(100, 50 + (bb_rate - 0.082) / 0.030 * 25))
 
-    # Hard hit: 28%=0, 38%=50, 56%=100 (hard contact harder to field = more hits)
-    hh_score = max(0, min(100, (hard_hit - 0.28) / (0.56 - 0.28) * 100))
+    # wOBA: avg=.315, sd=.040
+    woba_score = max(0, min(100, 50 + (woba - 0.315) / 0.040 * 25))
 
-    # xSLG: still matters but less — any hit counts
-    # .200=0, .398=50, .600=100
-    xslg_score = max(0, min(100, (xslg - 0.200) / (0.600 - 0.200) * 100))
+    # Hard hit%: avg=37%, sd=5.5%
+    hh_score = max(0, min(100, 50 + (hard_hit - 0.370) / 0.055 * 25))
 
-    # Weights: K% dominates, then contact/discipline metrics
+    # xSLG: avg=.398, sd=.080
+    xslg_score = max(0, min(100, 50 + (xslg - 0.398) / 0.080 * 25))
+
     composite = (
         k_score    * 0.30 +   # K% inverse — biggest driver (K = no hit guaranteed)
         wrc_score  * 0.22 +   # Overall offensive quality
@@ -4709,19 +4707,21 @@ def compute_pitcher_score_hits(statcast: Dict) -> Tuple[float, str]:
     whip    = f("whip",             1.30)
     hard_hit= f("hard_hit_allowed", 0.340)
 
-    # K% inverse — most critical for O0.5
-    # 10%=100, 22%=50, 35%=0
-    k_vuln = max(0, min(100, (0.35 - k_rate) / (0.35 - 0.10) * 100))
+    # ── Z-score normalized pitcher vulnerability — avg pitcher = 50 ──
+    # V1.8: Matches O1.5 normalization. High score = hittable = good for batter.
 
-    # WHIP: 0.90=0, 1.30=50, 1.80=100 (more baserunners = pitcher hittable)
-    whip_vuln = max(0, min(100, (whip - 0.90) / (1.80 - 0.90) * 100))
+    # K% INVERSE: avg=22%, sd=5%
+    k_vuln = max(0, min(100, 50 - (k_rate - 0.220) / 0.050 * 25))
 
-    # ERA/FIP: 2.0=0, 4.2=50, 7.0=100
+    # WHIP: avg=1.30, sd=0.20
+    whip_vuln = max(0, min(100, 50 + (whip - 1.30) / 0.20 * 25))
+
+    # ERA/FIP: avg=4.2, sd=0.80
     era_use = fip if fip > 0 else era
-    era_vuln = max(0, min(100, (era_use - 2.0) / (7.0 - 2.0) * 100))
+    era_vuln = max(0, min(100, 50 + (era_use - 4.20) / 0.80 * 25))
 
-    # Hard hit allowed (secondary for O0.5)
-    hh_vuln = max(0, min(100, (hard_hit - 0.26) / (0.50 - 0.26) * 100))
+    # Hard hit allowed: avg=37%, sd=5.5%
+    hh_vuln = max(0, min(100, 50 + (hard_hit - 0.370) / 0.055 * 25))
 
     composite = (
         k_vuln    * 0.50 +   # K% most critical for any-hit model
@@ -4812,7 +4812,7 @@ def compute_hits_score_for_player(
         tto_sc              * 0.04
     )
     # Calibration offset
-    score = max(0, min(100, round(raw + 15.0, 1)))
+    score = max(0, min(100, round(raw + 3.0, 1)))  # V1.8: Z-score centered; small positive lean
 
     if sp_tbd:
         score = min(score, 74)
@@ -4991,7 +4991,7 @@ def display_hits_tab(plays: List[Dict]):
     # Top plays detail
     st.markdown("---")
     st.subheader("🏆 Top O0.5 Plays — Full Breakdown")
-    top = [p for p in filtered if p["h_score"] >= 65][:5]
+    top = [p for p in filtered if p["h_score"] >= 58][:5]
     for i, p in enumerate(top, 1):
         with st.expander(f"{p['h_tier']} #{i}: {p['name']} ({p['team']}) — H-Score: {p['h_score']:.0f} | Prob: {p['h_prob']*100:.0f}% | O1.5 Score: {p['score']:.0f}"):
             col_a, col_b = st.columns(2)
