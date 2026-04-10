@@ -1660,11 +1660,11 @@ def get_batter_stats(player_name: str, mlb_id: str,
         "hard_hit_rate":    0.370,
         "soft_hit_rate":    0.155,
         "exit_velocity_avg":88.5,
-        "ev50":             95.0,    # hardest 50% avg EV — better power signal
+        "ev50":             0.0,     # 0 = not populated; real data from Savant only
         "sweet_spot_rate":  0.305,
         "tb_per_game":      0.85,
-        "bat_speed":        71.0,    # MLB avg bat speed mph (Savant bat tracking)
-        "blast_rate":       0.210,   # MLB avg blast rate ~21%
+        "bat_speed":        0.0,     # 0 = not populated; real data from Savant only
+        "blast_rate":       0.0,     # 0 = not populated; real data from Savant only
         "squared_up_rate":  0.265,   # MLB avg squared-up rate ~26.5%
         "sprint_speed":     27.0,    # MLB avg sprint speed ft/sec (Savant)
         # Pitch-type run values vs each pitch (league avg = 0.0 = neutral)
