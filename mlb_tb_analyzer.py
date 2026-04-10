@@ -1860,9 +1860,9 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         "k_rate_allowed":   0.228,
         "bb_rate_allowed":  0.082,
         "hard_hit_allowed": 0.360,
-        "barrel_allowed":   0.065,
+        "barrel_allowed":   0.070,
         "era":              4.20,
-        "fip":              4.10,
+        "fip":              4.20,
         "xfip":             4.10,
         "whip":             1.30,
         # Pitch arsenal mix — MLB avg usage (2025 approx)
@@ -2680,11 +2680,11 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
         try: return float(statcast.get(key, default))
         except: return float(default)
 
-    k_rate   = f("k_rate_allowed",   0.228)
-    hard_hit = f("hard_hit_allowed", 0.340)
-    barrel   = f("barrel_allowed",   0.065)
+    k_rate   = f("k_rate_allowed",   0.220)
+    hard_hit = f("hard_hit_allowed", 0.370)
+    barrel   = f("barrel_allowed",   0.070)
     era      = f("era",              4.20)
-    fip      = f("fip",              4.10)
+    fip      = f("fip",              4.20)
     whip     = f("whip",             1.30)
 
     # ── Pitcher VULNERABILITY sub-scores — Z-score normalized, avg pitcher = 50 ──
@@ -4383,7 +4383,7 @@ def display_parlay_builder(plays: List[Dict], unit_size: int = 25):
         # Re-score as hits model
         hits_pool = []
         for p in plays:
-            pitcher_mock = {"k_rate_allowed": 0.228, "era": 4.20, "fip": 4.10, "whip": 1.30, "hard_hit_allowed": 0.340}
+            pitcher_mock = {"k_rate_allowed": 0.220, "era": 4.20, "fip": 4.20, "whip": 1.30, "hard_hit_allowed": 0.340}
             try:
                 pit_label = p.get("pitcher_label", "")
                 if "K%:" in pit_label:
@@ -4413,7 +4413,7 @@ def display_parlay_builder(plays: List[Dict], unit_size: int = 25):
         # Build mixed pool: O1.5 eligible + O0.5 eligible
         hits_pool = []
         for p in plays:
-            pitcher_mock = {"k_rate_allowed": 0.228, "era": 4.20, "fip": 4.10, "whip": 1.30, "hard_hit_allowed": 0.340}
+            pitcher_mock = {"k_rate_allowed": 0.220, "era": 4.20, "fip": 4.20, "whip": 1.30, "hard_hit_allowed": 0.340}
             try:
                 pit_label = p.get("pitcher_label", "")
                 if "K%:" in pit_label:
@@ -4701,11 +4701,11 @@ def compute_pitcher_score_hits(statcast: Dict) -> Tuple[float, str]:
         try: return float(statcast.get(key, default))
         except: return float(default)
 
-    k_rate  = f("k_rate_allowed",   0.228)
+    k_rate  = f("k_rate_allowed",   0.220)
     era     = f("era",              4.20)
-    fip     = f("fip",              4.10)
+    fip     = f("fip",              4.20)
     whip    = f("whip",             1.30)
-    hard_hit= f("hard_hit_allowed", 0.340)
+    hard_hit= f("hard_hit_allowed", 0.370)
 
     # ── Z-score normalized pitcher vulnerability — avg pitcher = 50 ──
     # V1.8: Matches O1.5 normalization. High score = hittable = good for batter.
@@ -4854,8 +4854,8 @@ def display_hits_tab(plays: List[Dict]):
         # Re-use the pre-loaded stats from the original run
         # Build a minimal statcast dict from stored pitcher label
         pitcher_mock = {
-            "k_rate_allowed": 0.228, "era": 4.20, "fip": 4.10,
-            "whip": 1.30, "hard_hit_allowed": 0.340,
+            "k_rate_allowed": 0.220, "era": 4.20, "fip": 4.20,
+            "whip": 1.30, "hard_hit_allowed": 0.370,
         }
         # Parse pitcher label back into stats if available
         pit_label = p.get("pitcher_label", "")
@@ -5239,7 +5239,7 @@ def compute_fd_projection(statcast: Dict, pitcher_statcast: Dict,
 
     # Pitcher quality adjustment
     pit_k    = float(pitcher_statcast.get("k_rate_allowed", 0.228))
-    pit_hh   = float(pitcher_statcast.get("hard_hit_allowed", 0.340))
+    pit_hh   = float(pitcher_statcast.get("hard_hit_allowed", 0.370))
     pit_fip  = float(pitcher_statcast.get("fip", 4.10))
     pit_adj  = 1.0 + (pit_fip - 4.0) * 0.04  # FIP above 4 = better for batter
     pit_k_adj = 1.0 - (pit_k - 0.228) * 1.5  # higher K = fewer hits
@@ -5576,8 +5576,8 @@ Cal Raleigh, C, 3200
             "sprint_speed":   p.get("sprint_speed",    27.0),
         }
         pit_mock = {
-            "k_rate_allowed":  0.228,
-            "hard_hit_allowed":0.340,
+            "k_rate_allowed":  0.220,
+            "hard_hit_allowed":0.370,
             "fip":             4.10,
         }
         try:
@@ -6346,7 +6346,7 @@ def display_prizepicks_tab(plays: List[Dict]):
         }
         pit_mock = {
             "k_rate_allowed":   0.228,
-            "fip":              4.10,
+            "fip":              4.20,
             "_matchup_score":   p.get("sub_matchup", 50.0),  # V1.6
         }
         try:
