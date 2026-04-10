@@ -3209,15 +3209,15 @@ def get_tier(score: float, proxy_mode: bool = False) -> str:
     """
     if proxy_mode:
         # Proxy-data thresholds
-        if score >= 73:   return "🔒 TIER 1"
-        elif score >= 63: return "✅ TIER 2"
-        elif score >= 53: return "📊 TIER 3"
+        if score >= 75:   return "🔒 TIER 1"
+        elif score >= 65: return "✅ TIER 2"
+        elif score >= 55: return "📊 TIER 3"
         else:             return "❌ NO PLAY"
     else:
         # Full Savant thresholds — V1.8: shifted -2 to match reduced offset
-        if score >= 78:   return "🔒 TIER 1"
-        elif score >= 68: return "✅ TIER 2"
-        elif score >= 58: return "📊 TIER 3"
+        if score >= 80:   return "🔒 TIER 1"
+        elif score >= 70: return "✅ TIER 2"
+        elif score >= 60: return "📊 TIER 3"
         else:             return "❌ NO PLAY"
 
 # ============================================================================
@@ -4204,7 +4204,7 @@ def display_leaderboard(plays: List[Dict]):
     st.markdown("---")
     st.subheader("🏆 Top Plays — Full Breakdown")
     
-    top5 = [p for p in filtered if p["score"] >= 58][:5]
+    top5 = [p for p in filtered if p["score"] >= 60][:5]
     for i, p in enumerate(top5, 1):
         tier_color = "#00ff88" if p["tier"] == "🔒 TIER 1" else "#ffdd00" if p["tier"] == "✅ TIER 2" else "#ff8800"
         
@@ -4613,7 +4613,7 @@ def display_hr_plays(plays: List[Dict]):
                 st.write(f"**Total Bases Score:** {p['score']:.0f}")
             
             # SGP opportunity check
-            if p["score"] >= 58:
+            if p["score"] >= 60:
                 same_game = [op for op in hr_sorted if op["game_id"] == p["game_id"] and op["name"] != p["name"]]
                 if same_game:
                     st.success(f"⭐ SGP Opportunity: {p['name']} HR + {same_game[0]['name']} O1.5 TB in same game!")
@@ -4752,11 +4752,11 @@ def score_to_prob_hits(score: float) -> float:
 
 def get_tier_hits(score: float) -> str:
     """O0.5 tiers — calibrated to actual score distribution."""
-    if score >= 78:
+    if score >= 80:
         return "🔒 SAFE+"
-    elif score >= 68:
+    elif score >= 70:
         return "✅ SAFE"
-    elif score >= 58:
+    elif score >= 60:
         return "📊 LIKELY"
     else:
         return "❌ SKIP"
@@ -4991,7 +4991,7 @@ def display_hits_tab(plays: List[Dict]):
     # Top plays detail
     st.markdown("---")
     st.subheader("🏆 Top O0.5 Plays — Full Breakdown")
-    top = [p for p in filtered if p["h_score"] >= 58][:5]
+    top = [p for p in filtered if p["h_score"] >= 60][:5]
     for i, p in enumerate(top, 1):
         with st.expander(f"{p['h_tier']} #{i}: {p['name']} ({p['team']}) — H-Score: {p['h_score']:.0f} | Prob: {p['h_prob']*100:.0f}% | O1.5 Score: {p['score']:.0f}"):
             col_a, col_b = st.columns(2)
