@@ -7669,6 +7669,10 @@ else:
     
     # ── MAIN CONTENT ──────────────────────────────────────
     st.title("⚾ MLB Total Bases Analyzer V1.8")
+    # V1.8 build verification — remove after confirming deployment
+    import hashlib as _hlib
+    _sig = _hlib.md5(b"zscore_v18_offset6p5").hexdigest()[:6]
+    st.caption(f"🔑 Build sig: {_sig} — if this shows b7ba05 the Z-score V1.8 model is live")
     st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.8: Pitcher-weighted matchup model | Wider signal range | No fake bat-tracking proxies")
     
     # Tabs
