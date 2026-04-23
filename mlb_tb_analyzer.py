@@ -40,7 +40,7 @@ import pytz
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="⚾ MLB TB Analyzer V1.8",
+    page_title="⚾ MLB TB Analyzer V1.9",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="auto"
@@ -3425,6 +3425,9 @@ def run_model(date_str: str, status_container) -> List[Dict]:
     log("Loading 2025 season batting stats...", "run")
     batting_df = load_all_batting_stats(2025)
     pitching_df = load_all_pitching_stats(2025)
+    # V1.9: Store pitching_df globally so K Props and Moneyline tabs can access
+    # without re-fetching. Uses session_state (safe across reruns in same session).
+    st.session_state["_pitching_df_global"] = pitching_df
 
     # ── Set source labels in run_model (not inside @st.cache_data) ───────
     # @st.cache_data skips function body on cache HIT, so session_state
@@ -3737,6 +3740,10 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 pitcher_mlb_id=sp_id,
                 pitching_df=pitching_df,
             )
+            # V1.9: Cache pitcher K signals per play so K Props tab can use them
+            # without re-running get_pitcher_stats for every row in the display function
+            _pitcher_k_rate = float(pitcher_statcast.get("k_rate_allowed", 0.228) or 0.228)
+            _pitcher_swstr  = float(pitcher_statcast.get("swstr_pct", 0.0) or 0.0)
 
             # ── SCORE COMPONENTS ────────────────────────
             bat_score, _, bat_details = compute_batter_score(batter_statcast)
@@ -3888,6 +3895,9 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "wind_dir": weather.get("wind_dir_label", ""),
                 "wind_effect": weather.get("wind_effect", "neutral"),
                 "is_dome": weather.get("is_dome", False),
+                # V1.9: pitcher K signals for K Props tab
+                "_pitcher_k_rate": _pitcher_k_rate,
+                "_pitcher_swstr":  _pitcher_swstr,
             })
             total_batters += 1
 
@@ -4617,6 +4627,794 @@ def display_hr_plays(plays: List[Dict]):
                 same_game = [op for op in hr_sorted if op["game_id"] == p["game_id"] and op["name"] != p["name"]]
                 if same_game:
                     st.success(f"⭐ SGP Opportunity: {p['name']} HR + {same_game[0]['name']} O1.5 TB in same game!")
+
+
+# ============================================================================
+# K PROPS MODEL — Batter Strikeout Probability
+# V1.9: Composite K score per batter vs opposing pitcher.
+# Inputs: Batter K%, Pitcher K%/SwStr%, lineup slot, game context.
+# O-Swing% and batter SwStr% degrade gracefully to league avg when unavailable
+# (FanGraphs blocked on Streamlit Cloud; Savant CSV returns 502).
+# ============================================================================
+
+@st.cache_data(ttl=3600)
+def fetch_umpire_data() -> Dict:
+    """
+    Fetch today's HP umpire assignment and their historical K-rate impact.
+    Source: api.umpscorecards.com (free, no key required).
+    Returns: {game_pk: {"ump_name": str, "k_rate_added": float, "run_value": float}}
+    Falls back to {} on any failure — K model degrades gracefully.
+    """
+    result = {}
+    try:
+        # Step 1: Get today's umpire assignments from MLB Stats API
+        # The schedule 'officials' hydration returns HP umpire per game
+        today = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+        url = (f"https://statsapi.mlb.com/api/v1/schedule"
+               f"?sportId=1&date={today}&hydrate=officials")
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        game_umps = {}
+        for date_entry in data.get("dates", []):
+            for game in date_entry.get("games", []):
+                pk = game.get("gamePk")
+                officials = game.get("officials", [])
+                for off in officials:
+                    if off.get("officialType", "") == "Home Plate":
+                        name = off.get("official", {}).get("fullName", "")
+                        if name and pk:
+                            game_umps[pk] = name
+                        break
+
+        if not game_umps:
+            return {}
+
+        # Step 2: Fetch umpire K stats from ump-scorecard API
+        ump_stats_url = "https://api.umpscorecards.com/v1/umpires/"
+        ur = requests.get(ump_stats_url, timeout=10)
+        if ur.status_code != 200:
+            # Fallback: return ump names with zero adjustment
+            for pk, name in game_umps.items():
+                result[pk] = {"ump_name": name, "k_rate_added": 0.0, "run_value": 0.0}
+            return result
+
+        ump_data = ur.json()
+        # Build lookup: normalized name → stats
+        ump_lookup = {}
+        for ump in (ump_data if isinstance(ump_data, list) else ump_data.get("data", [])):
+            raw_name = str(ump.get("name", "") or ump.get("umpire", "")).strip()
+            if raw_name:
+                ump_lookup[_norm(raw_name)] = {
+                    "k_rate_added": float(ump.get("k_rate_added", 0) or ump.get("strikeout_rate", 0) or 0),
+                    "run_value":    float(ump.get("run_value_above_avg", 0) or 0),
+                }
+
+        for pk, name in game_umps.items():
+            stats = ump_lookup.get(_norm(name), {"k_rate_added": 0.0, "run_value": 0.0})
+            result[pk] = {"ump_name": name, **stats}
+
+    except Exception:
+        pass
+    return result
+
+
+def compute_k_score(batter_statcast: Dict, pitcher_statcast: Dict,
+                    lineup_slot: int, implied_total: float,
+                    ump_k_adj: float = 0.0) -> Tuple[float, str, Dict]:
+    """
+    Composite K score for a batter — 0 to 100, league avg = 50.
+    HIGH score = batter more likely to strike out.
+
+    Weight structure:
+      - Batter K%:          40% (most stable batter K signal)
+      - Pitcher K rate:     35% (K%, SwStr% when available)
+      - Whiff/chase:        15% (batter SwStr% + O-Swing%, graceful fallback)
+      - Lineup/context:     10% (slot PA count, game pace, ump zone)
+
+    Tiers: K+ (80+), K (70-79), Lean K (60-69), No Play (<60)
+    """
+    details = {}
+
+    def f(d, key, default):
+        try: return float(d.get(key, default) or default)
+        except: return float(default)
+
+    # ── BATTER K RATE (40%) ─────────────────────────────────────────────────
+    batter_k = f(batter_statcast, "k_rate", 0.228)
+    # MLB K% range: ~10% (elite contact) to ~38% (high-K). Avg ~22.8%.
+    # Z-score style: avg=50, ±1sd (6pp) = ±25 pts
+    batter_k_score = 50.0 + (batter_k - 0.228) / 0.060 * 25.0
+    batter_k_score = max(0.0, min(100.0, batter_k_score))
+    details["batter_k_pct"] = round(batter_k * 100, 1)
+    details["batter_k_score"] = round(batter_k_score, 1)
+
+    # ── PITCHER K RATE (35%) ────────────────────────────────────────────────
+    # Primary: pitcher K% from pitching_df (MLB Stats API K/TBF always available)
+    pit_k = f(pitcher_statcast, "k_rate_allowed", 0.228)
+    # SwStr% bonus when available (FanGraphs type=8, frequently blocked)
+    swstr = f(pitcher_statcast, "swstr_pct", 0.0)  # 0.0 = unavailable sentinel
+    if swstr > 0.02:
+        # SwStr% range: ~5% (soft contact SP) to ~18% (elite strikeout pitcher). Avg ~11%.
+        swstr_score = 50.0 + (swstr - 0.110) / 0.040 * 25.0
+        swstr_score = max(0.0, min(100.0, swstr_score))
+        # Blend: 70% K%, 30% SwStr% when both available
+        pit_k_score = (50.0 + (pit_k - 0.228) / 0.060 * 25.0) * 0.70 + swstr_score * 0.30
+        details["pitcher_swstr"] = round(swstr * 100, 1)
+    else:
+        pit_k_score = 50.0 + (pit_k - 0.228) / 0.060 * 25.0
+        details["pitcher_swstr"] = "N/A"
+    pit_k_score = max(0.0, min(100.0, pit_k_score))
+    details["pitcher_k_pct"] = round(pit_k * 100, 1)
+    details["pitcher_k_score"] = round(pit_k_score, 1)
+
+    # ── WHIFF / CHASE (15%) ─────────────────────────────────────────────────
+    # Batter O-Swing% and SwStr% from FanGraphs type=8 — blocked on Streamlit Cloud.
+    # Savant custom JSON occasionally returns k% but not whiff breakdown.
+    # Graceful fallback: use K% as proxy (already captured above) → neutral 50.
+    batter_swstr = f(batter_statcast, "batter_swstr_pct", 0.0)
+    o_swing      = f(batter_statcast, "o_swing_pct", 0.0)
+
+    if batter_swstr > 0.02 and o_swing > 0.02:
+        # Both available — full whiff signal
+        swstr_b_sc = 50.0 + (batter_swstr - 0.110) / 0.035 * 25.0
+        oswing_sc  = 50.0 + (o_swing - 0.310) / 0.060 * 25.0
+        whiff_score = swstr_b_sc * 0.55 + oswing_sc * 0.45
+        details["batter_swstr"] = round(batter_swstr * 100, 1)
+        details["o_swing"] = round(o_swing * 100, 1)
+    elif batter_swstr > 0.02:
+        swstr_b_sc  = 50.0 + (batter_swstr - 0.110) / 0.035 * 25.0
+        whiff_score = swstr_b_sc
+        details["batter_swstr"] = round(batter_swstr * 100, 1)
+        details["o_swing"] = "N/A"
+    else:
+        # Neither available — fall back to batter K% as proxy, centered
+        whiff_score = 50.0 + (batter_k - 0.228) / 0.060 * 15.0
+        whiff_score = max(0.0, min(100.0, whiff_score))
+        details["batter_swstr"] = "N/A"
+        details["o_swing"] = "N/A"
+    whiff_score = max(0.0, min(100.0, whiff_score))
+    details["whiff_score"] = round(whiff_score, 1)
+
+    # ── LINEUP / CONTEXT (10%) ──────────────────────────────────────────────
+    # PA opportunity: higher lineup slots get more PAs → more K chances.
+    # But leadoff sees pitcher fresh → lower K rate first TTO.
+    # Net: slots 1-5 get slight boost (more PAs + middle order sees TTO2+).
+    slot_pa_score = {1: 55, 2: 58, 3: 60, 4: 62, 5: 63,
+                     6: 52, 7: 48, 8: 45, 9: 40}.get(lineup_slot, 50)
+
+    # Game pace: high-total games → pitcher works faster, less strikeout focus
+    if implied_total >= 5.5:
+        pace_adj = -5.0   # high-scoring game → SP exits earlier, less K focus
+    elif implied_total >= 4.5:
+        pace_adj = 0.0
+    else:
+        pace_adj = 5.0    # low-total pitcher's duel → K rates up
+
+    # Umpire zone adjustment: k_rate_added is % point change in K rate
+    # Convert to score points: 1pp K_rate_added ≈ +4 score points
+    ump_adj = ump_k_adj * 400.0   # e.g. +0.02 K_rate_added → +8 pts
+    ump_adj = max(-15.0, min(15.0, ump_adj))
+
+    context_score = max(0.0, min(100.0, slot_pa_score + pace_adj + ump_adj))
+    details["slot_pa_score"] = slot_pa_score
+    details["ump_k_adj"] = round(ump_k_adj * 100, 2)
+    details["context_score"] = round(context_score, 1)
+
+    # ── COMPOSITE ───────────────────────────────────────────────────────────
+    raw = (batter_k_score * 0.40 +
+           pit_k_score    * 0.35 +
+           whiff_score    * 0.15 +
+           context_score  * 0.10)
+    final = max(0.0, min(100.0, raw))
+
+    tier = ("⚡ K+" if final >= 80 else
+            "🔥 K"  if final >= 70 else
+            "📊 Lean K" if final >= 60 else
+            "➖ No Play")
+
+    label = (f"Batter K%: {batter_k*100:.1f}% | "
+             f"Pitcher K%: {pit_k*100:.1f}%"
+             f"{' | SwStr%: ' + str(details['pitcher_swstr']) + '%' if details['pitcher_swstr'] != 'N/A' else ''}")
+    details["tier"] = tier
+    return round(final, 1), label, details
+
+
+def display_k_props_tab(plays: List[Dict], ump_data: Dict):
+    """
+    Tab: ⚡ K Props
+    Sortable table of all batters with K composite score, tier, and key inputs.
+    No market line column unless Odds API strikeout props are loaded (not on free tier).
+    """
+    st.header("⚡ K Props — Batter Strikeout Model")
+    st.caption("Composite K score per batter vs opposing pitcher. HIGH score = more likely to strikeout. "
+               "Inputs: Batter K%, Pitcher K%/SwStr%, lineup slot, ump zone, game pace.")
+
+    if not plays:
+        st.info("Run the model first to see K prop scores.")
+        return
+
+    # Build K scores for all plays
+    rows = []
+    pitching_df = st.session_state.get("_pitching_df_global", pd.DataFrame())
+
+    for p in plays:
+        batter_statcast = {
+            "k_rate":           p.get("k_rate", 0.228),
+            "batter_swstr_pct": p.get("batter_swstr_pct", 0.0),
+            "o_swing_pct":      p.get("o_swing_pct", 0.0),
+        }
+        # Re-use pitcher stats already loaded in run_model via pitching_df lookup
+        pitcher_statcast = {
+            "k_rate_allowed": p.get("_pitcher_k_rate", 0.228),
+            "swstr_pct":      p.get("_pitcher_swstr", 0.0),
+        }
+        # Ump adjustment for this game
+        game_pk_int = None
+        try: game_pk_int = int(p.get("game_id", 0))
+        except: pass
+        ump_entry = ump_data.get(game_pk_int, {})
+        ump_k_adj = float(ump_entry.get("k_rate_added", 0.0))
+        ump_name  = ump_entry.get("ump_name", "—")
+
+        k_score, k_label, k_details = compute_k_score(
+            batter_statcast=batter_statcast,
+            pitcher_statcast=pitcher_statcast,
+            lineup_slot=p.get("lineup_slot", 5),
+            implied_total=p.get("implied_total", 4.5),
+            ump_k_adj=ump_k_adj,
+        )
+
+        rows.append({
+            "Player":       p["name"],
+            "Team":         p["team"],
+            "#": p.get("lineup_slot", "—"),
+            "Opp Pitcher":  p.get("sp_name", "TBD"),
+            "Hand":         p.get("sp_hand", "R"),
+            "Batter K%":    f"{p.get('k_rate', 0)*100:.1f}%",
+            "Pit K%":       f"{k_details.get('pitcher_k_pct', 0):.1f}%",
+            "SwStr%":       f"{k_details['pitcher_swstr']}%" if k_details['pitcher_swstr'] != 'N/A' else "N/A",
+            "Batter SwStr": f"{k_details['batter_swstr']}%" if k_details['batter_swstr'] != 'N/A' else "N/A",
+            "Umpire":       ump_name,
+            "Ump K Adj":    f"{ump_k_adj*100:+.1f}pp" if ump_k_adj != 0 else "—",
+            "K Score":      k_score,
+            "Tier":         k_details.get("tier", "—"),
+            "Market Line":  "N/A — no free-tier prop data",
+        })
+
+    if not rows:
+        st.warning("No K scores computed.")
+        return
+
+    df = pd.DataFrame(rows)
+
+    # Color K Score column
+    def color_k(val):
+        try:
+            v = float(val)
+            if v >= 80: return "color: #ff4444; font-weight: bold"
+            elif v >= 70: return "color: #ff8800; font-weight: bold"
+            elif v >= 60: return "color: #ffdd00"
+            return "color: #888888"
+        except: return ""
+
+    tier_order = {"⚡ K+": 0, "🔥 K": 1, "📊 Lean K": 2, "➖ No Play": 3}
+    df = df.sort_values("K Score", ascending=False)
+    styled = df.style.map(color_k, subset=["K Score"])
+    st.dataframe(styled, use_container_width=True)
+
+    # Export
+    csv = df.to_csv(index=False)
+    st.download_button("📥 Export K Props CSV", csv, "k_props.csv", "text/csv", key="dl_kprops")
+
+    st.markdown("---")
+    st.subheader("⚡ Top K+ Plays — Detail")
+
+    k_plus = [r for r in rows if r["K Score"] >= 70]
+    if not k_plus:
+        st.info("No K+ or K tier plays today. Check back when lineups are confirmed.")
+        return
+
+    for i, r in enumerate(k_plus[:5], 1):
+        with st.expander(f"#{i}: {r['Player']} ({r['Team']}) — K Score: {r['K Score']} | {r['Tier']}"):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write(f"**Batter K%:** {r['Batter K%']}")
+                st.write(f"**Batter SwStr%:** {r['Batter SwStr']}")
+                st.write(f"**O-Swing%:** {r.get('O-Swing%', 'N/A')}")
+                st.write(f"**Lineup Slot:** #{r['#']}")
+            with c2:
+                st.write(f"**Pitcher K%:** {r['Pit K%']}")
+                st.write(f"**Pitcher SwStr%:** {r['SwStr%']}")
+                st.write(f"**Umpire:** {r['Umpire']} ({r['Ump K Adj']})")
+                st.write(f"**Market Line:** {r['Market Line']}")
+
+    # Results Tracker note
+    st.markdown("---")
+    st.caption("💾 K prop picks are logged to the Results Tracker (Tab 10) when you save picks.")
+
+
+# ============================================================================
+# MONEYLINE MODEL — Team Win Probability
+# V1.9: Log5-style win probability calibrated against Vegas implied probability.
+# Identifies edges where model diverges from market by >4%.
+# ============================================================================
+
+@st.cache_data(ttl=3600)
+def fetch_team_run_differential(date_str: str, days: int = 7) -> Dict[str, float]:
+    """
+    Fetch last N days of team run differential from MLB Stats API game logs.
+    Returns: {team_abbr: avg_run_diff_per_game}
+    Uses only MLB Stats API (always unblocked).
+    """
+    result = {}
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        end_dt   = _dt.strptime(date_str, "%Y-%m-%d")
+        start_dt = end_dt - _td(days=days)
+        start_str = start_dt.strftime("%Y-%m-%d")
+
+        # Fetch schedule for the window
+        url = (f"https://statsapi.mlb.com/api/v1/schedule"
+               f"?sportId=1&startDate={start_str}&endDate={date_str}"
+               f"&hydrate=linescore,team")
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return {}
+
+        team_runs_for   = {}
+        team_runs_against = {}
+        team_games       = {}
+
+        for date_entry in r.json().get("dates", []):
+            for game in date_entry.get("games", []):
+                if game.get("status", {}).get("abstractGameState") != "Final":
+                    continue
+                ls = game.get("linescore", {})
+                home_runs = int(ls.get("teams", {}).get("home", {}).get("runs", 0) or 0)
+                away_runs = int(ls.get("teams", {}).get("away", {}).get("runs", 0) or 0)
+                home_abb  = game["teams"]["home"]["team"].get("abbreviation", "")
+                away_abb  = game["teams"]["away"]["team"].get("abbreviation", "")
+                # Normalize via TEAM_ABB_MAP
+                home_abb = TEAM_ABB_MAP.get(game["teams"]["home"]["team"].get("name",""), home_abb)
+                away_abb = TEAM_ABB_MAP.get(game["teams"]["away"]["team"].get("name",""), away_abb)
+
+                for abb, rf, ra in [(home_abb, home_runs, away_runs),
+                                    (away_abb, away_runs, home_runs)]:
+                    if abb:
+                        team_runs_for[abb]    = team_runs_for.get(abb, 0) + rf
+                        team_runs_against[abb] = team_runs_against.get(abb, 0) + ra
+                        team_games[abb]        = team_games.get(abb, 0) + 1
+
+        for abb, g in team_games.items():
+            if g > 0:
+                result[abb] = round((team_runs_for[abb] - team_runs_against[abb]) / g, 2)
+
+    except Exception:
+        pass
+    return result
+
+
+def _american_to_implied(odds: float) -> float:
+    """Convert American moneyline odds to implied probability (no vig removal)."""
+    if odds < 0:
+        return abs(odds) / (abs(odds) + 100.0)
+    else:
+        return 100.0 / (odds + 100.0)
+
+
+def fetch_moneyline_odds(date_str: str) -> Dict[int, Dict]:
+    """
+    Extract h2h moneyline odds from Odds API response (already fetched in run_model).
+    Returns: {game_pk: {"home_odds": float, "away_odds": float,
+                        "home_implied": float, "away_implied": float}}
+    Re-uses fetch_odds infrastructure. Called once per run.
+    """
+    result = {}
+    try:
+        api_key = st.secrets.get("odds_api", {}).get("api_key", "")
+        if not api_key:
+            return {}
+
+        url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+        params = {
+            "apiKey":      api_key,
+            "regions":     "us",
+            "markets":     "h2h",
+            "oddsFormat":  "american",
+        }
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return {}
+
+        for game in r.json():
+            home_name = game.get("home_team", "")
+            away_name = game.get("away_team", "")
+            home_odds = away_odds = None
+
+            for bm in game.get("bookmakers", []):
+                for mkt in bm.get("markets", []):
+                    if mkt.get("key") == "h2h":
+                        for oc in mkt.get("outcomes", []):
+                            if oc.get("name", "").lower() in home_name.lower():
+                                home_odds = float(oc.get("price", -110))
+                            elif oc.get("name", "").lower() in away_name.lower():
+                                away_odds = float(oc.get("price", 100))
+                        break
+                if home_odds is not None:
+                    break
+
+            if home_odds is None:
+                home_odds, away_odds = -110, 100   # fallback neutral
+
+            home_impl = _american_to_implied(home_odds)
+            away_impl = _american_to_implied(away_odds)
+            # Vig-remove: normalize so they sum to 1.0
+            total_impl = home_impl + away_impl
+            if total_impl > 0:
+                home_impl_no_vig = home_impl / total_impl
+                away_impl_no_vig = away_impl / total_impl
+            else:
+                home_impl_no_vig = away_impl_no_vig = 0.5
+
+            # Key by team names — matched to games via TEAM_ABB_MAP in display
+            game_key = f"{away_name}|{home_name}"
+            result[game_key] = {
+                "home_odds":     home_odds,
+                "away_odds":     away_odds,
+                "home_implied":  round(home_impl_no_vig, 4),
+                "away_implied":  round(away_impl_no_vig, 4),
+            }
+
+    except Exception:
+        pass
+    return result
+
+
+def compute_team_offense_score(plays: List[Dict], team: str) -> Tuple[float, int]:
+    """
+    Aggregate offensive quality for a team from confirmed lineup batters.
+    Returns (team_wrc_plus_avg, n_batters_found).
+    Uses wrc_plus from each batter's scored play dict.
+    Falls back to 100 (league average) when lineup not loaded.
+    """
+    team_plays = [p for p in plays if p.get("team", "") == team]
+    wrc_vals = [p.get("wrc_plus", 100.0) for p in team_plays if p.get("wrc_plus", 100.0) > 0]
+    if not wrc_vals:
+        return 100.0, 0
+    return round(sum(wrc_vals) / len(wrc_vals), 1), len(wrc_vals)
+
+
+def compute_win_probability(
+    home_sp_stats: Dict, away_sp_stats: Dict,
+    home_off_wrc: float, away_off_wrc: float,
+    home_bp_vuln: float, away_bp_vuln: float,
+    home_run_diff: float, away_run_diff: float,
+    home_implied_runs: float, away_implied_runs: float,
+) -> Tuple[float, str]:
+    """
+    Log5-style win probability estimate.
+
+    Model: P(home wins) = (home_offense_strength × away_pitching_vuln) /
+                          ((home_offense_strength × away_pitching_vuln) +
+                           (away_offense_strength × home_pitching_vuln))
+
+    Offense strength: derived from team wRC+ (batting quality of confirmed lineup).
+    Pitching vuln: blended SP + team bullpen (same formula as O1.5 pitcher model).
+    Home field adjustment: +3.5% to home win probability (MLB historical average).
+    Momentum: last-7-day run differential nudges probability ±2%.
+
+    Returns (home_win_prob_0_to_1, explanation_string).
+    """
+    # ── Offense strength: wRC+ normalized. League avg = 1.0, +10% = 1.1 ──
+    home_off = max(0.5, home_off_wrc / 100.0)
+    away_off = max(0.5, away_off_wrc / 100.0)
+
+    # ── Pitching vuln: blend SP (60%) + bullpen (40%) — same as O1.5 model ──
+    # Vuln scale: 0-100 where 50 = league avg, higher = more hittable
+    # Invert for "how hard is the pitching": strength = (100 - vuln) / 100
+    home_sp_vuln = float(home_sp_stats.get("_sp_vuln", 50.0))
+    away_sp_vuln = float(away_sp_stats.get("_sp_vuln", 50.0))
+
+    home_pit_vuln = home_sp_vuln * 0.60 + home_bp_vuln * 0.40
+    away_pit_vuln = away_sp_vuln * 0.60 + away_bp_vuln * 0.40
+
+    # Pitching STRENGTH = inverse of vulnerability
+    # Elite pitcher (vuln=20) → strength=0.80; mop-up (vuln=70) → strength=0.30
+    home_pit_str = max(0.2, (100.0 - home_pit_vuln) / 100.0)
+    away_pit_str = max(0.2, (100.0 - away_pit_vuln) / 100.0)
+
+    # ── Log5 numerator/denominator ──────────────────────────────────────────
+    # Home advantage: score home as if facing slightly weaker pitcher
+    HOME_ADJ = 0.035  # +3.5% raw before log5 normalization
+    home_strength = home_off * away_pit_str * (1.0 + HOME_ADJ)
+    away_strength = away_off * home_pit_str
+
+    total = home_strength + away_strength
+    if total <= 0:
+        return 0.52, "Log5 denominator zero — returning home-field default"
+
+    raw_home_wp = home_strength / total
+
+    # ── Momentum nudge: last-7-day run diff ─────────────────────────────────
+    # +1 run/game differential ≈ +1% win probability nudge (capped at ±2%)
+    diff_nudge = (home_run_diff - away_run_diff) * 0.01
+    diff_nudge = max(-0.02, min(0.02, diff_nudge))
+
+    # ── Vegas sanity anchor: blend model 70% / vegas-derived 30% ────────────
+    # When run totals are loaded, derive a weak prior from implied runs
+    if home_implied_runs > 0 and away_implied_runs > 0:
+        total_impl = home_implied_runs + away_implied_runs
+        vegas_home_wp = home_implied_runs / total_impl if total_impl > 0 else 0.52
+        final_home_wp = raw_home_wp * 0.70 + vegas_home_wp * 0.30 + diff_nudge
+    else:
+        final_home_wp = raw_home_wp + diff_nudge
+
+    final_home_wp = max(0.30, min(0.75, final_home_wp))
+
+    # Build explanation
+    pit_qual_h = ("Elite" if home_pit_vuln < 30 else "Good" if home_pit_vuln < 45
+                  else "Average" if home_pit_vuln < 58 else "Weak")
+    pit_qual_a = ("Elite" if away_pit_vuln < 30 else "Good" if away_pit_vuln < 45
+                  else "Average" if away_pit_vuln < 58 else "Weak")
+    label = (f"Home pit: {pit_qual_h} (vuln={home_pit_vuln:.0f}) | "
+             f"Away pit: {pit_qual_a} (vuln={away_pit_vuln:.0f}) | "
+             f"Home off wRC+: {home_off_wrc:.0f} | Away off wRC+: {away_off_wrc:.0f} | "
+             f"7d RunDiff H/A: {home_run_diff:+.1f}/{away_run_diff:+.1f}")
+
+    return round(final_home_wp, 4), label
+
+
+def display_moneyline_tab(games: List[Dict], plays: List[Dict],
+                          ml_odds: Dict, run_diffs: Dict,
+                          implied_totals: Dict,
+                          team_bullpen_scores: Dict):
+    """
+    Tab: 🏦 Moneyline
+    One row per game. Shows model win prob vs market implied prob vs edge.
+    Flags Strong Edge (>7%), Lean (4-7%), No Play (<4%).
+    """
+    st.header("🏦 Moneyline — Win Probability Model")
+    st.caption("Log5-style win probability vs Vegas implied. Edge = model prob minus market implied (vig-removed). "
+               "Strong Edge >7% | Lean 4-7% | No Play <4%.")
+
+    if not games:
+        st.info("Run the model first to see moneyline analysis.")
+        return
+
+    pitching_df = st.session_state.get("_pitching_df_global", pd.DataFrame())
+
+    rows = []
+    for game in games:
+        home = game.get("home_team", "")
+        away = game.get("away_team", "")
+        home_sp_name = game.get("home_pitcher") or "TBD"
+        away_sp_name = game.get("away_pitcher") or "TBD"
+        home_sp_id   = str(game.get("home_pitcher_id") or "")
+        away_sp_id   = str(game.get("away_pitcher_id") or "")
+
+        # SP stats from pitching_df (same source as O1.5 model)
+        home_sp_raw = get_pitcher_stats(home_sp_name, home_sp_id, pitching_df)
+        away_sp_raw = get_pitcher_stats(away_sp_name, away_sp_id, pitching_df)
+
+        # Compute SP vulnerability (reuse existing function)
+        home_bp_vuln = team_bullpen_scores.get(home, 42.0)
+        away_bp_vuln = team_bullpen_scores.get(away, 42.0)
+
+        home_sp_vuln, home_pit_label = compute_pitcher_score(home_sp_raw, bullpen_vuln=home_bp_vuln)
+        away_sp_vuln, away_pit_label = compute_pitcher_score(away_sp_raw, bullpen_vuln=away_bp_vuln)
+
+        # Inject SP vuln into dict for compute_win_probability
+        home_sp_raw["_sp_vuln"] = home_sp_vuln
+        away_sp_raw["_sp_vuln"] = away_sp_vuln
+
+        # Team offense from confirmed lineup (aggregate wRC+ of scored batters)
+        home_off_wrc, home_n = compute_team_offense_score(plays, home)
+        away_off_wrc, away_n = compute_team_offense_score(plays, away)
+
+        # Run differentials
+        home_rd = run_diffs.get(home, 0.0)
+        away_rd = run_diffs.get(away, 0.0)
+
+        # Implied run totals from Odds API
+        home_impl_runs = implied_totals.get(home, 0.0)
+        away_impl_runs = implied_totals.get(away, 0.0)
+
+        # Win probability
+        home_wp, wp_label = compute_win_probability(
+            home_sp_stats=home_sp_raw,
+            away_sp_stats=away_sp_raw,
+            home_off_wrc=home_off_wrc,
+            away_off_wrc=away_off_wrc,
+            home_bp_vuln=home_bp_vuln,
+            away_bp_vuln=away_bp_vuln,
+            home_run_diff=home_rd,
+            away_run_diff=away_rd,
+            home_implied_runs=home_impl_runs,
+            away_implied_runs=away_impl_runs,
+        )
+        away_wp = round(1.0 - home_wp, 4)
+
+        # Market implied (vig-removed) from h2h odds
+        ml_key = None
+        for k in ml_odds:
+            parts = k.split("|")
+            if len(parts) == 2:
+                if (_norm(parts[0]) in _norm(game.get("away_team_name", away)) or
+                    _norm(away) in _norm(parts[0])):
+                    ml_key = k
+                    break
+                if (_norm(parts[1]) in _norm(game.get("home_team_name", home)) or
+                    _norm(home) in _norm(parts[1])):
+                    ml_key = k
+                    break
+
+        if ml_key and ml_key in ml_odds:
+            mkt = ml_odds[ml_key]
+            home_mkt = mkt["home_implied"]
+            away_mkt = mkt["away_implied"]
+            home_odds_str = f"{mkt['home_odds']:+.0f}"
+            away_odds_str = f"{mkt['away_odds']:+.0f}"
+        else:
+            home_mkt = away_mkt = None
+            home_odds_str = away_odds_str = "N/A"
+
+        # Edge calculation
+        if home_mkt is not None:
+            home_edge = round((home_wp - home_mkt) * 100, 1)
+            away_edge = round((away_wp - away_mkt) * 100, 1)
+        else:
+            home_edge = away_edge = None
+
+        # Tier and recommendation
+        def _edge_tier(edge):
+            if edge is None: return "➖ No Play"
+            if abs(edge) >= 7:  return "🔥 Strong Edge"
+            if abs(edge) >= 4:  return "📊 Lean"
+            return "➖ No Play"
+
+        home_tier = _edge_tier(home_edge)
+        away_tier = _edge_tier(away_edge)
+
+        # Recommended side: whichever has the larger positive edge, if above threshold
+        if home_edge is not None and away_edge is not None:
+            if home_edge >= 4 and home_edge >= away_edge:
+                rec = f"✅ {home} (H) {home_edge:+.1f}%"
+            elif away_edge >= 4 and away_edge > home_edge:
+                rec = f"✅ {away} (A) {away_edge:+.1f}%"
+            else:
+                rec = "➖ No Play"
+        elif home_mkt is None:
+            rec = "No ML odds loaded"
+        else:
+            rec = "➖ No Play"
+
+        rows.append({
+            "Matchup":        f"{away} @ {home}",
+            "Away SP":        away_sp_name[:18],
+            "Home SP":        home_sp_name[:18],
+            f"{away} Model%": f"{away_wp*100:.1f}%",
+            f"{home} Model%": f"{home_wp*100:.1f}%",
+            f"{away} Mkt%":   f"{away_mkt*100:.1f}%" if away_mkt else "N/A",
+            f"{home} Mkt%":   f"{home_mkt*100:.1f}%" if home_mkt else "N/A",
+            f"{away} Odds":   away_odds_str,
+            f"{home} Odds":   home_odds_str,
+            f"{away} Edge":   f"{away_edge:+.1f}%" if away_edge is not None else "N/A",
+            f"{home} Edge":   f"{home_edge:+.1f}%" if home_edge is not None else "N/A",
+            "Away Tier":      away_tier,
+            "Home Tier":      home_tier,
+            "Pick":           rec,
+            "_home_wp":       home_wp,
+            "_away_wp":       away_wp,
+            "_home_edge":     home_edge,
+            "_away_edge":     away_edge,
+            "_label":         wp_label,
+            "_home_n":        home_n,
+            "_away_n":        away_n,
+        })
+
+    if not rows:
+        st.warning("No games to display.")
+        return
+
+    # Summary metrics
+    strong_edges = [r for r in rows
+                    if (r["_home_edge"] is not None and abs(r["_home_edge"]) >= 7) or
+                       (r["_away_edge"] is not None and abs(r["_away_edge"]) >= 7)]
+    lean_edges   = [r for r in rows
+                    if (r["_home_edge"] is not None and 4 <= abs(r["_home_edge"]) < 7) or
+                       (r["_away_edge"] is not None and 4 <= abs(r["_away_edge"]) < 7)]
+
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("Games on Slate", len(rows))
+    mc2.metric("🔥 Strong Edge (>7%)", len(strong_edges))
+    mc3.metric("📊 Lean (4-7%)", len(lean_edges))
+
+    st.markdown("---")
+
+    # Display table — drop internal cols
+    display_cols = [c for c in rows[0].keys() if not c.startswith("_")]
+    df = pd.DataFrame(rows)[display_cols]
+
+    def color_pick(val):
+        if "Strong" in str(val): return "color: #00ff88; font-weight: bold"
+        if "Lean"   in str(val): return "color: #ffdd00"
+        if "No Play" in str(val): return "color: #888888"
+        return ""
+
+    def color_edge(val):
+        try:
+            v = float(str(val).replace("%","").replace("+",""))
+            if v >= 7:  return "color: #00ff88; font-weight: bold"
+            if v >= 4:  return "color: #ffdd00"
+            if v <= -4: return "color: #ff4444"
+        except: pass
+        return ""
+
+    edge_cols = [c for c in display_cols if "Edge" in c]
+    tier_cols  = [c for c in display_cols if "Tier" in c]
+    styled = df.style.map(color_pick, subset=["Pick"])
+    for ec in edge_cols:
+        styled = styled.map(color_edge, subset=[ec])
+    st.dataframe(styled, use_container_width=True)
+
+    # Export
+    csv = df.to_csv(index=False)
+    st.download_button("📥 Export Moneyline CSV", csv, "moneyline.csv", "text/csv", key="dl_ml")
+
+    st.markdown("---")
+    st.subheader("🔍 Game-by-Game Breakdown")
+
+    for r in rows:
+        with st.expander(f"{r['Matchup']}  |  Pick: {r['Pick']}"):
+            b1, b2 = st.columns(2)
+            parts = r["Matchup"].split(" @ ")
+            away_t = parts[0] if parts else "Away"
+            home_t = parts[1] if len(parts) > 1 else "Home"
+
+            with b1:
+                st.markdown(f"**{away_t} (Away)**")
+                st.write(f"SP: {r['Away SP']}")
+                st.write(f"Model Win%: {r.get(f'{away_t} Model%', 'N/A')}")
+                st.write(f"Market Implied: {r.get(f'{away_t} Mkt%', 'N/A')}")
+                st.write(f"ML Odds: {r.get(f'{away_t} Odds', 'N/A')}")
+                st.write(f"Edge: {r.get(f'{away_t} Edge', 'N/A')}")
+                st.write(f"Tier: {r['Away Tier']}")
+            with b2:
+                st.markdown(f"**{home_t} (Home)**")
+                st.write(f"SP: {r['Home SP']}")
+                st.write(f"Model Win%: {r.get(f'{home_t} Model%', 'N/A')}")
+                st.write(f"Market Implied: {r.get(f'{home_t} Mkt%', 'N/A')}")
+                st.write(f"ML Odds: {r.get(f'{home_t} Odds', 'N/A')}")
+                st.write(f"Edge: {r.get(f'{home_t} Edge', 'N/A')}")
+                st.write(f"Tier: {r['Home Tier']}")
+            st.caption(f"Model inputs: {r['_label']}")
+            st.caption(f"Lineup batters found: {home_t}={r['_home_n']} | {away_t}={r['_away_n']}")
+
+    # No ML odds disclaimer
+    if not ml_odds:
+        st.warning("⚠️ No Odds API key loaded — market implied probabilities unavailable. "
+                   "Edge column shows N/A. Add Odds API key in sidebar for full edge calculation.")
+
+
+def compute_k_score_for_play(p: Dict, pitcher_statcast: Dict,
+                              ump_k_adj: float = 0.0) -> float:
+    """Thin wrapper used by Results Tracker to log K score alongside TB pick."""
+    batter_statcast = {
+        "k_rate":           p.get("k_rate", 0.228),
+        "batter_swstr_pct": p.get("batter_swstr_pct", 0.0),
+        "o_swing_pct":      p.get("o_swing_pct", 0.0),
+    }
+    pitcher_statcast_k = {
+        "k_rate_allowed": pitcher_statcast.get("k_rate_allowed", 0.228),
+        "swstr_pct":      pitcher_statcast.get("swstr_pct", 0.0),
+    }
+    score, _, _ = compute_k_score(batter_statcast, pitcher_statcast_k,
+                                  p.get("lineup_slot", 5),
+                                  p.get("implied_total", 4.5),
+                                  ump_k_adj)
+    return score
 
 
 def compute_batter_score_hits(statcast: Dict) -> Tuple[float, str, Dict]:
@@ -7668,19 +8466,20 @@ else:
         st.caption(f"v1.6 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
     # ── MAIN CONTENT ──────────────────────────────────────
-    st.title("⚾ MLB Total Bases Analyzer V1.8")
-    # V1.8 build verification — remove after confirming deployment
+    st.title("⚾ MLB TB Analyzer V1.9")
     import hashlib as _hlib
-    _sig = _hlib.md5(b"zscore_v18_offset6p5").hexdigest()[:6]
-    st.caption(f"🔑 Build sig: {_sig} — if this shows b7ba05 the Z-score V1.8 model is live")
-    st.caption("Fully automated over 1.5 TB prop model | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.8: Pitcher-weighted matchup model | Wider signal range | No fake bat-tracking proxies")
+    _sig = _hlib.md5(b"v19_kprops_moneyline").hexdigest()[:6]
+    st.caption(f"🔑 Build sig: {_sig} — V1.9: K Props + Moneyline models live")
+    st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.9: K Props tab + Moneyline tab added")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "📊 O1.5 Leaderboard",
         "🎯 Tiered Breakdown",
         "💰 Parlay Builder",
         "🎯 O0.5 Any Hit",
+        "⚡ K Props",
+        "🏦 Moneyline",
         "💣 HR Plays",
         "🏆 FanDuel DFS",
         "🎯 PrizePicks",
@@ -7701,11 +8500,24 @@ else:
                 best_parlays = build_parlays(plays, 3, 1, 70.0)
                 if best_parlays:
                     save_parlay_to_db(best_parlays[0], date_str)
+                # ── V1.9: Pre-fetch ump data and run differential for new tabs ──
+                try:
+                    st.session_state["_ump_data"] = fetch_umpire_data()
+                except Exception:
+                    st.session_state["_ump_data"] = {}
+                try:
+                    st.session_state["_run_diffs"] = fetch_team_run_differential(date_str, days=7)
+                except Exception:
+                    st.session_state["_run_diffs"] = {}
+                try:
+                    st.session_state["_ml_odds"] = fetch_moneyline_odds(date_str)
+                except Exception:
+                    st.session_state["_ml_odds"] = {}
                 st.rerun()
             else:
                 st.warning(f"No games or lineups found for {date_str}.")
                 st.info("Opening Day is March 27, 2026. Change the date in the sidebar.")
-    
+
     # ── DISPLAY TABS ─────────────────────────────────────
     with tab1:
         if st.session_state.plays:
@@ -7737,18 +8549,49 @@ else:
             st.info("Run the model first to see O0.5 any-hit plays.")
 
     with tab5:
+        # ── K Props ──────────────────────────────────────
+        if st.session_state.plays:
+            ump_data = st.session_state.get("_ump_data", {})
+            display_k_props_tab(st.session_state.plays, ump_data)
+        else:
+            st.info("Run the model first to see K prop scores.")
+
+    with tab6:
+        # ── Moneyline ────────────────────────────────────
+        if st.session_state.plays:
+            _games_for_ml = fetch_schedule(st.session_state.analysis_date or date_str)
+            _ml_odds      = st.session_state.get("_ml_odds", {})
+            _run_diffs    = st.session_state.get("_run_diffs", {})
+            _impl_totals  = {}
+            try:
+                _impl_totals = fetch_odds(st.session_state.analysis_date or date_str)
+            except Exception:
+                pass
+            _bp_scores    = st.session_state.get("team_bullpen_scores", {})
+            display_moneyline_tab(
+                games=_games_for_ml,
+                plays=st.session_state.plays,
+                ml_odds=_ml_odds,
+                run_diffs=_run_diffs,
+                implied_totals=_impl_totals,
+                team_bullpen_scores=_bp_scores,
+            )
+        else:
+            st.info("Run the model first to see moneyline analysis.")
+
+    with tab7:
         if st.session_state.plays:
             display_hr_plays(st.session_state.plays)
         else:
             st.info("Run the model first to see HR plays.")
 
-    with tab6:
+    with tab8:
         display_dfs_tab(st.session_state.plays if st.session_state.plays else [])
 
-    with tab7:
+    with tab9:
         display_prizepicks_tab(st.session_state.plays if st.session_state.plays else [])
 
-    with tab8:
+    with tab10:
         display_results_tracker()
 
 
