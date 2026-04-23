@@ -8101,7 +8101,17 @@ def main():
         
         st.markdown("---")
         
-        run_btn = st.button("⚾ Run Today's Model", type="primary", use_container_width=True)
+        # V1.9: type="primary" renders grey on dark Streamlit themes. Use CSS override.
+        st.markdown("""<style>
+        div[data-testid="stSidebar"] div.stButton:first-of-type > button {
+            background-color: #00cc66 !important; color: #000 !important;
+            font-weight: 700 !important; border: none !important; font-size: 1rem !important;
+        }
+        div[data-testid="stSidebar"] div.stButton:first-of-type > button:hover {
+            background-color: #00ff88 !important;
+        }
+        </style>""", unsafe_allow_html=True)
+        run_btn = st.button("⚾ Run Today's Model", use_container_width=True)
         
         if st.button("🔄 Clear Cache + Rerun", use_container_width=True):
             st.cache_data.clear()
