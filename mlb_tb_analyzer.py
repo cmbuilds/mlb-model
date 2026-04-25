@@ -3871,6 +3871,9 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "streak_label": streak_label,
                 "recent_tb_per_game": recent_form.get("tb_per_game"),
                 "recent_games": recent_form.get("games", 0),
+                "_hr_last7": recent_form.get("hr_last_7", 0),
+                "_h_last7":  recent_form.get("h_last_7", 0),
+                "_ab_last7": recent_form.get("ab_last_7", 0),
                 "sub_bvp": round(bvp_sc, 1),
                 "bvp_label": bvp_label,
                 "bvp_sig": bvp_sig,         # 'owns'/'edge'/'neutral'/'fade'/'dominated'/'no_data'
@@ -4823,21 +4826,22 @@ def compute_k_score(batter_statcast: Dict, pitcher_statcast: Dict,
 
 def display_k_props_tab(plays: List[Dict], ump_data: Dict):
     """
-    Tab: ⚡ K Props
-    Sortable table of all batters with K composite score, tier, and key inputs.
-    No market line column unless Odds API strikeout props are loaded (not on free tier).
+    Tab: ⚡ K Props — Redesigned V1.9+
+    Ranked tier cards + clean sortable table. HIGH score = likely to K.
     """
-    st.header("⚡ K Props — Batter Strikeout Model")
-    st.caption("Composite K score per batter vs opposing pitcher. HIGH score = more likely to strikeout. "
-               "Inputs: Batter K%, Pitcher K%/SwStr%, lineup slot, ump zone, game pace.")
+    st.header("⚡ K Props — Strikeout Prop Model")
+    st.caption(
+        "Composite strikeout score per batter. **HIGH score = more likely to strike out.** "
+        "Inputs: Batter K%, Pitcher K%/SwStr%, lineup slot, umpire zone, game pace."
+    )
 
     if not plays:
         st.info("Run the model first to see K prop scores.")
         return
 
-    # Build K scores for all plays
-    rows = []
+    # ── Build K scores ───────────────────────────────────────────────────────
     pitching_df = st.session_state.get("_pitching_df_global", pd.DataFrame())
+    rows = []
 
     for p in plays:
         batter_statcast = {
@@ -4845,12 +4849,10 @@ def display_k_props_tab(plays: List[Dict], ump_data: Dict):
             "batter_swstr_pct": p.get("batter_swstr_pct", 0.0),
             "o_swing_pct":      p.get("o_swing_pct", 0.0),
         }
-        # Re-use pitcher stats already loaded in run_model via pitching_df lookup
         pitcher_statcast = {
             "k_rate_allowed": p.get("_pitcher_k_rate", 0.228),
             "swstr_pct":      p.get("_pitcher_swstr", 0.0),
         }
-        # Ump adjustment for this game
         game_pk_int = None
         try: game_pk_int = int(p.get("game_id", 0))
         except: pass
@@ -4865,305 +4867,168 @@ def display_k_props_tab(plays: List[Dict], ump_data: Dict):
             implied_total=p.get("implied_total", 4.5),
             ump_k_adj=ump_k_adj,
         )
+        tier = k_details.get("tier", "➖ No Play")
 
         rows.append({
-            "Player":       p["name"],
-            "Team":         p["team"],
-            "#": p.get("lineup_slot", "—"),
-            "Opp Pitcher":  p.get("sp_name", "TBD"),
-            "Hand":         p.get("sp_hand", "R"),
-            "Batter K%":    f"{p.get('k_rate', 0)*100:.1f}%",
-            "Pit K%":       f"{k_details.get('pitcher_k_pct', 0):.1f}%",
-            "SwStr%":       f"{k_details['pitcher_swstr']}%" if k_details['pitcher_swstr'] != 'N/A' else "N/A",
-            "Batter SwStr": f"{k_details['batter_swstr']}%" if k_details['batter_swstr'] != 'N/A' else "N/A",
-            "Umpire":       ump_name,
-            "Ump K Adj":    f"{ump_k_adj*100:+.1f}pp" if ump_k_adj != 0 else "—",
-            "K Score":      k_score,
-            "Tier":         k_details.get("tier", "—"),
-            "Market Line":  "N/A — no free-tier prop data",
+            "k_score":      k_score,
+            "tier":         tier,
+            "name":         p["name"],
+            "team":         p["team"],
+            "slot":         p.get("lineup_slot", "—"),
+            "sp_name":      p.get("sp_name", "TBD"),
+            "sp_hand":      p.get("sp_hand", "R"),
+            "batter_hand":  p.get("batter_hand", "R"),
+            "batter_k_pct": p.get("k_rate", 0) * 100,
+            "pit_k_pct":    k_details.get("pitcher_k_pct", 0),
+            "pit_swstr":    k_details.get("pitcher_swstr", "N/A"),
+            "batter_swstr": k_details.get("batter_swstr", "N/A"),
+            "ump_name":     ump_name,
+            "ump_k_adj":    ump_k_adj * 100,
+            "context_score": k_details.get("context_score", 50),
+            "opponent":     p.get("opponent", ""),
         })
+
+    rows.sort(key=lambda x: x["k_score"], reverse=True)
 
     if not rows:
         st.warning("No K scores computed.")
         return
 
-    df = pd.DataFrame(rows)
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    k_plus  = [r for r in rows if r["k_score"] >= 80]
+    k_tier  = [r for r in rows if 70 <= r["k_score"] < 80]
+    lean_k  = [r for r in rows if 60 <= r["k_score"] < 70]
+    no_play = [r for r in rows if r["k_score"] < 60]
 
-    # Color K Score column
-    def color_k(val):
-        try:
-            v = float(val)
-            if v >= 80: return "color: #ff4444; font-weight: bold"
-            elif v >= 70: return "color: #ff8800; font-weight: bold"
-            elif v >= 60: return "color: #ffdd00"
-            return "color: #888888"
-        except: return ""
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("⚡ K+  (80+)",   len(k_plus))
+    m2.metric("🔥 K   (70-79)", len(k_tier))
+    m3.metric("📊 Lean (60-69)", len(lean_k))
+    m4.metric("➖ No Play",     len(no_play))
+    m5.metric("Total Batters",  len(rows))
 
-    tier_order = {"⚡ K+": 0, "🔥 K": 1, "📊 Lean K": 2, "➖ No Play": 3}
-    df = df.sort_values("K Score", ascending=False)
-    styled = df.style.map(color_k, subset=["K Score"])
-    st.dataframe(styled, use_container_width=True)
+    # ── Top K+ / K tier ranked cards ─────────────────────────────────────────
+    top_plays = k_plus + k_tier
+    if top_plays:
+        st.markdown("---")
+        st.subheader(f"🎯 Top K Plays — {len(top_plays)} Ranked")
+        st.caption("Ranked from highest to lowest K score. These batters are most likely to strikeout today.")
 
-    # Export
-    csv = df.to_csv(index=False)
-    st.download_button("📥 Export K Props CSV", csv, "k_props.csv", "text/csv", key="dl_kprops")
-
-    st.markdown("---")
-    st.subheader("⚡ Top K+ Plays — Detail")
-
-    k_plus = [r for r in rows if r["K Score"] >= 70]
-    if not k_plus:
-        st.info("No K+ or K tier plays today. Check back when lineups are confirmed.")
-        return
-
-    for i, r in enumerate(k_plus[:5], 1):
-        with st.expander(f"#{i}: {r['Player']} ({r['Team']}) — K Score: {r['K Score']} | {r['Tier']}"):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write(f"**Batter K%:** {r['Batter K%']}")
-                st.write(f"**Batter SwStr%:** {r['Batter SwStr']}")
-                st.write(f"**O-Swing%:** {r.get('O-Swing%', 'N/A')}")
-                st.write(f"**Lineup Slot:** #{r['#']}")
-            with c2:
-                st.write(f"**Pitcher K%:** {r['Pit K%']}")
-                st.write(f"**Pitcher SwStr%:** {r['SwStr%']}")
-                st.write(f"**Umpire:** {r['Umpire']} ({r['Ump K Adj']})")
-                st.write(f"**Market Line:** {r['Market Line']}")
-
-    # Results Tracker note
-    st.markdown("---")
-    st.caption("💾 K prop picks are logged to the Results Tracker (Tab 10) when you save picks.")
-
-
-# ============================================================================
-# MONEYLINE MODEL — Team Win Probability
-# V1.9: Log5-style win probability calibrated against Vegas implied probability.
-# Identifies edges where model diverges from market by >4%.
-# ============================================================================
-
-@st.cache_data(ttl=3600)
-def fetch_team_run_differential(date_str: str, days: int = 7) -> Dict[str, float]:
-    """
-    Fetch last N days of team run differential from MLB Stats API game logs.
-    Returns: {team_abbr: avg_run_diff_per_game}
-    Uses only MLB Stats API (always unblocked).
-    """
-    result = {}
-    try:
-        from datetime import datetime as _dt, timedelta as _td
-        end_dt   = _dt.strptime(date_str, "%Y-%m-%d")
-        start_dt = end_dt - _td(days=days)
-        start_str = start_dt.strftime("%Y-%m-%d")
-
-        # Fetch schedule for the window
-        url = (f"https://statsapi.mlb.com/api/v1/schedule"
-               f"?sportId=1&startDate={start_str}&endDate={date_str}"
-               f"&hydrate=linescore,team")
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return {}
-
-        team_runs_for   = {}
-        team_runs_against = {}
-        team_games       = {}
-
-        for date_entry in r.json().get("dates", []):
-            for game in date_entry.get("games", []):
-                if game.get("status", {}).get("abstractGameState") != "Final":
-                    continue
-                ls = game.get("linescore", {})
-                home_runs = int(ls.get("teams", {}).get("home", {}).get("runs", 0) or 0)
-                away_runs = int(ls.get("teams", {}).get("away", {}).get("runs", 0) or 0)
-                home_abb  = game["teams"]["home"]["team"].get("abbreviation", "")
-                away_abb  = game["teams"]["away"]["team"].get("abbreviation", "")
-                # Normalize via TEAM_ABB_MAP
-                home_abb = TEAM_ABB_MAP.get(game["teams"]["home"]["team"].get("name",""), home_abb)
-                away_abb = TEAM_ABB_MAP.get(game["teams"]["away"]["team"].get("name",""), away_abb)
-
-                for abb, rf, ra in [(home_abb, home_runs, away_runs),
-                                    (away_abb, away_runs, home_runs)]:
-                    if abb:
-                        team_runs_for[abb]    = team_runs_for.get(abb, 0) + rf
-                        team_runs_against[abb] = team_runs_against.get(abb, 0) + ra
-                        team_games[abb]        = team_games.get(abb, 0) + 1
-
-        for abb, g in team_games.items():
-            if g > 0:
-                result[abb] = round((team_runs_for[abb] - team_runs_against[abb]) / g, 2)
-
-    except Exception:
-        pass
-    return result
-
-
-def _american_to_implied(odds: float) -> float:
-    """Convert American moneyline odds to implied probability (no vig removal)."""
-    if odds < 0:
-        return abs(odds) / (abs(odds) + 100.0)
-    else:
-        return 100.0 / (odds + 100.0)
-
-
-def fetch_moneyline_odds(date_str: str) -> Dict[int, Dict]:
-    """
-    Extract h2h moneyline odds from Odds API response (already fetched in run_model).
-    Returns: {game_pk: {"home_odds": float, "away_odds": float,
-                        "home_implied": float, "away_implied": float}}
-    Re-uses fetch_odds infrastructure. Called once per run.
-    """
-    result = {}
-    try:
-        api_key = st.secrets.get("odds_api", {}).get("api_key", "")
-        if not api_key:
-            return {}
-
-        url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
-        params = {
-            "apiKey":      api_key,
-            "regions":     "us",
-            "markets":     "h2h",
-            "oddsFormat":  "american",
-        }
-        r = requests.get(url, params=params, timeout=12)
-        if r.status_code != 200:
-            return {}
-
-        for game in r.json():
-            home_name = game.get("home_team", "")
-            away_name = game.get("away_team", "")
-            home_odds = away_odds = None
-
-            for bm in game.get("bookmakers", []):
-                for mkt in bm.get("markets", []):
-                    if mkt.get("key") == "h2h":
-                        for oc in mkt.get("outcomes", []):
-                            if oc.get("name", "").lower() in home_name.lower():
-                                home_odds = float(oc.get("price", -110))
-                            elif oc.get("name", "").lower() in away_name.lower():
-                                away_odds = float(oc.get("price", 100))
-                        break
-                if home_odds is not None:
-                    break
-
-            if home_odds is None:
-                home_odds, away_odds = -110, 100   # fallback neutral
-
-            home_impl = _american_to_implied(home_odds)
-            away_impl = _american_to_implied(away_odds)
-            # Vig-remove: normalize so they sum to 1.0
-            total_impl = home_impl + away_impl
-            if total_impl > 0:
-                home_impl_no_vig = home_impl / total_impl
-                away_impl_no_vig = away_impl / total_impl
+        for i, r in enumerate(top_plays[:8], 1):
+            score = r["k_score"]
+            tier  = r["tier"]
+            # Card color by tier
+            if score >= 80:
+                border = "#ff4444"; tier_emoji = "⚡"
+            elif score >= 70:
+                border = "#ff8800"; tier_emoji = "🔥"
             else:
-                home_impl_no_vig = away_impl_no_vig = 0.5
+                border = "#ffdd00"; tier_emoji = "📊"
 
-            # Key by team names — matched to games via TEAM_ABB_MAP in display
-            game_key = f"{away_name}|{home_name}"
-            result[game_key] = {
-                "home_odds":     home_odds,
-                "away_odds":     away_odds,
-                "home_implied":  round(home_impl_no_vig, 4),
-                "away_implied":  round(away_impl_no_vig, 4),
-            }
+            with st.container():
+                col_rank, col_main, col_stats, col_score = st.columns([0.4, 2.8, 3.0, 1.2])
 
-    except Exception:
-        pass
-    return result
+                with col_rank:
+                    st.markdown(f"<div style='font-size:1.6rem;font-weight:900;color:{border};margin-top:12px'>#{i}</div>",
+                                unsafe_allow_html=True)
 
+                with col_main:
+                    st.markdown(f"**{r['name']}** &nbsp;`{r['team']}`")
+                    sp_str = r["sp_name"][:22] if r["sp_name"] else "TBD"
+                    st.caption(f"vs {sp_str} ({r['sp_hand']}HP) · Lineup #{r['slot']} · {r['batter_hand']}HB")
+                    ump_str = f"Umpire: {r['ump_name']}" if r["ump_name"] != "—" else ""
+                    adj_str = f"({r['ump_k_adj']:+.1f}pp K adj)" if r["ump_k_adj"] != 0 else ""
+                    if ump_str:
+                        st.caption(f"{ump_str} {adj_str}")
 
-def compute_team_offense_score(plays: List[Dict], team: str) -> Tuple[float, int]:
-    """
-    Aggregate offensive quality for a team from confirmed lineup batters.
-    Returns (team_wrc_plus_avg, n_batters_found).
-    Uses wrc_plus from each batter's scored play dict.
-    Falls back to 100 (league average) when lineup not loaded.
-    """
-    team_plays = [p for p in plays if p.get("team", "") == team]
-    wrc_vals = [p.get("wrc_plus", 100.0) for p in team_plays if p.get("wrc_plus", 100.0) > 0]
-    if not wrc_vals:
-        return 100.0, 0
-    return round(sum(wrc_vals) / len(wrc_vals), 1), len(wrc_vals)
+                with col_stats:
+                    bk = f"{r['batter_k_pct']:.1f}%"
+                    pk = f"{r['pit_k_pct']:.1f}%"
+                    ps = f"{r['pit_swstr']}%" if r["pit_swstr"] != "N/A" else "N/A"
+                    bs = f"{r['batter_swstr']}%" if r["batter_swstr"] != "N/A" else "N/A"
+                    st.caption(f"**Batter K%:** {bk}  |  **Pit K%:** {pk}")
+                    st.caption(f"**Pit SwStr%:** {ps}  |  **Bat SwStr%:** {bs}")
 
+                with col_score:
+                    score_color = "#ff4444" if score >= 80 else "#ff8800" if score >= 70 else "#ffdd00"
+                    st.markdown(
+                        f"<div style='text-align:center;background:#1a1a2e;border:2px solid {score_color};"
+                        f"border-radius:10px;padding:8px 4px;margin-top:4px'>"
+                        f"<div style='font-size:1.5rem;font-weight:900;color:{score_color}'>{score:.0f}</div>"
+                        f"<div style='font-size:0.65rem;color:#aaa'>{tier}</div></div>",
+                        unsafe_allow_html=True
+                    )
 
-def compute_win_probability(
-    home_sp_stats: Dict, away_sp_stats: Dict,
-    home_off_wrc: float, away_off_wrc: float,
-    home_bp_vuln: float, away_bp_vuln: float,
-    home_run_diff: float, away_run_diff: float,
-    home_implied_runs: float, away_implied_runs: float,
-) -> Tuple[float, str]:
-    """
-    Log5-style win probability estimate.
+            st.markdown("<hr style='margin:6px 0;border-color:#2a2a2a'>", unsafe_allow_html=True)
 
-    Model: P(home wins) = (home_offense_strength × away_pitching_vuln) /
-                          ((home_offense_strength × away_pitching_vuln) +
-                           (away_offense_strength × home_pitching_vuln))
+    # ── Full sortable table ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📋 Full K Props Table")
 
-    Offense strength: derived from team wRC+ (batting quality of confirmed lineup).
-    Pitching vuln: blended SP + team bullpen (same formula as O1.5 pitcher model).
-    Home field adjustment: +3.5% to home win probability (MLB historical average).
-    Momentum: last-7-day run differential nudges probability ±2%.
+    # Filters
+    cf1, cf2, cf3 = st.columns(3)
+    with cf1:
+        tier_f = st.multiselect("Filter Tier", ["⚡ K+", "🔥 K", "📊 Lean K", "➖ No Play"],
+                                default=["⚡ K+", "🔥 K", "📊 Lean K"], key="k_tier_filter")
+    with cf2:
+        teams_k = sorted(set(r["team"] for r in rows))
+        team_f = st.multiselect("Filter Team", teams_k, default=[], key="k_team_filter")
+    with cf3:
+        min_k = st.slider("Min K Score", 0, 100, 60, key="k_min_score")
 
-    Returns (home_win_prob_0_to_1, explanation_string).
-    """
-    # ── Offense strength: wRC+ normalized. League avg = 1.0, +10% = 1.1 ──
-    home_off = max(0.5, home_off_wrc / 100.0)
-    away_off = max(0.5, away_off_wrc / 100.0)
+    filtered = [r for r in rows
+                if r["tier"] in tier_f
+                and (not team_f or r["team"] in team_f)
+                and r["k_score"] >= min_k]
 
-    # ── Pitching vuln: blend SP (60%) + bullpen (40%) — same as O1.5 model ──
-    # Vuln scale: 0-100 where 50 = league avg, higher = more hittable
-    # Invert for "how hard is the pitching": strength = (100 - vuln) / 100
-    home_sp_vuln = float(home_sp_stats.get("_sp_vuln", 50.0))
-    away_sp_vuln = float(away_sp_stats.get("_sp_vuln", 50.0))
+    st.caption(f"Showing {len(filtered)} batters")
 
-    home_pit_vuln = home_sp_vuln * 0.60 + home_bp_vuln * 0.40
-    away_pit_vuln = away_sp_vuln * 0.60 + away_bp_vuln * 0.40
+    table_rows = []
+    for r in filtered:
+        table_rows.append({
+            "K Score":      r["k_score"],
+            "Tier":         r["tier"],
+            "Player":       r["name"],
+            "Team":         r["team"],
+            "Slot":         f"#{r['slot']}",
+            "Hand":         r["batter_hand"],
+            "Opp SP":       r["sp_name"][:20],
+            "SP Hand":      r["sp_hand"],
+            "Batter K%":    f"{r['batter_k_pct']:.1f}%",
+            "Pit K%":       f"{r['pit_k_pct']:.1f}%",
+            "Pit SwStr%":   f"{r['pit_swstr']}%" if r["pit_swstr"] != "N/A" else "N/A",
+            "Bat SwStr%":   f"{r['batter_swstr']}%" if r["batter_swstr"] != "N/A" else "N/A",
+            "Umpire":       r["ump_name"],
+            "Ump Adj":      f"{r['ump_k_adj']:+.1f}pp" if r["ump_k_adj"] != 0 else "—",
+        })
 
-    # Pitching STRENGTH = inverse of vulnerability
-    # Elite pitcher (vuln=20) → strength=0.80; mop-up (vuln=70) → strength=0.30
-    home_pit_str = max(0.2, (100.0 - home_pit_vuln) / 100.0)
-    away_pit_str = max(0.2, (100.0 - away_pit_vuln) / 100.0)
+    if table_rows:
+        df_k = pd.DataFrame(table_rows)
 
-    # ── Log5 numerator/denominator ──────────────────────────────────────────
-    # Home advantage: score home as if facing slightly weaker pitcher
-    HOME_ADJ = 0.035  # +3.5% raw before log5 normalization
-    home_strength = home_off * away_pit_str * (1.0 + HOME_ADJ)
-    away_strength = away_off * home_pit_str
+        def color_k_score(val):
+            try:
+                v = float(val)
+                if v >= 80: return "color:#ff4444;font-weight:bold"
+                if v >= 70: return "color:#ff8800;font-weight:bold"
+                if v >= 60: return "color:#ffdd00"
+                return "color:#888888"
+            except: return ""
 
-    total = home_strength + away_strength
-    if total <= 0:
-        return 0.52, "Log5 denominator zero — returning home-field default"
+        def color_k_tier(val):
+            s = str(val)
+            if "K+" in s:   return "color:#ff4444;font-weight:bold"
+            if "🔥" in s:   return "color:#ff8800;font-weight:bold"
+            if "Lean" in s: return "color:#ffdd00"
+            return "color:#888888"
 
-    raw_home_wp = home_strength / total
+        styled_k = df_k.style.map(color_k_score, subset=["K Score"]).map(color_k_tier, subset=["Tier"])
+        st.dataframe(styled_k, use_container_width=True)
 
-    # ── Momentum nudge: last-7-day run diff ─────────────────────────────────
-    # +1 run/game differential ≈ +1% win probability nudge (capped at ±2%)
-    diff_nudge = (home_run_diff - away_run_diff) * 0.01
-    diff_nudge = max(-0.02, min(0.02, diff_nudge))
+        csv_k = df_k.to_csv(index=False)
+        st.download_button("📥 Export K Props CSV", csv_k, "k_props.csv", "text/csv", key="dl_kprops")
 
-    # ── Vegas sanity anchor: blend model 70% / vegas-derived 30% ────────────
-    # When run totals are loaded, derive a weak prior from implied runs
-    if home_implied_runs > 0 and away_implied_runs > 0:
-        total_impl = home_implied_runs + away_implied_runs
-        vegas_home_wp = home_implied_runs / total_impl if total_impl > 0 else 0.52
-        final_home_wp = raw_home_wp * 0.70 + vegas_home_wp * 0.30 + diff_nudge
-    else:
-        final_home_wp = raw_home_wp + diff_nudge
-
-    final_home_wp = max(0.30, min(0.75, final_home_wp))
-
-    # Build explanation
-    pit_qual_h = ("Elite" if home_pit_vuln < 30 else "Good" if home_pit_vuln < 45
-                  else "Average" if home_pit_vuln < 58 else "Weak")
-    pit_qual_a = ("Elite" if away_pit_vuln < 30 else "Good" if away_pit_vuln < 45
-                  else "Average" if away_pit_vuln < 58 else "Weak")
-    label = (f"Home pit: {pit_qual_h} (vuln={home_pit_vuln:.0f}) | "
-             f"Away pit: {pit_qual_a} (vuln={away_pit_vuln:.0f}) | "
-             f"Home off wRC+: {home_off_wrc:.0f} | Away off wRC+: {away_off_wrc:.0f} | "
-             f"7d RunDiff H/A: {home_run_diff:+.1f}/{away_run_diff:+.1f}")
-
-    return round(final_home_wp, 4), label
+    st.markdown("---")
+    st.caption("💾 K prop picks are logged to the Results Tracker when you save picks.")
 
 
 def display_moneyline_tab(games: List[Dict], plays: List[Dict],
@@ -5171,13 +5036,17 @@ def display_moneyline_tab(games: List[Dict], plays: List[Dict],
                           implied_totals: Dict,
                           team_bullpen_scores: Dict):
     """
-    Tab: 🏦 Moneyline
-    One row per game. Shows model win prob vs market implied prob vs edge.
-    Flags Strong Edge (>7%), Lean (4-7%), No Play (<4%).
+    Tab: 🏦 Moneyline — Redesigned V1.9+
+    Ranked pick cards (Strong Edge → Lean → No Play) + full game table.
+    Composite ML confidence score 0-100 drives the ranking.
     """
     st.header("🏦 Moneyline — Win Probability Model")
-    st.caption("Log5-style win probability vs Vegas implied. Edge = model prob minus market implied (vig-removed). "
-               "Strong Edge >7% | Lean 4-7% | No Play <4%.")
+    st.caption(
+        "Log5-style win probability vs Vegas implied odds. "
+        "**Edge = model% minus market% (vig-removed).** "
+        "Strong Edge >7% | Lean 4-7% | No Play <4%. "
+        "Confidence score (0-100) blends edge magnitude, data quality, and SP strength."
+    )
 
     if not games:
         st.info("Run the model first to see moneyline analysis.")
@@ -5185,7 +5054,8 @@ def display_moneyline_tab(games: List[Dict], plays: List[Dict],
 
     pitching_df = st.session_state.get("_pitching_df_global", pd.DataFrame())
 
-    rows = []
+    # ── Build game rows ──────────────────────────────────────────────────────
+    game_rows = []
     for game in games:
         home = game.get("home_team", "")
         away = game.get("away_team", "")
@@ -5194,208 +5064,304 @@ def display_moneyline_tab(games: List[Dict], plays: List[Dict],
         home_sp_id   = str(game.get("home_pitcher_id") or "")
         away_sp_id   = str(game.get("away_pitcher_id") or "")
 
-        # SP stats from pitching_df (same source as O1.5 model)
         home_sp_raw = get_pitcher_stats(home_sp_name, home_sp_id, pitching_df)
         away_sp_raw = get_pitcher_stats(away_sp_name, away_sp_id, pitching_df)
 
-        # Compute SP vulnerability (reuse existing function)
         home_bp_vuln = team_bullpen_scores.get(home, 42.0)
         away_bp_vuln = team_bullpen_scores.get(away, 42.0)
 
         home_sp_vuln, home_pit_label = compute_pitcher_score(home_sp_raw, bullpen_vuln=home_bp_vuln)
         away_sp_vuln, away_pit_label = compute_pitcher_score(away_sp_raw, bullpen_vuln=away_bp_vuln)
 
-        # Inject SP vuln into dict for compute_win_probability
         home_sp_raw["_sp_vuln"] = home_sp_vuln
         away_sp_raw["_sp_vuln"] = away_sp_vuln
 
-        # Team offense from confirmed lineup (aggregate wRC+ of scored batters)
         home_off_wrc, home_n = compute_team_offense_score(plays, home)
         away_off_wrc, away_n = compute_team_offense_score(plays, away)
 
-        # Run differentials
         home_rd = run_diffs.get(home, 0.0)
         away_rd = run_diffs.get(away, 0.0)
 
-        # Implied run totals from Odds API
         home_impl_runs = implied_totals.get(home, 0.0)
         away_impl_runs = implied_totals.get(away, 0.0)
 
-        # Win probability
         home_wp, wp_label = compute_win_probability(
-            home_sp_stats=home_sp_raw,
-            away_sp_stats=away_sp_raw,
-            home_off_wrc=home_off_wrc,
-            away_off_wrc=away_off_wrc,
-            home_bp_vuln=home_bp_vuln,
-            away_bp_vuln=away_bp_vuln,
-            home_run_diff=home_rd,
-            away_run_diff=away_rd,
-            home_implied_runs=home_impl_runs,
-            away_implied_runs=away_impl_runs,
+            home_sp_stats=home_sp_raw, away_sp_stats=away_sp_raw,
+            home_off_wrc=home_off_wrc, away_off_wrc=away_off_wrc,
+            home_bp_vuln=home_bp_vuln, away_bp_vuln=away_bp_vuln,
+            home_run_diff=home_rd, away_run_diff=away_rd,
+            home_implied_runs=home_impl_runs, away_implied_runs=away_impl_runs,
         )
         away_wp = round(1.0 - home_wp, 4)
 
-        # Market implied (vig-removed) from h2h odds
+        # Match market odds
         ml_key = None
         for k in ml_odds:
             parts = k.split("|")
             if len(parts) == 2:
                 if (_norm(parts[0]) in _norm(game.get("away_team_name", away)) or
                     _norm(away) in _norm(parts[0])):
-                    ml_key = k
-                    break
+                    ml_key = k; break
                 if (_norm(parts[1]) in _norm(game.get("home_team_name", home)) or
                     _norm(home) in _norm(parts[1])):
-                    ml_key = k
-                    break
+                    ml_key = k; break
 
         if ml_key and ml_key in ml_odds:
             mkt = ml_odds[ml_key]
-            home_mkt = mkt["home_implied"]
-            away_mkt = mkt["away_implied"]
-            home_odds_str = f"{mkt['home_odds']:+.0f}"
-            away_odds_str = f"{mkt['away_odds']:+.0f}"
+            home_mkt  = mkt["home_implied"]
+            away_mkt  = mkt["away_implied"]
+            home_odds_raw = mkt["home_odds"]
+            away_odds_raw = mkt["away_odds"]
+            home_odds_str = f"{home_odds_raw:+.0f}"
+            away_odds_str = f"{away_odds_raw:+.0f}"
+            has_odds = True
         else:
             home_mkt = away_mkt = None
+            home_odds_raw = away_odds_raw = None
             home_odds_str = away_odds_str = "N/A"
+            has_odds = False
 
-        # Edge calculation
-        if home_mkt is not None:
-            home_edge = round((home_wp - home_mkt) * 100, 1)
-            away_edge = round((away_wp - away_mkt) * 100, 1)
-        else:
-            home_edge = away_edge = None
+        home_edge = round((home_wp - home_mkt) * 100, 1) if home_mkt is not None else None
+        away_edge = round((away_wp - away_mkt) * 100, 1) if away_mkt is not None else None
 
-        # Tier and recommendation
-        def _edge_tier(edge):
-            if edge is None: return "➖ No Play"
-            if abs(edge) >= 7:  return "🔥 Strong Edge"
-            if abs(edge) >= 4:  return "📊 Lean"
-            return "➖ No Play"
+        # ── Composite confidence score (0-100) ──────────────────────────────
+        # Rewards: large edge, confirmed lineups, known SP, low SP vuln on favored side
+        # Penalizes: TBD pitchers, missing odds, small samples
+        def _conf_score(side_wp, side_edge, sp_name, n_batters, sp_vuln, side_odds_raw):
+            if side_edge is None:
+                return 0.0
+            # Edge magnitude (0-50 pts): 7%+ edge = full 50, scaled linearly
+            edge_pts = min(50.0, max(0.0, side_edge / 7.0 * 50.0))
+            # SP quality (0-20 pts): elite SP on our side = confidence boost
+            # Low vuln (elite) → more predictable → higher confidence
+            sp_pts = max(0.0, min(20.0, (60.0 - sp_vuln) / 60.0 * 20.0))
+            # Lineup data (0-15 pts): more confirmed batters = better wRC+ estimate
+            lineup_pts = min(15.0, n_batters / 9.0 * 15.0)
+            # Odds loaded (0-10 pts): having real market odds = real edge signal
+            odds_pts = 10.0 if side_odds_raw is not None else 0.0
+            # SP known (0-5 pts)
+            sp_known_pts = 5.0 if sp_name not in ("TBD", "", None) else 0.0
+            # Penalty if edge is negative (model disagrees — don't recommend)
+            if side_edge < 0:
+                return 0.0
+            raw = edge_pts + sp_pts + lineup_pts + odds_pts + sp_known_pts
+            return round(min(100.0, raw), 1)
 
-        home_tier = _edge_tier(home_edge)
-        away_tier = _edge_tier(away_edge)
+        home_conf = _conf_score(home_wp, home_edge, home_sp_name, home_n,
+                                home_sp_raw.get("_sp_vuln", 50), home_odds_raw)
+        away_conf = _conf_score(away_wp, away_edge, away_sp_name, away_n,
+                                away_sp_raw.get("_sp_vuln", 50), away_odds_raw)
 
-        # Recommended side: whichever has the larger positive edge, if above threshold
+        # Best side = higher positive edge
         if home_edge is not None and away_edge is not None:
             if home_edge >= 4 and home_edge >= away_edge:
-                rec = f"✅ {home} (H) {home_edge:+.1f}%"
+                pick_side = home; pick_edge = home_edge; pick_conf = home_conf
+                pick_wp = home_wp; pick_odds = home_odds_str; pick_mkt = home_mkt
+                pick_sp = home_sp_name; opp_sp = away_sp_name
             elif away_edge >= 4 and away_edge > home_edge:
-                rec = f"✅ {away} (A) {away_edge:+.1f}%"
+                pick_side = away; pick_edge = away_edge; pick_conf = away_conf
+                pick_wp = away_wp; pick_odds = away_odds_str; pick_mkt = away_mkt
+                pick_sp = away_sp_name; opp_sp = home_sp_name
             else:
-                rec = "➖ No Play"
-        elif home_mkt is None:
-            rec = "No ML odds loaded"
+                pick_side = None; pick_edge = max(home_edge, away_edge) if home_edge and away_edge else 0
+                pick_conf = 0; pick_wp = None; pick_odds = "—"; pick_mkt = None
+                pick_sp = "—"; opp_sp = "—"
         else:
-            rec = "➖ No Play"
+            pick_side = None; pick_edge = 0; pick_conf = 0
+            pick_wp = None; pick_odds = "—"; pick_mkt = None
+            pick_sp = "—"; opp_sp = "—"
 
-        rows.append({
-            "Matchup":        f"{away} @ {home}",
-            "Away SP":        away_sp_name[:18],
-            "Home SP":        home_sp_name[:18],
-            f"{away} Model%": f"{away_wp*100:.1f}%",
-            f"{home} Model%": f"{home_wp*100:.1f}%",
-            f"{away} Mkt%":   f"{away_mkt*100:.1f}%" if away_mkt else "N/A",
-            f"{home} Mkt%":   f"{home_mkt*100:.1f}%" if home_mkt else "N/A",
-            f"{away} Odds":   away_odds_str,
-            f"{home} Odds":   home_odds_str,
-            f"{away} Edge":   f"{away_edge:+.1f}%" if away_edge is not None else "N/A",
-            f"{home} Edge":   f"{home_edge:+.1f}%" if home_edge is not None else "N/A",
-            "Away Tier":      away_tier,
-            "Home Tier":      home_tier,
-            "Pick":           rec,
-            "_home_wp":       home_wp,
-            "_away_wp":       away_wp,
-            "_home_edge":     home_edge,
-            "_away_edge":     away_edge,
-            "_label":         wp_label,
-            "_home_n":        home_n,
-            "_away_n":        away_n,
+        # Tier
+        if pick_side and pick_edge >= 7:
+            pick_tier = "🔥 Strong Edge"
+        elif pick_side and pick_edge >= 4:
+            pick_tier = "📊 Lean"
+        else:
+            pick_tier = "➖ No Play"
+
+        game_rows.append({
+            "matchup":      f"{away} @ {home}",
+            "away":         away, "home": home,
+            "away_sp":      away_sp_name, "home_sp": home_sp_name,
+            "home_wp":      home_wp, "away_wp": away_wp,
+            "home_mkt":     home_mkt, "away_mkt": away_mkt,
+            "home_edge":    home_edge, "away_edge": away_edge,
+            "home_odds":    home_odds_str, "away_odds": away_odds_str,
+            "home_odds_raw":home_odds_raw, "away_odds_raw": away_odds_raw,
+            "pick_side":    pick_side, "pick_tier": pick_tier,
+            "pick_edge":    pick_edge, "pick_conf": pick_conf,
+            "pick_wp":      pick_wp, "pick_odds": pick_odds,
+            "pick_mkt":     pick_mkt, "pick_sp": pick_sp, "opp_sp": opp_sp,
+            "home_n":       home_n, "away_n": away_n,
+            "home_rd":      home_rd, "away_rd": away_rd,
+            "home_wrc":     home_off_wrc, "away_wrc": away_off_wrc,
+            "home_sp_vuln": home_sp_raw.get("_sp_vuln", 50),
+            "away_sp_vuln": away_sp_raw.get("_sp_vuln", 50),
+            "wp_label":     wp_label,
+            "has_odds":     has_odds,
         })
 
-    if not rows:
+    if not game_rows:
         st.warning("No games to display.")
         return
 
-    # Summary metrics
-    strong_edges = [r for r in rows
-                    if (r["_home_edge"] is not None and abs(r["_home_edge"]) >= 7) or
-                       (r["_away_edge"] is not None and abs(r["_away_edge"]) >= 7)]
-    lean_edges   = [r for r in rows
-                    if (r["_home_edge"] is not None and 4 <= abs(r["_home_edge"]) < 7) or
-                       (r["_away_edge"] is not None and 4 <= abs(r["_away_edge"]) < 7)]
+    # Sort by confidence score descending
+    game_rows.sort(key=lambda x: x["pick_conf"], reverse=True)
 
-    mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("Games on Slate", len(rows))
-    mc2.metric("🔥 Strong Edge (>7%)", len(strong_edges))
-    mc3.metric("📊 Lean (4-7%)", len(lean_edges))
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    strong = [r for r in game_rows if r["pick_tier"] == "🔥 Strong Edge"]
+    lean   = [r for r in game_rows if r["pick_tier"] == "📊 Lean"]
+    no_p   = [r for r in game_rows if r["pick_tier"] == "➖ No Play"]
 
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Games on Slate", len(game_rows))
+    m2.metric("🔥 Strong Edge (>7%)", len(strong))
+    m3.metric("📊 Lean (4-7%)", len(lean))
+    m4.metric("➖ No Play", len(no_p))
+
+    has_any_odds = any(r["has_odds"] for r in game_rows)
+    if not has_any_odds:
+        st.warning("⚠️ No Odds API key — market implied % unavailable. "
+                   "Edge = N/A. Add Odds API key in sidebar to unlock edge calculation.")
+
+    # ── Ranked pick cards (Strong → Lean → No Play) ───────────────────────────
     st.markdown("---")
+    st.subheader("🏆 Ranked ML Picks")
+    st.caption("Games ranked by ML Confidence Score. Confidence blends edge magnitude, "
+               "SP quality, lineup data completeness, and odds availability.")
 
-    # Display table — drop internal cols
-    display_cols = [c for c in rows[0].keys() if not c.startswith("_")]
-    df = pd.DataFrame(rows)[display_cols]
+    for rank, r in enumerate(game_rows, 1):
+        tier = r["pick_tier"]
+        conf = r["pick_conf"]
 
-    def color_pick(val):
-        if "Strong" in str(val): return "color: #00ff88; font-weight: bold"
-        if "Lean"   in str(val): return "color: #ffdd00"
-        if "No Play" in str(val): return "color: #888888"
-        return ""
+        if tier == "🔥 Strong Edge":
+            border = "#00ff88"; rank_color = "#00ff88"
+        elif tier == "📊 Lean":
+            border = "#ffdd00"; rank_color = "#ffdd00"
+        else:
+            border = "#444444"; rank_color = "#666666"
 
-    def color_edge(val):
+        with st.container():
+            col_rank, col_pick, col_probs, col_conf = st.columns([0.5, 3.0, 3.5, 1.5])
+
+            with col_rank:
+                st.markdown(
+                    f"<div style='text-align:center;margin-top:10px'>"
+                    f"<div style='font-size:1.6rem;font-weight:900;color:{rank_color}'>{rank}</div>"
+                    f"<div style='font-size:0.6rem;color:#666'>RANK</div></div>",
+                    unsafe_allow_html=True)
+
+            with col_pick:
+                st.markdown(f"**{r['matchup']}**")
+                if r["pick_side"]:
+                    edge_disp = f"+{r['pick_edge']:.1f}%" if r["pick_edge"] > 0 else f"{r['pick_edge']:.1f}%"
+                    odds_disp = r["pick_odds"] if r["pick_odds"] != "—" else "N/A"
+                    st.markdown(
+                        f"<span style='color:{border};font-weight:bold;font-size:1.0rem'>"
+                        f"✅ {r['pick_side']} {odds_disp}</span> &nbsp;"
+                        f"<span style='color:{border}'>Edge: {edge_disp}</span>",
+                        unsafe_allow_html=True)
+                else:
+                    st.markdown("<span style='color:#666'>➖ No Play</span>", unsafe_allow_html=True)
+                sp_str = r["pick_sp"][:22] if r["pick_side"] else "—"
+                opp_str = r["opp_sp"][:22] if r["pick_side"] else "—"
+                if r["pick_side"]:
+                    st.caption(f"Their SP: {sp_str} &nbsp;|&nbsp; Opp SP: {opp_str}")
+                tier_color = "#00ff88" if "Strong" in tier else "#ffdd00" if "Lean" in tier else "#666"
+                st.markdown(f"<span style='background:#111;border:1px solid {tier_color};"
+                            f"color:{tier_color};border-radius:5px;padding:1px 7px;"
+                            f"font-size:0.75rem'>{tier}</span>", unsafe_allow_html=True)
+
+            with col_probs:
+                hmp = f"{r['home_wp']*100:.1f}%" 
+                amp = f"{r['away_wp']*100:.1f}%"
+                hmkt = f"{r['home_mkt']*100:.1f}%" if r["home_mkt"] else "N/A"
+                amkt = f"{r['away_mkt']*100:.1f}%" if r["away_mkt"] else "N/A"
+                hedge = f"{r['home_edge']:+.1f}%" if r["home_edge"] is not None else "N/A"
+                aedge = f"{r['away_edge']:+.1f}%" if r["away_edge"] is not None else "N/A"
+                # Mini table
+                st.caption(
+                    f"**{r['home']}** Model: {hmp} | Market: {hmkt} | Edge: {hedge} | "
+                    f"SP vuln: {r['home_sp_vuln']:.0f} | wRC+: {r['home_wrc']:.0f}"
+                )
+                st.caption(
+                    f"**{r['away']}** Model: {amp} | Market: {amkt} | Edge: {aedge} | "
+                    f"SP vuln: {r['away_sp_vuln']:.0f} | wRC+: {r['away_wrc']:.0f}"
+                )
+                st.caption(
+                    f"7d RunDiff: {r['home']} {r['home_rd']:+.1f} / {r['away']} {r['away_rd']:+.1f}"
+                )
+
+            with col_conf:
+                bar_w = int(conf)
+                conf_color = "#00ff88" if conf >= 60 else "#ffdd00" if conf >= 35 else "#666"
+                st.markdown(
+                    f"<div style='text-align:center;background:#1a1a2e;"
+                    f"border:2px solid {conf_color};border-radius:10px;padding:8px 4px'>"
+                    f"<div style='font-size:1.4rem;font-weight:900;color:{conf_color}'>{conf:.0f}</div>"
+                    f"<div style='font-size:0.6rem;color:#aaa'>CONF</div></div>",
+                    unsafe_allow_html=True)
+                st.caption(f"Lineup data: {r['home']}={r['home_n']} / {r['away']}={r['away_n']} batters")
+
+        st.markdown("<hr style='margin:6px 0;border-color:#2a2a2a'>", unsafe_allow_html=True)
+
+    # ── Full comparison table ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📋 All Games Comparison Table")
+
+    table_ml = []
+    for r in game_rows:
+        table_ml.append({
+            "Rank":          game_rows.index(r) + 1,
+            "Matchup":       r["matchup"],
+            "Pick":          f"{r['pick_side']} ({r['pick_tier']})" if r["pick_side"] else "➖ No Play",
+            "Conf":          r["pick_conf"],
+            f"{r['away']} Model%": f"{r['away_wp']*100:.1f}%",
+            f"{r['home']} Model%": f"{r['home_wp']*100:.1f}%",
+            f"{r['away']} Mkt%":   f"{r['away_mkt']*100:.1f}%" if r["away_mkt"] else "N/A",
+            f"{r['home']} Mkt%":   f"{r['home_mkt']*100:.1f}%" if r["home_mkt"] else "N/A",
+            "Away Odds":     r["away_odds"],
+            "Home Odds":     r["home_odds"],
+            "Away Edge":     f"{r['away_edge']:+.1f}%" if r["away_edge"] is not None else "N/A",
+            "Home Edge":     f"{r['home_edge']:+.1f}%" if r["home_edge"] is not None else "N/A",
+            "Away SP":       r["away_sp"][:18],
+            "Home SP":       r["home_sp"][:18],
+        })
+
+    df_ml = pd.DataFrame(table_ml)
+
+    def color_pick_ml(val):
+        if "Strong" in str(val) or (str(val) not in ("➖ No Play", "N/A") and "No Play" not in str(val) and val != "➖ No Play"):
+            if "Strong" in str(val): return "color:#00ff88;font-weight:bold"
+            if "Lean" in str(val):   return "color:#ffdd00"
+        return "color:#888888"
+
+    def color_edge_ml(val):
         try:
             v = float(str(val).replace("%","").replace("+",""))
-            if v >= 7:  return "color: #00ff88; font-weight: bold"
-            if v >= 4:  return "color: #ffdd00"
-            if v <= -4: return "color: #ff4444"
+            if v >= 7:  return "color:#00ff88;font-weight:bold"
+            if v >= 4:  return "color:#ffdd00"
+            if v <= -4: return "color:#ff4444"
         except: pass
         return ""
 
-    edge_cols = [c for c in display_cols if "Edge" in c]
-    tier_cols  = [c for c in display_cols if "Tier" in c]
-    styled = df.style.map(color_pick, subset=["Pick"])
-    for ec in edge_cols:
-        styled = styled.map(color_edge, subset=[ec])
-    st.dataframe(styled, use_container_width=True)
+    def color_conf_ml(val):
+        try:
+            v = float(val)
+            if v >= 60: return "color:#00ff88;font-weight:bold"
+            if v >= 35: return "color:#ffdd00"
+        except: pass
+        return "color:#888888"
 
-    # Export
-    csv = df.to_csv(index=False)
-    st.download_button("📥 Export Moneyline CSV", csv, "moneyline.csv", "text/csv", key="dl_ml")
+    edge_cols_ml = [c for c in df_ml.columns if "Edge" in c]
+    styled_ml = df_ml.style.map(color_pick_ml, subset=["Pick"]).map(color_conf_ml, subset=["Conf"])
+    for ec in edge_cols_ml:
+        styled_ml = styled_ml.map(color_edge_ml, subset=[ec])
 
-    st.markdown("---")
-    st.subheader("🔍 Game-by-Game Breakdown")
+    st.dataframe(styled_ml, use_container_width=True)
 
-    for r in rows:
-        with st.expander(f"{r['Matchup']}  |  Pick: {r['Pick']}"):
-            b1, b2 = st.columns(2)
-            parts = r["Matchup"].split(" @ ")
-            away_t = parts[0] if parts else "Away"
-            home_t = parts[1] if len(parts) > 1 else "Home"
-
-            with b1:
-                st.markdown(f"**{away_t} (Away)**")
-                st.write(f"SP: {r['Away SP']}")
-                st.write(f"Model Win%: {r.get(f'{away_t} Model%', 'N/A')}")
-                st.write(f"Market Implied: {r.get(f'{away_t} Mkt%', 'N/A')}")
-                st.write(f"ML Odds: {r.get(f'{away_t} Odds', 'N/A')}")
-                st.write(f"Edge: {r.get(f'{away_t} Edge', 'N/A')}")
-                st.write(f"Tier: {r['Away Tier']}")
-            with b2:
-                st.markdown(f"**{home_t} (Home)**")
-                st.write(f"SP: {r['Home SP']}")
-                st.write(f"Model Win%: {r.get(f'{home_t} Model%', 'N/A')}")
-                st.write(f"Market Implied: {r.get(f'{home_t} Mkt%', 'N/A')}")
-                st.write(f"ML Odds: {r.get(f'{home_t} Odds', 'N/A')}")
-                st.write(f"Edge: {r.get(f'{home_t} Edge', 'N/A')}")
-                st.write(f"Tier: {r['Home Tier']}")
-            st.caption(f"Model inputs: {r['_label']}")
-            st.caption(f"Lineup batters found: {home_t}={r['_home_n']} | {away_t}={r['_away_n']}")
-
-    # No ML odds disclaimer
-    if not ml_odds:
-        st.warning("⚠️ No Odds API key loaded — market implied probabilities unavailable. "
-                   "Edge column shows N/A. Add Odds API key in sidebar for full edge calculation.")
+    csv_ml = df_ml.to_csv(index=False)
+    st.download_button("📥 Export Moneyline CSV", csv_ml, "moneyline.csv", "text/csv", key="dl_ml")
 
 
 def compute_k_score_for_play(p: Dict, pitcher_statcast: Dict,
@@ -5630,6 +5596,248 @@ def compute_hits_score_for_player(
     }
 
     return score, prob, tier, details
+
+
+
+# ============================================================================
+# HOT STREAKS TAB — Top 10 batters by recent form / hit streak
+# ============================================================================
+def display_hot_streaks_tab(plays: List[Dict]):
+    """
+    Tab: 🔥 Hot Streaks
+    Ranks the top 10 hottest batters by recent form score and TB/game.
+    Shows streak label, recent TB/game vs season baseline, HR pace, and
+    the model score so hot batters can be cross-referenced against today's lineup.
+    """
+    st.header("🔥 Hot Streaks — Top Batters in Form")
+    st.caption(
+        "Top batters ranked by recent performance (last 7 games). "
+        "TB/g = total bases per game over last 7. "
+        "🔥 Hot = recent TB/g is 20%+ above season baseline. "
+        "Cold or no-data batters are excluded."
+    )
+
+    if not plays:
+        st.info("Run the model first to see streak data.")
+        return
+
+    # ── Build streak-ranked list ──────────────────────────────────────────────
+    streak_plays = []
+    for p in plays:
+        streak_label = p.get("streak_label", "")
+        sub_streak   = p.get("sub_streak", 50.0)
+        tb_pg        = p.get("recent_tb_per_game")
+        recent_games = p.get("recent_games", 0)
+
+        # Only include batters with real recent data and a hot/neutral signal
+        # Exclude: no data, cold (sub_streak < 40), and < 3 game samples
+        if tb_pg is None or recent_games < 3:
+            continue
+        if sub_streak < 40:
+            continue
+
+        # Derive season TB expectation from xSLG proxy (same as model)
+        season_slg = p.get("xslg", 0.398) or 0.398
+        season_exp = season_slg * 4.2  # TB/game estimate from SLG
+        pct_above  = ((tb_pg / season_exp) - 1.0) * 100 if season_exp > 0 else 0.0
+
+        streak_plays.append({
+            "name":          p["name"],
+            "team":          p["team"],
+            "opponent":      p.get("opponent", ""),
+            "sp_name":       p.get("sp_name", "TBD"),
+            "sp_hand":       p.get("sp_hand", "R"),
+            "batter_hand":   p.get("batter_hand", "R"),
+            "lineup_slot":   p.get("lineup_slot", 9),
+            "sub_streak":    sub_streak,
+            "tb_per_game":   tb_pg,
+            "recent_games":  recent_games,
+            "season_exp":    round(season_exp, 2),
+            "pct_above":     round(pct_above, 1),
+            "streak_label":  streak_label,
+            "hr_last_7":     p.get("_hr_last7", 0),
+            "h_last_7":      p.get("_h_last7", 0),
+            "ab_last_7":     p.get("_ab_last7", 0),
+            "model_score":   p.get("score", 0),
+            "tier":          p.get("tier", "❌ NO PLAY"),
+            "barrel_rate":   p.get("barrel_rate", 0),
+            "hard_hit_rate": p.get("hard_hit_rate", 0),
+            "bvp_sig":       p.get("bvp_sig", ""),
+            "bvp_label":     p.get("bvp_label", ""),
+            "hr_score":      p.get("hr_score", 0),
+            "prob":          p.get("prob", 0),
+        })
+
+    # Sort: primary = sub_streak score, secondary = TB/game
+    streak_plays.sort(key=lambda x: (x["sub_streak"], x["tb_per_game"]), reverse=True)
+
+    if not streak_plays:
+        st.info("No recent form data available — lineups may not be confirmed yet, "
+                "or no batters have 3+ recent games loaded.")
+        return
+
+    top10 = streak_plays[:10]
+    cold_count = len([p for p in plays if p.get("sub_streak", 50) < 40 and p.get("recent_tb_per_game") is not None])
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    blazing = [p for p in streak_plays if p["sub_streak"] >= 70]
+    hot     = [p for p in streak_plays if 60 <= p["sub_streak"] < 70]
+    warm    = [p for p in streak_plays if 50 <= p["sub_streak"] < 60]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🔥🔥 Blazing (70+)", len(blazing))
+    m2.metric("🔥 Hot (60-69)",     len(hot))
+    m3.metric("📈 Warm (50-59)",    len(warm))
+    m4.metric("❄️ Cold (faded)",    cold_count)
+
+    st.markdown("---")
+    st.subheader(f"🏆 Top {len(top10)} Batters in Form")
+
+    # ── Ranked streak cards ───────────────────────────────────────────────────
+    for rank, p in enumerate(top10, 1):
+        score     = p["sub_streak"]
+        tb_pg     = p["tb_per_game"]
+        pct_above = p["pct_above"]
+
+        # Color by streak intensity
+        if score >= 70:
+            border = "#ff4444"; flame = "🔥🔥"; heat_label = "BLAZING"
+        elif score >= 60:
+            border = "#ff8800"; flame = "🔥"; heat_label = "HOT"
+        else:
+            border = "#ffdd00"; flame = "📈"; heat_label = "WARM"
+
+        # Tier color for model score badge
+        model_sc = p["model_score"]
+        if model_sc >= 80:
+            tier_color = "#00ff88"
+        elif model_sc >= 70:
+            tier_color = "#ffdd00"
+        elif model_sc >= 60:
+            tier_color = "#ff8800"
+        else:
+            tier_color = "#666666"
+
+        with st.container():
+            col_rank, col_player, col_streak, col_context, col_badges = st.columns([0.4, 2.2, 2.6, 2.6, 1.6])
+
+            with col_rank:
+                st.markdown(
+                    f"<div style='text-align:center;margin-top:8px'>"
+                    f"<div style='font-size:1.6rem;font-weight:900;color:{border}'>{rank}</div>"
+                    f"<div style='font-size:0.65rem;color:{border};font-weight:bold'>{heat_label}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True)
+
+            with col_player:
+                st.markdown(f"**{p['name']}** &nbsp;`{p['team']}`")
+                vs_str = f"vs {p['opponent']}" if p["opponent"] else ""
+                sp_str = f"· {p['sp_name'][:20]} ({p['sp_hand']}HP)" if p["sp_name"] not in ("TBD","") else "· SP TBD"
+                st.caption(f"#{p['lineup_slot']} · {p['batter_hand']}HB {vs_str} {sp_str}")
+                # BvP note if relevant
+                bvp = p.get("bvp_sig", "")
+                if bvp == "owns":
+                    st.caption("🔥 OWNS this pitcher career")
+                elif bvp == "edge":
+                    st.caption("🟢 Edge vs this pitcher")
+                elif bvp == "dominated":
+                    st.caption("⚠️ Dominated by this pitcher")
+
+            with col_streak:
+                # TB/game progress vs baseline
+                bl = p["season_exp"]
+                bar_pct = min(100, int(tb_pg / max(bl, 0.1) * 60))
+                pct_str = f"+{pct_above:.0f}% above baseline" if pct_above >= 0 else f"{pct_above:.0f}% below"
+                color_bar = border
+
+                st.markdown(f"{flame} **{tb_pg:.2f} TB/g** last {p['recent_games']}g")
+                st.markdown(
+                    f"<div style='font-size:0.75rem;color:#aaa;margin-bottom:2px'>"
+                    f"Baseline: {bl:.2f} · {pct_str}</div>"
+                    f"<div style='background:#333;border-radius:4px;height:6px;width:100%'>"
+                    f"<div style='background:{color_bar};width:{bar_pct}%;height:6px;border-radius:4px'>"
+                    f"</div></div>",
+                    unsafe_allow_html=True)
+                st.markdown(" ")
+                # Hitting line
+                h7  = p["h_last_7"]
+                ab7 = p["ab_last_7"]
+                hr7 = p["hr_last_7"]
+                avg7 = f"{h7/ab7:.3f}" if ab7 > 0 else "—"
+                hr_str = f" · {hr7}HR" if hr7 > 0 else ""
+                st.caption(f"Last {p['recent_games']}g line: {h7}/{ab7} ({avg7}){hr_str}")
+
+            with col_context:
+                # Contact quality + today's matchup context
+                barrel = p["barrel_rate"] * 100
+                hh = p["hard_hit_rate"] * 100
+                st.caption(f"**Barrel%:** {barrel:.1f}%  |  **HH%:** {hh:.1f}%")
+                st.caption(f"**HR Score:** {p['hr_score']:.0f}/100  |  **O1.5 Prob:** {p['prob']*100:.0f}%")
+                # Streak label cleaned
+                lbl = p["streak_label"].replace("Form: ", "").replace("🔥 Hot", "").replace("❄️ Cold", "").strip()
+                if lbl:
+                    st.caption(lbl)
+
+            with col_badges:
+                # Model score badge
+                st.markdown(
+                    f"<div style='text-align:center;background:#1a1a2e;"
+                    f"border:2px solid {tier_color};border-radius:10px;padding:6px 2px;margin-bottom:4px'>"
+                    f"<div style='font-size:1.2rem;font-weight:900;color:{tier_color}'>{model_sc:.0f}</div>"
+                    f"<div style='font-size:0.6rem;color:#aaa'>MODEL</div></div>",
+                    unsafe_allow_html=True)
+                # Streak score badge
+                st.markdown(
+                    f"<div style='text-align:center;background:#1a1a2e;"
+                    f"border:2px solid {border};border-radius:10px;padding:6px 2px'>"
+                    f"<div style='font-size:1.2rem;font-weight:900;color:{border}'>{score:.0f}</div>"
+                    f"<div style='font-size:0.6rem;color:#aaa'>STREAK</div></div>",
+                    unsafe_allow_html=True)
+
+        st.markdown("<hr style='margin:6px 0;border-color:#2a2a2a'>", unsafe_allow_html=True)
+
+    # ── Full streaks table ────────────────────────────────────────────────────
+    if len(streak_plays) > 10:
+        st.markdown("---")
+        with st.expander(f"📋 Full Streak Rankings ({len(streak_plays)} batters with recent data)"):
+            full_rows = []
+            for i, p in enumerate(streak_plays, 1):
+                h7 = p["h_last_7"]; ab7 = p["ab_last_7"]; hr7 = p["hr_last_7"]
+                full_rows.append({
+                    "Rank":         i,
+                    "Player":       p["name"],
+                    "Team":         p["team"],
+                    "Streak Score": p["sub_streak"],
+                    "TB/g (last7)": f"{p['tb_per_game']:.2f}",
+                    "vs Baseline":  f"{p['pct_above']:+.0f}%",
+                    "Hitting Line": f"{h7}/{ab7}" + (f" {hr7}HR" if hr7 else ""),
+                    "Games":        p["recent_games"],
+                    "Model Score":  p["model_score"],
+                    "Tier":         p["tier"],
+                    "vs":           p["opponent"],
+                    "Opp SP":       p["sp_name"][:18],
+                })
+            df_str = pd.DataFrame(full_rows)
+
+            def color_streak_sc(val):
+                try:
+                    v = float(val)
+                    if v >= 70: return "color:#ff4444;font-weight:bold"
+                    if v >= 60: return "color:#ff8800;font-weight:bold"
+                    if v >= 50: return "color:#ffdd00"
+                    return "color:#888888"
+                except: return ""
+
+            styled_str = df_str.style.map(color_streak_sc, subset=["Streak Score"])
+            st.dataframe(styled_str, use_container_width=True)
+
+    # ── Targeting note ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.info(
+        "💡 **How to use Hot Streaks:** Cross-reference these batters with the O1.5 Leaderboard. "
+        "A hot batter (70+ streak score) with a Tier 2+ model score and a weak opposing pitcher "
+        "is your highest-confidence same-game parlay anchor."
+    )
 
 
 def display_hits_tab(plays: List[Dict]):
@@ -8478,18 +8686,19 @@ else:
     # ── MAIN CONTENT ──────────────────────────────────────
     st.title("⚾ MLB TB Analyzer V1.9")
     import hashlib as _hlib
-    _sig = _hlib.md5(b"v19_kprops_moneyline").hexdigest()[:6]
-    st.caption(f"🔑 Build sig: {_sig} — V1.9: K Props + Moneyline models live")
-    st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V1.9: K Props tab + Moneyline tab added")
+    _sig = _hlib.md5(b"v20_kprops_ml_hotstreaks").hexdigest()[:6]
+    st.caption(f"🔑 Build sig: {_sig} — V2.0: K Props redesigned + ML ranked cards + Hot Streaks tab")
+    st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V2.0: K Props + Moneyline redesigned + Hot Streaks tab")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
         "📊 O1.5 Leaderboard",
         "🎯 Tiered Breakdown",
         "💰 Parlay Builder",
         "🎯 O0.5 Any Hit",
         "⚡ K Props",
         "🏦 Moneyline",
+        "🔥 Hot Streaks",
         "💣 HR Plays",
         "🏆 FanDuel DFS",
         "🎯 PrizePicks",
@@ -8590,18 +8799,25 @@ else:
             st.info("Run the model first to see moneyline analysis.")
 
     with tab7:
+        # ── Hot Streaks ───────────────────────────────────
+        if st.session_state.plays:
+            display_hot_streaks_tab(st.session_state.plays)
+        else:
+            st.info("Run the model first to see hot streak rankings.")
+
+    with tab8:
         if st.session_state.plays:
             display_hr_plays(st.session_state.plays)
         else:
             st.info("Run the model first to see HR plays.")
 
-    with tab8:
+    with tab9:
         display_dfs_tab(st.session_state.plays if st.session_state.plays else [])
 
-    with tab9:
+    with tab10:
         display_prizepicks_tab(st.session_state.plays if st.session_state.plays else [])
 
-    with tab10:
+    with tab11:
         display_results_tracker()
 
 
