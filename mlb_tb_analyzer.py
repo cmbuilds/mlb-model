@@ -372,6 +372,7 @@ def fetch_schedule(date_str: str) -> List[Dict]:
                 for side in ["home_team", "away_team"]:
                     name_key = side + "_name"
                     code = game_info[side]
+                    _raw_code = code  # save for debug
                     mapped_name = TEAM_ABB_MAP.get(game_info[name_key])
                     mapped_code = TEAM_ABB_MAP.get(code)
                     if code not in STADIUM_COORDS:
@@ -380,7 +381,9 @@ def fetch_schedule(date_str: str) -> List[Dict]:
                         elif mapped_code:
                             game_info[side] = mapped_code
                     elif mapped_code and mapped_code in STADIUM_COORDS:
-                        game_info[side] = mapped_code  # normalize alternate abbrev
+                        game_info[side] = mapped_code
+                    # Embed raw API value for debug
+                    game_info[f"_raw_{side}"] = _raw_code
 
                 # Neutral-site detection — Mexico City & international venues
                 venue_lower = game_info.get("venue", "").lower()
@@ -3644,6 +3647,8 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         away_team = game["away_team"]
         
         log(f"Processing: **{away_team} @ {home_team}**...", "run")
+        log(f"  DEBUG: home_team='{home_team}' away_team='{away_team}' venue='{game.get('venue','?')}' neutral={game.get('neutral_site',False)}", "info")
+        log(f"  DEBUG: raw API codes: home='{game.get('_raw_home_team','?')}' away='{game.get('_raw_away_team','?')}'", "info")
 
         # Park / weather — use neutral-site override when applicable
         park_override = game.get("park_override")
@@ -3661,6 +3666,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
         # Per-side fallback: if one side has no batters, try roster for that side
         # (don't skip the whole game just because one side's lineup isn't posted)
+        log(f"  DEBUG: fetch_lineup returned home={len(home_batters)} away={len(away_batters)} batters", "info")
         if not home_batters:
             home_id = fetch_team_id(home_team)
             if home_id:
@@ -3675,6 +3681,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                     log(f"  {away_team} lineup not posted — using projected roster (flagged)", "warn")
 
         lineup_confirmed = bool(home_batters or away_batters)
+        log(f"  DEBUG: after fallback home={len(home_batters)} away={len(away_batters)} | home_team={home_team} away_team={away_team}", "info")
 
         if not lineup_confirmed:
             log(f"  Could not load any batters for {away_team}@{home_team} — skipping", "err")
