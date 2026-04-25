@@ -413,34 +413,43 @@ def fetch_lineup(game_pk: int) -> Dict:
             batting_order = team_data.get("battingOrder", [])
             players = team_data.get("players", {})
             
-            # Use batting order if available, else batters list
+            # Use batting order if available, else batters list.
+            # Take up to 12 entries to handle NL/Mexico City rules where pitcher
+            # occupies a batting order slot — we skip pitchers and collect 9 real batters.
             order = batting_order if batting_order else batters
             
-            for slot_idx, player_id in enumerate(order[:9]):
+            slot_num = 0  # tracks actual batter position (1-9), ignoring pitcher slots
+            for player_id in order[:12]:
+                if slot_num >= 9:
+                    break
                 player_key = f"ID{player_id}"
                 player_info = players.get(player_key, {})
                 person = player_info.get("person", {})
-                stats = player_info.get("stats", {})
                 position = player_info.get("position", {})
                 
-                # Skip pitchers
+                # Skip pitchers — they appear in batting order for NL/international rules
                 if position.get("abbreviation") == "P":
                     continue
                 
+                # Also skip if player type indicates pitcher (extra safety)
+                if player_info.get("gameStatus", {}).get("isCurrentBatter") is False and \
+                   position.get("type", "") == "Pitcher":
+                    continue
+                
+                slot_num += 1
                 bat_hand = person.get("batSide", {}).get("code", "")
                 if not bat_hand or bat_hand == "?":
-                    # Boxscore sometimes omits batSide — try person details
                     try:
                         pr = requests.get(f"https://statsapi.mlb.com/api/v1/people/{player_id}",
                                          params={"fields":"people,id,fullName,batSide"},
                                          timeout=5)
                         bat_hand = pr.json().get("people",[{}])[0].get("batSide",{}).get("code","R")
                     except Exception:
-                        bat_hand = "R"  # fallback to R (most common)
+                        bat_hand = "R"
                 batter = {
                     "player_id": str(player_id),
                     "name": person.get("fullName", f"Player {player_id}"),
-                    "lineup_slot": slot_idx + 1,
+                    "lineup_slot": slot_num,
                     "batter_hand": bat_hand or "R",
                     "position": position.get("abbreviation", ""),
                 }
@@ -3645,25 +3654,32 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             log(f"  🌎 Neutral site — using {park_key} park factors ({park_info[2]})", "info")
         weather = fetch_weather(lat, lon, game.get("game_time", ""), is_dome)
 
-        # Lineups — try confirmed first, fall back to roster
+        # Lineups — try confirmed first, fall back to roster per side independently
         lineups = fetch_lineup(game_pk)
         home_batters = lineups.get("home", [])
         away_batters = lineups.get("away", [])
+
+        # Per-side fallback: if one side has no batters, try roster for that side
+        # (don't skip the whole game just because one side's lineup isn't posted)
+        if not home_batters:
+            home_id = fetch_team_id(home_team)
+            if home_id:
+                home_batters = fetch_team_roster(home_id)
+                if home_batters:
+                    log(f"  {home_team} lineup not posted — using projected roster (flagged)", "warn")
+        if not away_batters:
+            away_id = fetch_team_id(away_team)
+            if away_id:
+                away_batters = fetch_team_roster(away_id)
+                if away_batters:
+                    log(f"  {away_team} lineup not posted — using projected roster (flagged)", "warn")
+
         lineup_confirmed = bool(home_batters or away_batters)
 
         if not lineup_confirmed:
-            log(f"  Lineup not posted yet — using projected roster (flagged)", "warn")
-            # Fallback: use roster
-            home_id = fetch_team_id(home_team)
-            away_id = fetch_team_id(away_team)
-            if home_id:
-                home_batters = fetch_team_roster(home_id)
-            if away_id:
-                away_batters = fetch_team_roster(away_id)
-            if not home_batters and not away_batters:
-                log(f"  Could not load roster for {away_team}@{home_team} — skipping", "err")
-                games_skipped += 1
-                continue
+            log(f"  Could not load any batters for {away_team}@{home_team} — skipping", "err")
+            games_skipped += 1
+            continue
 
         # Pitcher info
         home_pitcher_id = game.get("home_pitcher_id")
