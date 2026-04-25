@@ -3395,41 +3395,58 @@ def compute_hr_score(
 # ============================================================================
 # ROSTER FALLBACK — fetch team roster when lineup not yet posted
 # ============================================================================
-@st.cache_data(ttl=3600)
 def fetch_team_roster(team_id: int) -> List[Dict]:
-    """Fetch 40-man roster as fallback when lineup not confirmed."""
-    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
-    params = {"rosterType": "active"}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        batters = []
-        for p in data.get("roster", []):
-            pos = p.get("position", {}).get("type", "")
-            if pos in ("Pitcher",):
+    """Fetch active roster as lineup fallback. NOT cached — cache of empty list is worse than a fresh call."""
+    # Try both rosterType=active and depthChart for robustness
+    for roster_type in ["active", "fullRoster"]:
+        try:
+            r = requests.get(
+                f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster",
+                params={"rosterType": roster_type},
+                timeout=15
+            )
+            if r.status_code != 200:
                 continue
-            batters.append({
-                "player_id": str(p["person"]["id"]),
-                "name": p["person"]["fullName"],
-                "lineup_slot": 5,  # unknown slot
-                "batter_hand": "R",  # default
-                "position": p.get("position", {}).get("abbreviation", ""),
-                "projected": True,
-            })
-        return batters[:9]
-    except:
-        return []
+            data = r.json()
+            batters = []
+            for p in data.get("roster", []):
+                pos_type = p.get("position", {}).get("type", "")
+                pos_abbr = p.get("position", {}).get("abbreviation", "")
+                # Skip pitchers
+                if pos_type == "Pitcher" or pos_abbr == "P":
+                    continue
+                batters.append({
+                    "player_id": str(p["person"]["id"]),
+                    "name": p["person"]["fullName"],
+                    "lineup_slot": 5,
+                    "batter_hand": "R",
+                    "position": pos_abbr,
+                    "lineup_confirmed": False,
+                })
+            if batters:
+                return batters[:9]
+        except Exception:
+            continue
+    return []
 
 @st.cache_data(ttl=3600)
 def fetch_team_id(abbreviation: str) -> Optional[int]:
-    """Get MLB team ID from abbreviation."""
-    url = "https://statsapi.mlb.com/api/v1/teams"
-    params = {"sportId": 1, "season": 2026}
+    """Get MLB team ID. Hardcoded map first (never fails on API timeout), then API fallback."""
+    TEAM_IDS = {
+        "ARI": 109, "ATL": 144, "BAL": 110, "BOS": 111, "CHC": 112,
+        "CWS": 145, "CIN": 113, "CLE": 114, "COL": 115, "DET": 116,
+        "HOU": 117, "KC":  118, "LAA": 108, "LAD": 119, "MIA": 146,
+        "MIL": 158, "MIN": 142, "NYM": 121, "NYY": 147, "OAK": 133,
+        "PHI": 143, "PIT": 134, "SD":  135, "SEA": 136, "SF":  137,
+        "STL": 138, "TB":  139, "TEX": 140, "TOR": 141, "WSH": 120,
+    }
+    team_id = TEAM_IDS.get(str(abbreviation).upper().strip())
+    if team_id:
+        return team_id
     try:
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        for team in data.get("teams", []):
+        r = requests.get("https://statsapi.mlb.com/api/v1/teams",
+                         params={"sportId": 1, "season": 2026}, timeout=10)
+        for team in r.json().get("teams", []):
             if team.get("abbreviation") == abbreviation:
                 return team["id"]
     except:
@@ -3665,20 +3682,27 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         away_batters = lineups.get("away", [])
 
         # Per-side fallback: if one side has no batters, try roster for that side
-        # (don't skip the whole game just because one side's lineup isn't posted)
         log(f"  DEBUG: fetch_lineup returned home={len(home_batters)} away={len(away_batters)} batters", "info")
         if not home_batters:
             home_id = fetch_team_id(home_team)
+            log(f"  DEBUG: {home_team} lineup empty → fetch_team_id returned {home_id}", "info")
             if home_id:
                 home_batters = fetch_team_roster(home_id)
+                log(f"  DEBUG: {home_team} roster fetch returned {len(home_batters)} players", "info")
                 if home_batters:
-                    log(f"  {home_team} lineup not posted — using projected roster (flagged)", "warn")
+                    log(f"  {home_team} lineup not posted — using projected roster ({len(home_batters)} players)", "warn")
+                else:
+                    log(f"  ❌ {home_team} roster fetch also failed — team_id={home_id}", "err")
         if not away_batters:
             away_id = fetch_team_id(away_team)
+            log(f"  DEBUG: {away_team} lineup empty → fetch_team_id returned {away_id}", "info")
             if away_id:
                 away_batters = fetch_team_roster(away_id)
+                log(f"  DEBUG: {away_team} roster fetch returned {len(away_batters)} players", "info")
                 if away_batters:
-                    log(f"  {away_team} lineup not posted — using projected roster (flagged)", "warn")
+                    log(f"  {away_team} lineup not posted — using projected roster ({len(away_batters)} players)", "warn")
+                else:
+                    log(f"  ❌ {away_team} roster fetch also failed — team_id={away_id}", "err")
 
         lineup_confirmed = bool(home_batters or away_batters)
         log(f"  DEBUG: after fallback home={len(home_batters)} away={len(away_batters)} | home_team={home_team} away_team={away_team}", "info")
