@@ -1208,7 +1208,9 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     import io as _io
 
     # ── 1. Early disk cache ───────────────────────────────────────────────
-    _early = _load_disk_cache("pitching_stats", max_age_hours=6)
+    # NOTE: Cache cleared when FIP-only vulnerability fix deployed (2026-05-05)
+    # Reduce TTL to 2h so fresh data always runs through FIP-only detection
+    _early = _load_disk_cache("pitching_stats", max_age_hours=2)
     if _early is not None:
         st.session_state["_pitching_source"] = "disk_cache_fresh"
         return _early
@@ -5441,9 +5443,15 @@ def compute_win_probability(
     away_off = max(0.5, away_off_wrc / 100.0)
     hpv = float(home_sp_stats.get("_sp_vuln", 50.0)) * 0.60 + home_bp_vuln * 0.40
     apv = float(away_sp_stats.get("_sp_vuln", 50.0)) * 0.60 + away_bp_vuln * 0.40
-    hps = max(0.2, (100.0 - hpv) / 100.0)
-    aps = max(0.2, (100.0 - apv) / 100.0)
-    hs = home_off * aps * 1.035; aws = away_off * hps
+    # Pitcher factor: scales how many runs the OPPOSING offense scores.
+    # High vulnerability = opponent scores more. Low vulnerability = opponent scores less.
+    # Scale: vuln 0 → 0.0 factor, vuln 50 → 1.0 (avg), vuln 100 → 2.0
+    # PHI scores against Severino (away pitcher = apv):  high apv = PHI scores more
+    # OAK scores against Sanchez  (home pitcher = hpv):  high hpv = OAK scores more
+    h_pit_factor = max(0.10, apv / 50.0)   # away pitcher vuln → home offense multiplier
+    a_pit_factor = max(0.10, hpv / 50.0)   # home pitcher vuln → away offense multiplier
+    hs  = home_off * h_pit_factor * 1.035  # home team scoring (home field +3.5%)
+    aws = away_off * a_pit_factor           # away team scoring
     tot = hs + aws
     if tot <= 0:
         return 0.52, "Log5 zero — home-field default"
@@ -8461,19 +8469,32 @@ def display_fd_hand_builder(plays: List[Dict]):
     st.markdown("---")
 
     # ── HITTER POSITION SECTIONS ──────────────────────────────────────────────
+    def _pos_eligible(rp_str, pos):
+        """Check if player with roster_pos string rp_str is eligible for FD slot pos."""
+        parts = [s.strip() for s in rp_str.split("/")]
+        if pos == "C/1B":
+            return "C" in parts or "1B" in parts
+        if pos == "OF":
+            return "OF" in parts or "LF" in parts or "CF" in parts or "RF" in parts
+        if pos == "UTIL":
+            return True
+        return pos in parts
+
     POSITION_MAP = {
-        "C/1B":  {"slots": ["C/1B"],          "eligible": lambda rp: "C" in rp.split("/") or "1B" in rp.split("/")},
-        "2B":    {"slots": ["2B"],             "eligible": lambda rp: "2B" in rp.split("/")},
-        "3B":    {"slots": ["3B"],             "eligible": lambda rp: "3B" in rp.split("/")},
-        "SS":    {"slots": ["SS"],             "eligible": lambda rp: "SS" in rp.split("/")},
-        "OF":    {"slots": ["OF1","OF2","OF3"],"eligible": lambda rp: "OF" in rp.split("/")},
-        "UTIL":  {"slots": ["UTIL"],           "eligible": lambda rp: True},
+        "C/1B":  {"slots": ["C/1B"],           "pos": "C/1B"},
+        "2B":    {"slots": ["2B"],              "pos": "2B"},
+        "3B":    {"slots": ["3B"],              "pos": "3B"},
+        "SS":    {"slots": ["SS"],              "pos": "SS"},
+        "OF":    {"slots": ["OF1","OF2","OF3"], "pos": "OF"},
+        "UTIL":  {"slots": ["UTIL"],            "pos": "UTIL"},
     }
 
     def get_eligible(pos_key):
-        check = POSITION_MAP[pos_key]["eligible"]
+        pos = POSITION_MAP[pos_key]["pos"]
         return [p for p in eligible_plays
-                if check([s.strip() for s in p.get("fd_roster_pos", p.get("fd_position","OF")).upper().split("/")])]
+                if _pos_eligible(
+                    p.get("fd_roster_pos", p.get("fd_position","OF")).upper(), pos
+                )]
 
     # Current locked names to exclude from selection tables
     locked_names = set(p["name"] for p in lu.values() if p and p.get("name"))
@@ -8543,13 +8564,16 @@ def display_fd_hand_builder(plays: List[Dict]):
                     return ""
                 except: return ""
 
-            st.dataframe(
-                df_p.style.map(_cproj, subset=["FD Proj","Ceiling"])
-                          .map(_cval,  subset=["Value"])
-                          .map(_co,    subset=["Own%"]),
-                use_container_width=True, hide_index=True,
-                height=min(380, 55 + len(rows_p) * 35)
-            )
+            if df_p.empty or "FD Proj" not in df_p.columns:
+                st.info("No salary-matched players at this position.")
+            else:
+                st.dataframe(
+                    df_p.style.map(_cproj, subset=["FD Proj","Ceiling"])
+                              .map(_cval,  subset=["Value"])
+                              .map(_co,    subset=["Own%"]),
+                    use_container_width=True, hide_index=True,
+                    height=min(380, 55 + len(rows_p) * 35)
+                )
 
             # Lock selector
             names_avail = [r["_name"] for r in rows_p
@@ -8695,7 +8719,10 @@ def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
         return [], {"error": "No SPs with salary found"}
 
     # ── Identify stack teams ──────────────────────────────────────────────────
-    game_scores  = compute_game_stack_scores(fd_plays)
+    # Use raw plays from session state for game stack scoring
+    # (fd_plays are salary-enriched but may lack wind/park fields)
+    raw_plays = st.session_state.get("plays", fd_plays)
+    game_scores = compute_game_stack_scores(raw_plays if raw_plays else fd_plays)
     # Top 4 teams by stack score (home team of top games)
     stack_candidates = []
     seen_stack_teams = set()
