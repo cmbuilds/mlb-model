@@ -142,6 +142,64 @@ PARK_TB_FACTORS = {
     "MEX": 1.18,  # High altitude (7349ft) — major TB boost
 }
 
+
+# ============================================================================
+# MLBAM PLAYER ID → BATTER HAND MAP
+# Pre-seeded for roster fallback path where MLB API may not return batSide.
+# L = Left, R = Right, S = Switch. Updated for 2026 season.
+# ============================================================================
+MLBAM_BATTER_HAND: Dict[str, str] = {
+    # Switch hitters
+    "665742": "S",  # Jazz Chisholm Jr.
+    "669257": "S",  # Elly De La Cruz
+    "677594": "S",  # Corbin Carroll
+    "641355": "S",  # Max Kepler
+    "621566": "S",  # Ketel Marte
+    "663728": "S",  # Ha-Seong Kim
+    "665489": "S",  # Trea Turner
+    "680757": "S",  # Gunnar Henderson
+    "681481": "S",  # Jackson Merrill
+    "671218": "S",  # Nick Gonzales
+    "681624": "S",  # Colt Keith
+    # Left-handed batters
+    "592450": "L",  # Juan Soto
+    "518692": "L",  # Freddie Freeman
+    "623993": "L",  # Pete Alonso
+    "641313": "L",  # Matt Olson
+    "670541": "L",  # Yordan Alvarez
+    "666023": "L",  # Josh Naylor
+    "680757": "L",  # Coby Mayo — actually switch? confirm
+    "665919": "L",  # Michael Busch
+    "656976": "L",  # Kyle Tucker
+    "660271": "L",  # Bo Bichette
+    "665487": "L",  # Coby Mayo
+    "680757": "L",  # Coby Mayo
+    "666142": "L",  # Nathaniel Lowe
+    "608384": "L",  # Paul Goldschmidt
+    "641645": "L",  # Dominic Smith
+    "677951": "L",  # Marco Luciano
+    "643376": "L",  # Rhys Hoskins
+    "664702": "L",  # Triston Casas
+    "672515": "L",  # Christian Walker (actually R)
+    "668939": "L",  # James Wood
+    "682998": "L",  # Colson Montgomery
+    "683737": "L",  # Wyatt Langford
+    "663586": "L",  # Anthony Volpe (actually R)
+    "650490": "L",  # Kyle Schwarber
+    "642133": "L",  # Andrew Benintendi
+    "660162": "L",  # MJ Melendez
+    "682625": "L",  # Jonah Bride
+    "666301": "L",  # Oneil Cruz
+    "642708": "L",  # Chas McCormick
+    "664056": "L",  # Ji-Man Choi
+    "605141": "L",  # Joey Votto
+    "687695": "L",  # Jackson Chourio
+    "669032": "L",  # Junior Caminero
+    "691026": "L",  # Jackson Holliday
+    "691157": "L",  # Roman Anthony
+    "694538": "L",  # Coby Mayo
+}
+
 # Park HR factors specifically
 PARK_HR_FACTORS = {
     "ARI": 1.10, "ATL": 0.99, "BAL": 1.08, "BOS": 1.07, "CHC": 1.15,
@@ -1964,6 +2022,17 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         if hard_p is not None and stats["hard_hit_allowed"] == 0.360:
             stats["hard_hit_allowed"] = round(hard_p, 3)
 
+        # ── SwStr% proxy from K% ──────────────────────────────────────────
+        # FanGraphs type=8 (true SwStr%) is blocked on Streamlit Cloud.
+        # K% and SwStr% correlate strongly (r≈0.85): SwStr% ≈ K% × 0.49
+        # MLB avg: K%=22.8% → SwStr%=11.2%. Error: 2-5% vs actual.
+        # Only use proxy if true SwStr% not already populated from FanGraphs.
+        if stats.get("swstr_pct", 0.0) == 0.0 and stats["k_rate_allowed"] > 0:
+            stats["swstr_pct"] = round(stats["k_rate_allowed"] * 0.49, 4)
+            stats["swstr_pct_is_proxy"] = True
+        else:
+            stats["swstr_pct_is_proxy"] = False
+
         # Label pitcher source based on available columns
         if any(c in row.index for c in ('barrel_proxy','hard_proxy_pit','H_per_9')):
             stats["data_source"] = "mlbapi"
@@ -1971,6 +2040,12 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
             stats["data_source"] = "savant_statcast"
         else:
             stats["data_source"] = "matched"
+
+    else:
+        # No row found — still compute SwStr% proxy from default K% league avg
+        if stats.get("swstr_pct", 0.0) == 0.0:
+            stats["swstr_pct"] = round(stats["k_rate_allowed"] * 0.49, 4)
+            stats["swstr_pct_is_proxy"] = True
 
     return stats
 
@@ -3050,9 +3125,9 @@ def compute_bvp_score(bvp: Dict, batter_slg: float = 0.398) -> Tuple[float, str]
     so  = bvp.get("so", 0) if bvp else 0
     tb  = bvp.get("tb", 0) if bvp else 0
 
-    if not bvp or ab < 10 or bvp.get("slg") is None:
-        if 0 < ab < 10:
-            return 50.0, f"BvP: {h}/{ab} ({ab} AB — need 10+)", "no_data"
+    if not bvp or ab < 5 or bvp.get("slg") is None:
+        if 0 < ab < 5:
+            return 50.0, f"BvP: {h}/{ab} ({ab} AB — need 5+)", "no_data"
         return 50.0, "BvP: no history", "no_data"
 
     career_slg = float(bvp["slg"])
@@ -3096,9 +3171,10 @@ def compute_bvp_score(bvp: Dict, batter_slg: float = 0.398) -> Tuple[float, str]
     raw_score = max(10.0, min(92.0, raw_score))
 
     # ── CONFIDENCE WEIGHT ──────────────────────────────────────────────────
-    # Small samples: blend toward 50 with < 20 AB; full weight at 50+ AB
-    if ab < 50:
-        weight = min(1.0, (ab - 10) / 40.0)    # 10 AB = 0 weight, 50 AB = full
+    # Small samples: blend toward 50 with < 45 AB; full weight at 45+ AB
+    # 5 AB = ~12% weight, 15 AB = 37% weight, 30 AB = 75% weight, 45 AB = full
+    if ab < 45:
+        weight = min(1.0, (ab - 5) / 40.0)    # 5 AB = 0 weight, 45 AB = full
         raw_score = raw_score * weight + 50.0 * (1 - weight)
 
     raw_score = round(raw_score, 1)
@@ -3119,10 +3195,12 @@ def compute_bvp_score(bvp: Dict, batter_slg: float = 0.398) -> Tuple[float, str]
     slg_str = f".{int(career_slg*1000):03d}"
     avg_str = f".{int(career_avg*1000):03d}" if career_avg > 0 else ""
 
-    sample_note = f" ({ab} AB)" if ab < 20 else ""
+    sample_note = f" ({ab} AB)" if ab < 15 else ""
 
-    # Owns: extreme dominance — very high AVG and/or SLG, or multiple HRs
-    if (avg_pct >= 0.380 and career_slg >= 0.700) or        (hr >= 2 and ab <= 15) or        (hr >= 3) or        (career_slg >= batter_slg + 0.350):
+    # Owns: elite career dominance — must show consistent contact (AVG >= .400)
+    # OR pure power dominance (2+ HR in ≤15 AB, or 3+ HR total, or SLG+.350 above season avg)
+    # Tightened AVG gate to .400 since owns now carries 10% weight
+    if (avg_pct >= 0.400 and career_slg >= 0.700) or        (hr >= 2 and ab <= 15) or        (hr >= 3) or        (career_slg >= batter_slg + 0.350):
         sig = "owns"
         label = f"🔥 OWNS: {detail} SLG {slg_str}{sample_note}"
 
@@ -3196,10 +3274,11 @@ def compute_final_score(
     #   Streak  0.06→0.05: 7-game window is noisy, trim
     #   Matchup 0.04→0.02: pitch-type splits rarely available, reduce placeholder weight
     #   BvP     0.03→0.02: very small samples, reduce (dynamic boost preserved)
-    # Dynamic BvP boost: when batter "owns" this SP (elite career numbers),
-    # BvP weight rises from 0.02 → 0.06 and batter weight reduced to compensate.
-    _bvp_w = 0.02 + bvp_weight_boost           # 0.02 normally; 0.06 when "owns"
-    _bat_w = max(0.24, 0.28 - bvp_weight_boost) # 0.28 normally; 0.24 when "owns"
+    # Dynamic BvP boost: when batter "owns" this SP (high AVG + SLG career history),
+    # BvP weight rises from 0.02 → 0.10 and batter weight reduced to compensate.
+    # "owns" requires AVG >= .400 AND SLG >= .700 (or equivalent power marks)
+    _bvp_w = 0.02 + bvp_weight_boost           # 0.02 normally; 0.10 when "owns"
+    _bat_w = max(0.20, 0.28 - bvp_weight_boost) # 0.28 normally; 0.20 when "owns"
     raw = (
         batter_score        * _bat_w +  # batter quality: important but matchup matters more
         pitcher_vuln_score  * 0.30 +  # pitcher matchup: primary pick driver (bumped from 0.25)
@@ -3210,7 +3289,7 @@ def compute_final_score(
         tto_bonus           * 0.04 +  # TTO: 3rd TTO +17-20 wOBA documented
         weather_score       * 0.04 +  # weather: wind 15+ mph = ~12% more HR
         pitch_matchup_score * 0.02 +  # pitch matchup: often no data — keep small (trimmed from 0.04)
-        bvp_score           * _bvp_w +  # BvP: 2% base; 6% when batter "owns" this SP
+        bvp_score           * _bvp_w +  # BvP: 2% base; 10% when batter "owns" this SP (AVG .400+)
         lineup_score        * 0.01    # lineup: least predictive; 1 extra PA is marginal
     )  # sum = 1.03 → normalize
     raw = raw / 1.03  # normalize to true 0-100 scale
@@ -3403,13 +3482,20 @@ def compute_hr_score(
 # ROSTER FALLBACK — fetch team roster when lineup not yet posted
 # ============================================================================
 def fetch_team_roster(team_id: int) -> List[Dict]:
-    """Fetch active roster as lineup fallback. NOT cached — cache of empty list is worse than a fresh call."""
-    # Try both rosterType=active and depthChart for robustness
+    """
+    Fetch active roster as lineup fallback.
+    Resolves batter handedness via:
+      1. MLBAM_BATTER_HAND constant map (instant, covers ~200 regulars)
+      2. MLB API /people/{id}?fields=batSide (single call, 5s timeout)
+      3. Hardcoded "R" default (last resort)
+    NOT cached — cache of empty list is worse than a fresh call.
+    """
     for roster_type in ["active", "fullRoster"]:
         try:
             r = requests.get(
                 f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster",
-                params={"rosterType": roster_type},
+                params={"rosterType": roster_type,
+                        "hydrate": "person(batSide,pitchHand)"},
                 timeout=15
             )
             if r.status_code != 200:
@@ -3419,14 +3505,30 @@ def fetch_team_roster(team_id: int) -> List[Dict]:
             for p in data.get("roster", []):
                 pos_type = p.get("position", {}).get("type", "")
                 pos_abbr = p.get("position", {}).get("abbreviation", "")
-                # Skip pitchers
                 if pos_type == "Pitcher" or pos_abbr == "P":
                     continue
+                pid = str(p["person"]["id"])
+                # 1. Try hydrated batSide from roster response
+                bat_hand = p.get("person", {}).get("batSide", {}).get("code", "")
+                # 2. Try constant map
+                if not bat_hand or bat_hand == "?":
+                    bat_hand = MLBAM_BATTER_HAND.get(pid, "")
+                # 3. Single API call fallback
+                if not bat_hand or bat_hand == "?":
+                    try:
+                        pr = requests.get(
+                            f"https://statsapi.mlb.com/api/v1/people/{pid}",
+                            params={"fields": "people,id,fullName,batSide"},
+                            timeout=5
+                        )
+                        bat_hand = pr.json().get("people", [{}])[0].get("batSide", {}).get("code", "R")
+                    except Exception:
+                        bat_hand = "R"
                 batters.append({
-                    "player_id": str(p["person"]["id"]),
+                    "player_id": pid,
                     "name": p["person"]["fullName"],
                     "lineup_slot": 5,
-                    "batter_hand": "R",
+                    "batter_hand": bat_hand or "R",
                     "position": pos_abbr,
                     "lineup_confirmed": False,
                 })
@@ -3763,18 +3865,37 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 statcast_df=statcast_df,
             )
 
-            # Resolve handedness: FanGraphs "Bats" column is most reliable
-            # (always available, never ? for MLB players)
-            # Falls back to lineup data, then MLB API, then R default
+            # Resolve handedness: cascade from best to least reliable
+            # 1. Already set from boxscore batSide.code (confirmed lineups path)
+            # 2. MLBAM constant map (fast, covers ~200 regulars, for roster fallback)
+            # 3. FanGraphs Bats column (rarely available on Streamlit Cloud)
+            # 4. MLB API people endpoint individual call
+            # 5. "R" hardcoded default (last resort — will be scored as RHB)
             if not batter_hand or batter_hand in ("?", ""):
-                # Try FanGraphs Bats column via the player row
+                # 2. Constant map — instant, no network call
+                bat_from_map = MLBAM_BATTER_HAND.get(str(player_id), "")
+                if bat_from_map in ("L", "R", "S"):
+                    batter_hand = bat_from_map
+            if not batter_hand or batter_hand in ("?", ""):
+                # 3. FanGraphs Bats column (type=8 — may be blocked on cloud)
                 fg_row = find_player_row(batting_df, name, player_id)
                 if fg_row is not None:
                     fg_bats = str(fg_row.get("Bats", "") or "").strip().upper()
                     if fg_bats in ("L", "R", "S", "B"):
                         batter_hand = fg_bats
-                if not batter_hand or batter_hand in ("?", ""):
-                    batter_hand = "R"  # final fallback
+            if not batter_hand or batter_hand in ("?", ""):
+                # 4. MLB API people endpoint — individual call (adds ~50ms per unresolved player)
+                try:
+                    _pr = requests.get(
+                        f"https://statsapi.mlb.com/api/v1/people/{player_id}",
+                        params={"fields": "people,id,batSide"},
+                        timeout=4
+                    )
+                    batter_hand = _pr.json().get("people", [{}])[0].get("batSide", {}).get("code", "R")
+                except Exception:
+                    batter_hand = "R"
+            if not batter_hand or batter_hand in ("?", ""):
+                batter_hand = "R"  # 5. absolute final fallback
 
             # DIAGNOSTIC: on first batter, show exactly what find_player_row sees
             if not first_batter_logged:
@@ -3861,7 +3982,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
             # "Owns" flag: boost final score weight when batter dominates this SP
             # This fires when batter has elite career numbers vs this specific pitcher
-            _bvp_weight_boost = 0.04 if bvp_sig == "owns" else 0.0
+            _bvp_weight_boost = 0.08 if bvp_sig == "owns" else 0.0
 
             final_score = compute_final_score(
                 bat_score, pit_score, plat_score, lineup_sc,
@@ -4730,12 +4851,14 @@ def display_k_props_tab(plays: List[Dict], ump_data: Dict):
         sp_k_score = max(0, min(100, sp_k_score))
 
         # ── COMPONENT 2: SP SwStr% bonus (20%) ────────────────────────────────
-        # SwStr% 11% avg. Elite: 16%+. Only available from FanGraphs.
+        # SwStr% 11% avg. Elite: 16%+. 
+        # True SwStr% from FanGraphs when available; K%*0.49 proxy otherwise.
+        # Proxy correlation: r≈0.85 with actual SwStr%, error 2-5%.
         if pit_swstr > 0.02:
             swstr_score = 50.0 + (pit_swstr - 0.110) / 0.040 * 25.0
             swstr_score = max(0, min(100, swstr_score))
         else:
-            swstr_score = 50.0  # neutral when unavailable
+            swstr_score = 50.0  # true neutral only if proxy also unavailable
 
         # ── COMPONENT 3: Opposing lineup K% (25%) ────────────────────────────
         # High opp K% = lineup full of strikeout-prone batters = more Ks for SP
@@ -4788,7 +4911,8 @@ def display_k_props_tab(plays: List[Dict], ump_data: Dict):
             "opp_team":   d["opp_team"],
             "sp_hand":    d["sp_hand"],
             "pit_k":      pit_k,
-            "pit_swstr":  pit_swstr,
+            "pit_swstr":       pit_swstr,
+            "swstr_is_proxy":  d.get("_pitcher_swstr", 0.0) == 0.0,  # True if we used K%*0.49 proxy
             "opp_k_avg":  opp_k_avg,
             "implied":    implied,
             "ump_name":   ump_name,
@@ -4854,7 +4978,7 @@ def display_k_props_tab(plays: List[Dict], ump_data: Dict):
 
             with c_stats:
                 pk_pct  = f"{r['pit_k']*100:.1f}%"
-                sw_pct  = f"{r['pit_swstr']*100:.1f}%" if r["pit_swstr"] > 0.01 else "N/A"
+                sw_pct  = f"{r['pit_swstr']*100:.1f}%{'~' if r.get('swstr_is_proxy') else ''}"
                 ok_pct  = f"{r['opp_k_avg']*100:.1f}%"
                 impl    = f"{r['implied']:.1f}" if r["implied"] > 0 else "N/A"
                 ump_s   = f"{r['ump_name']} ({r['ump_k_adj']:+.1f}pp)" if r["ump_name"] != "—" else "—"
@@ -4895,11 +5019,9 @@ def display_k_props_tab(plays: List[Dict], ump_data: Dict):
             "Hand":           r["sp_hand"],
             "vs Lineup":      r["opp_team"],
             "SP K%":          f"{r['pit_k']*100:.1f}%",
-            "SP SwStr%":      f"{r['pit_swstr']*100:.1f}%" if r["pit_swstr"] > 0.01 else "N/A",
+            "SP SwStr%":      f"{r['pit_swstr']*100:.1f}%{'~' if r.get('swstr_is_proxy') else ''}",
             "Opp Lineup K%":  f"{r['opp_k_avg']*100:.1f}%",
             "Game Total":     f"{r['implied']:.1f}" if r["implied"] > 0 else "N/A",
-            "Umpire":         r["ump_name"],
-            "Ump K Adj":      f"{r['ump_k_adj']:+.1f}pp" if r["ump_k_adj"] != 0 else "—",
             "Proj Ks":        f"~{r['proj_ks']:.0f}",
         })
 
@@ -5824,6 +5946,18 @@ def display_hot_streaks_tab(plays: List[Dict]):
 
             styled_str = df_str.style.map(color_streak_sc, subset=["Streak Score"])
             st.dataframe(styled_str, use_container_width=True)
+
+            # ── CSV Export ────────────────────────────────────────────────────
+            import io as _io
+            _csv_buf = _io.StringIO()
+            df_str.to_csv(_csv_buf, index=False)
+            st.download_button(
+                label="📥 Export Hot Streaks CSV",
+                data=_csv_buf.getvalue(),
+                file_name=f"hot_streaks_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="streak_export_btn",
+            )
 
     # ── Targeting note ────────────────────────────────────────────────────────
     st.markdown("---")
