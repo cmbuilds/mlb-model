@@ -3954,6 +3954,9 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 "recent_tb_per_game": recent_form.get("tb_per_game"),
                 "recent_games": recent_form.get("games", 0),
                 "_hr_last7": recent_form.get("hr_last_7", 0),
+                "game_total": round(
+                    implied_totals.get(home_team, 4.7) + implied_totals.get(away_team, 4.3), 1
+                ),
                 "_h_last7":  recent_form.get("h_last_7", 0),
                 "_ab_last7": recent_form.get("ab_last_7", 0),
                 "sub_bvp": round(bvp_sc, 1),
@@ -6728,6 +6731,728 @@ def build_fd_lineups(
     return lineups
 
 
+# ============================================================================
+# DFS STACK COMMAND CENTER
+# ============================================================================
+
+def _norm_name_dfs(name: str) -> str:
+    """Normalize player name for salary matching."""
+    import re
+    return re.sub(r"[^a-z]", "", name.lower())
+
+
+def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
+    """
+    Rank all games on today's slate by DFS stack value.
+    Uses: game O/U + park HR factor + wind bonus + dome penalty.
+    Returns list of game dicts sorted best → worst.
+    """
+    games_seen = {}
+    for p in plays:
+        gid = p.get("game_id", "")
+        if not gid:
+            continue
+        home = p.get("park", "")  # park = home team abbr
+        away = p.get("opponent", "") if p.get("team", "") == home else p.get("team", "")
+        if gid not in games_seen:
+            games_seen[gid] = {
+                "game_id": gid,
+                "home_team": home,
+                "away_team": away,
+                "game_total": p.get("game_total", 9.0),
+                "park": home,
+                "is_dome": p.get("is_dome", False),
+                "wind_speed": p.get("wind_speed", 0),
+                "wind_effect": p.get("wind_effect", "neutral"),
+                "temperature": p.get("temperature", 70),
+                "players": [],
+            }
+        games_seen[gid]["players"].append(p)
+
+    results = []
+    for gid, g in games_seen.items():
+        game_total = g["game_total"]
+        park = g["park"]
+        park_hr = PARK_HR_FACTORS.get(park, 1.0)
+        wind_effect = g["wind_effect"]
+        is_dome = g["is_dome"]
+        temp = g["temperature"]
+
+        # Park bonus: scale 0.87–1.35 → -6 to +12
+        park_bonus = round((park_hr - 1.0) * 40, 1)
+
+        # Wind bonus
+        wind_bonus = 0
+        if not is_dome:
+            if wind_effect in ("out_strong", "out"):
+                wind_bonus = 6 if wind_effect == "out_strong" else 3
+            elif wind_effect in ("in_strong", "in"):
+                wind_bonus = -5 if wind_effect == "in_strong" else -2
+
+        # Temp penalty (cold suppresses offense)
+        temp_adj = 0
+        if not is_dome:
+            if temp < 45:
+                temp_adj = -4
+            elif temp < 55:
+                temp_adj = -2
+            elif temp > 80:
+                temp_adj = 1
+
+        stack_score = round(game_total + park_bonus + wind_bonus + temp_adj, 1)
+
+        # Derive teams properly
+        home_team = g["home_team"]
+        away_team = g["away_team"]
+        # Fix: identify home/away from players
+        home_players = [p for p in g["players"] if p.get("park") == p.get("team")]
+        away_players = [p for p in g["players"] if p.get("park") != p.get("team")]
+        if not home_players:
+            home_players = [p for p in g["players"] if p.get("team") == home_team]
+        if not away_players:
+            away_players = [p for p in g["players"] if p.get("team") != home_team]
+
+        home_implied = home_players[0].get("implied_total", 0) if home_players else 0
+        away_implied = away_players[0].get("implied_total", 0) if away_players else 0
+
+        results.append({
+            "game_id": gid,
+            "home_team": home_team,
+            "away_team": away_team,
+            "game_total": game_total,
+            "park": park,
+            "park_hr": park_hr,
+            "park_bonus": park_bonus,
+            "wind_effect": wind_effect,
+            "wind_bonus": wind_bonus,
+            "temp": temp,
+            "temp_adj": temp_adj,
+            "is_dome": is_dome,
+            "stack_score": stack_score,
+            "home_implied": home_implied,
+            "away_implied": away_implied,
+            "all_players": g["players"],
+        })
+
+    results.sort(key=lambda x: x["stack_score"], reverse=True)
+    return results
+
+
+def compute_team_stack_score(team: str, game: Dict, plays: List[Dict]) -> Dict:
+    """
+    Score a specific team as a DFS stack target within a game.
+    Components: implied total (40%), SP vulnerability (25%),
+    HR potential (20%), hot streak count (15%).
+    """
+    team_players = [p for p in plays if p.get("team") == team
+                    and p.get("game_id") == game["game_id"]
+                    and p.get("lineup_slot", 10) <= 9]
+
+    if not team_players:
+        return {"team": team, "stack_score": 0, "players": [], "components": {}}
+
+    # Sort by lineup slot for proper stack ordering
+    team_players.sort(key=lambda x: x.get("lineup_slot", 9))
+
+    # 1. Implied total (0-40 pts)
+    implied = team_players[0].get("implied_total", 4.5)
+    implied_score = min(40, max(0, (implied - 2.5) / (7.0 - 2.5) * 40))
+
+    # 2. SP vulnerability — use sub_pitcher score of opposing batters (0-25 pts)
+    # Higher sub_pitcher = more vulnerable opposing SP
+    avg_pit_vuln = sum(p.get("sub_pitcher", 50) for p in team_players) / len(team_players)
+    pit_score = min(25, max(0, (avg_pit_vuln - 30) / (80 - 30) * 25))
+
+    # 3. HR potential — avg hr_score of top 4 hitters in lineup slots 1-5 (0-20 pts)
+    top4 = sorted(team_players[:6], key=lambda x: x.get("hr_score", 0), reverse=True)[:4]
+    avg_hr = sum(p.get("hr_score", 0) for p in top4) / max(1, len(top4))
+    hr_score_comp = min(20, max(0, (avg_hr - 30) / (85 - 30) * 20))
+
+    # 4. Hot streak count bonus (0-15 pts)
+    streaking = sum(
+        1 for p in team_players
+        if p.get("sub_streak", 50) >= 65
+        and p.get("lineup_slot", 10) <= 7
+    )
+    streak_bonus = {0: 0, 1: 5, 2: 10}.get(min(streaking, 2), 15)
+    streak_score = min(15, streak_bonus)
+
+    total = round(implied_score + pit_score + hr_score_comp + streak_score, 1)
+
+    # Platoon advantage vs opposing SP
+    sp_hand = team_players[0].get("sp_hand", "R") if team_players else "R"
+    favorable_platoon = sum(
+        1 for p in team_players[:6]
+        if (p.get("batter_hand") == "L" and sp_hand == "R") or
+           (p.get("batter_hand") == "R" and sp_hand == "L")
+    )
+
+    return {
+        "team": team,
+        "stack_score": total,
+        "implied": implied,
+        "avg_hr_score": round(avg_hr, 1),
+        "streaking_count": streaking,
+        "sp_name": team_players[0].get("sp_name", "TBD") if team_players else "TBD",
+        "sp_hand": sp_hand,
+        "favorable_platoon": favorable_platoon,
+        "players": team_players,
+        "components": {
+            "implied_score": round(implied_score, 1),
+            "pit_vuln_score": round(pit_score, 1),
+            "hr_potential_score": round(hr_score_comp, 1),
+            "streak_score": round(streak_score, 1),
+        }
+    }
+
+
+def get_sp_targets(plays: List[Dict], salary_data: Dict) -> Dict:
+    """
+    Build SP target board from plays data.
+    Returns {"aces": [...], "values": [...]} each sorted best first.
+    """
+    pitchers = {}
+    for p in plays:
+        sp = p.get("sp_name", "TBD")
+        if not sp or sp == "TBD":
+            continue
+        if sp not in pitchers:
+            opp_team_players = [x for x in plays if x.get("team") == p.get("team")
+                                 and x.get("sp_name") == sp]
+            opp_k_rates = [x.get("k_rate", 0.22) for x in opp_team_players if x.get("k_rate", 0) > 0]
+            opp_team_k = round(sum(opp_k_rates) / len(opp_k_rates), 3) if opp_k_rates else 0.22
+
+            # SP's own K rate from pitcher label or _pitcher_k_rate
+            sp_k = p.get("_pitcher_k_rate", 0)
+
+            # Implied total allowed (the OPPOSING team's implied = what SP gives up)
+            opp_implied = p.get("implied_total", 4.5)  # this is batter's team implied
+
+            pitchers[sp] = {
+                "name": sp,
+                "hand": p.get("sp_hand", "R"),
+                "team": p.get("opponent", ""),
+                "opp_team": p.get("team", ""),
+                "sp_k_rate": sp_k,
+                "opp_team_k_rate": opp_team_k,
+                "opp_implied": opp_implied,
+                "park": p.get("park", ""),
+                "game_id": p.get("game_id", ""),
+                "is_dome": p.get("is_dome", False),
+            }
+
+    sp_list = []
+    for sp_name, sp in pitchers.items():
+        # Ace score: K rate (40%) + opp team K rate (25%) + low implied (25%) + home (10%)
+        k_score = min(40, sp["sp_k_rate"] * 160)  # 0.25 K% → 40pts
+        opp_k_score = min(25, sp["opp_team_k_rate"] * 100)  # high opp K% = good for SP
+        implied_score = min(25, max(0, (5.5 - sp["opp_implied"]) / (5.5 - 2.5) * 25))
+        ace_score = round(k_score + opp_k_score + implied_score, 1)
+
+        # Salary match
+        norm = _norm_name_dfs(sp_name)
+        sal_match = next(
+            (v for k, v in salary_data.items() if _norm_name_dfs(k) == norm), None
+        )
+        salary = sal_match.get("salary", 0) if sal_match else 0
+
+        # Value score
+        value_score = round(ace_score / (salary / 1000), 2) if salary > 0 else 0.0
+
+        sp_list.append({
+            **sp,
+            "ace_score": ace_score,
+            "salary": salary,
+            "value_score": value_score,
+        })
+
+    aces = sorted(sp_list, key=lambda x: x["ace_score"], reverse=True)[:5]
+    values = sorted(
+        [s for s in sp_list if s["salary"] > 0],
+        key=lambda x: x["value_score"], reverse=True
+    )[:5]
+
+    return {"aces": aces, "values": values, "all": sp_list}
+
+
+def build_dfs_lineup(
+    plays: List[Dict],
+    salary_data: Dict,
+    primary_team: str,
+    secondary_team: str,
+    sp1_name: str,
+    sp2_name: str,
+    platform: str = "DK",
+    lineup_num: int = 0,
+) -> Optional[Dict]:
+    """
+    Build a single GPP lineup.
+    DK: 2SP + 1C + 1B + 2B + 3B + SS + 3OF + UTIL (10 hitters)
+    FD: 1SP + 1C + 1B + 2B + 3B + SS + 3OF + UTIL (9 hitters)
+    Stack: 5-man primary + 3-man secondary (DK 5-3) or 4-4 (FD).
+    """
+    if platform == "DK":
+        hitter_slots = ["C","1B","2B","3B","SS","OF","OF","OF","UTIL","UTIL"]
+        primary_target = 5
+        secondary_target = 3
+        sal_cap = 50000
+        sp_slots = 2
+    else:  # FD
+        hitter_slots = ["C","1B","2B","3B","SS","OF","OF","OF","UTIL"]
+        primary_target = 4
+        secondary_target = 4
+        sal_cap = 35000
+        sp_slots = 1
+
+    def get_sal(name):
+        norm = _norm_name_dfs(name)
+        match = next((v for k, v in salary_data.items() if _norm_name_dfs(k) == norm), None)
+        return match if match else None
+
+    def can_fill(player, slot):
+        pos = player.get("batter_position", "").upper()
+        if slot == "UTIL":
+            return pos in ("C","1B","2B","3B","SS","OF","DH","")
+        if slot == "OF":
+            return pos in ("OF","LF","CF","RF","")
+        return pos == slot or pos == "" or slot == "UTIL"
+
+    # Get salary-matched players for primary and secondary stacks
+    primary_pool = []
+    for p in plays:
+        if p.get("team") != primary_team:
+            continue
+        sal_info = get_sal(p["name"])
+        if not sal_info:
+            continue
+        primary_pool.append({**p, "salary": sal_info["salary"], "position": sal_info.get("position","OF")})
+
+    secondary_pool = []
+    for p in plays:
+        if p.get("team") != secondary_team:
+            continue
+        sal_info = get_sal(p["name"])
+        if not sal_info:
+            continue
+        secondary_pool.append({**p, "salary": sal_info["salary"], "position": sal_info.get("position","OF")})
+
+    if len(primary_pool) < primary_target or len(secondary_pool) < secondary_target:
+        return None
+
+    # Sort by score (GPP: use ceiling = score + hr_score blend)
+    def gpp_sort(p):
+        base = p.get("score", 0)
+        hr_bonus = p.get("hr_score", 0) * 0.3
+        # Differentiate lineup 2/3 by deprioritizing chalk
+        chalk_penalty = 5 if lineup_num > 0 and p.get("lineup_slot", 5) <= 2 else 0
+        return base + hr_bonus - chalk_penalty
+
+    primary_pool.sort(key=gpp_sort, reverse=True)
+    secondary_pool.sort(key=gpp_sort, reverse=True)
+
+    # Pick stack players
+    primary_stack = primary_pool[:primary_target + 2][:primary_target]
+    secondary_stack = secondary_pool[:secondary_target + 2][:secondary_target]
+
+    hitters = primary_stack + secondary_stack
+    total_sal = sum(p["salary"] for p in hitters)
+
+    # SP salaries
+    sp_sal = 0
+    sps_used = []
+    for sp_name in ([sp1_name, sp2_name] if sp_slots == 2 else [sp1_name]):
+        sal_info = get_sal(sp_name)
+        if sal_info:
+            sp_sal += sal_info["salary"]
+            sps_used.append({"name": sp_name, "salary": sal_info["salary"]})
+
+    remaining = sal_cap - total_sal - sp_sal
+    if remaining < 0:
+        return None  # Over cap
+
+    return {
+        "platform": platform,
+        "primary_team": primary_team,
+        "secondary_team": secondary_team,
+        "hitters": hitters,
+        "sps": sps_used,
+        "total_salary": total_sal + sp_sal,
+        "salary_remaining": remaining,
+        "total_proj": round(sum(p.get("score", 0) for p in hitters), 1),
+        "stack_label": f"{primary_target}-{secondary_target}",
+    }
+
+
+def display_dfs_stack_tab(plays: List[Dict]):
+    """
+    DFS Stack Command Center.
+    Section 1: Game Stack Ranker
+    Section 2: Team Stack Viewer (click a game)
+    Section 3: SP Target Board
+    Section 4: Salary Upload → Auto Lineup Builder
+    """
+    st.header("🎯 DFS Stack Command Center")
+    st.caption("Identify optimal stacks, SP targets, and build GPP lineups for DraftKings & FanDuel")
+
+    if not plays:
+        st.info("Run the model first — stack analysis auto-generates from prop model data.")
+        return
+
+    # ── PLATFORM TOGGLE ───────────────────────────────────────────────────
+    platform = st.radio("Platform", ["DraftKings", "FanDuel"], horizontal=True, key="dfs_platform")
+    dk = platform == "DraftKings"
+    primary_n = 5 if dk else 4
+    secondary_n = 3 if dk else 4
+    stack_label = f"{primary_n}-{secondary_n}"
+    st.caption(f"{'DK: 5-3 stack (10 hitters + 2 SP)' if dk else 'FD: 4-4 stack (9 hitters + 1 SP)'}")
+
+    st.markdown("---")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 1 — GAME STACK RANKER
+    # ═══════════════════════════════════════════════════════════════════════
+    st.subheader("🏟️ Game Stack Ranker")
+    st.caption("Games ranked by run environment. Pick your primary and secondary stack game.")
+
+    game_scores = compute_game_stack_scores(plays)
+
+    if not game_scores:
+        st.warning("No game data available — run the model first.")
+        return
+
+    # Build display table
+    rows = []
+    for i, g in enumerate(game_scores):
+        if i == 0:
+            label = "🥇 PRIMARY"
+        elif i == 1:
+            label = "🥈 SECONDARY"
+        elif i == 2:
+            label = "🥉 CONSIDER"
+        else:
+            label = "❌ FADE"
+
+        wind_str = ""
+        if not g["is_dome"]:
+            we = g["wind_effect"]
+            if "out" in we:
+                wind_str = f"💨 Out {'strong' if 'strong' in we else ''} (+{g['wind_bonus']})"
+            elif "in" in we:
+                wind_str = f"💨 In {'strong' if 'strong' in we else ''} ({g['wind_bonus']})"
+            else:
+                wind_str = "→ Neutral"
+        else:
+            wind_str = "🏟️ Dome"
+
+        rows.append({
+            "Label": label,
+            "Game": f"{g['away_team']} @ {g['home_team']}",
+            "O/U": f"{g['game_total']:.1f}",
+            "Park Bonus": f"{g['park_bonus']:+.1f}",
+            "Wind": wind_str,
+            "Stack Score": f"{g['stack_score']:.1f}",
+        })
+
+    df_games = pd.DataFrame(rows)
+    st.dataframe(df_games, use_container_width=True, hide_index=True)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 2 — TEAM STACK VIEWER
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("🔗 Team Stack Viewer")
+    st.caption(f"Select a game to see optimal {stack_label} stack options from each team.")
+
+    game_options = {
+        f"{g['away_team']} @ {g['home_team']} (Score: {g['stack_score']:.1f})": g
+        for g in game_scores
+    }
+    selected_game_label = st.selectbox("Select game to analyze:", list(game_options.keys()), key="dfs_game_select")
+    selected_game = game_options[selected_game_label]
+
+    home_t = selected_game["home_team"]
+    away_t = selected_game["away_team"]
+
+    home_stack = compute_team_stack_score(home_t, selected_game, plays)
+    away_stack = compute_team_stack_score(away_t, selected_game, plays)
+
+    col_home, col_away = st.columns(2)
+
+    def render_team_stack(col, stack_data, is_primary_candidate: bool):
+        with col:
+            team = stack_data["team"]
+            score = stack_data["stack_score"]
+            comp = stack_data["components"]
+
+            badge = "🏆 STACK THIS" if is_primary_candidate else "📌 MINI-STACK"
+            st.markdown(f"### {team}  {badge}")
+            st.metric("Team Stack Score", f"{score:.1f} / 100")
+
+            # Component breakdown
+            with st.expander("📊 Score Breakdown"):
+                st.write(f"💰 Implied Total ({stack_data['implied']:.1f} runs): **{comp['implied_score']:.1f}** / 40")
+                st.write(f"⚔️ SP Vulnerability: **{comp['pit_vuln_score']:.1f}** / 25")
+                st.write(f"💣 HR Potential (avg {stack_data['avg_hr_score']:.0f}): **{comp['hr_potential_score']:.1f}** / 20")
+                st.write(f"🔥 Hot Streaks ({stack_data['streaking_count']} players): **{comp['streak_score']:.1f}** / 15")
+                st.write(f"🎯 Opp SP: {stack_data['sp_name']} ({stack_data['sp_hand']}HP) | Platoon edge: {stack_data['favorable_platoon']}/6 hitters")
+
+            # Stack players table
+            players = stack_data["players"]
+            if not players:
+                st.info("No player data for this team.")
+                return
+
+            top_n = primary_n if is_primary_candidate else secondary_n
+            stack_players = sorted(players, key=lambda x: (x.get("lineup_slot", 9)))[:top_n + 2]
+
+            rows_p = []
+            for p in stack_players[:top_n]:
+                streak_lbl = p.get("streak_label", "")
+                hot = "🔥" if "Hot" in streak_lbl else ("❄️" if "Cold" in streak_lbl else "")
+                hr7 = p.get("_hr_last7", 0)
+                rows_p.append({
+                    "Slot": p.get("lineup_slot", "?"),
+                    "Player": p["name"],
+                    "Hand": p.get("batter_hand", "?"),
+                    "Score": f"{p.get('score', 0):.0f}",
+                    "HR Score": f"{p.get('hr_score', 0):.0f}",
+                    "Streak": hot or "—",
+                    "HR/7g": hr7 if hr7 else "—",
+                    "xSLG": f"{p.get('xslg', 0):.3f}" if p.get("xslg") else "—",
+                })
+
+            st.dataframe(pd.DataFrame(rows_p), use_container_width=True, hide_index=True)
+
+            # Recommended additional players (differentiation pool)
+            extra = [p for p in players if p not in stack_players[:top_n]]
+            extra_sorted = sorted(extra, key=lambda x: x.get("score", 0), reverse=True)[:3]
+            if extra_sorted:
+                st.caption(f"**+ Differentiation options** (mix into custom builds):")
+                for p in extra_sorted:
+                    streak_lbl = p.get("streak_label", "")
+                    hot = "🔥 " if "Hot" in streak_lbl else ""
+                    st.write(f"  {hot}{p['name']} (Slot {p.get('lineup_slot','?')}) — Score {p.get('score',0):.0f} | HR {p.get('hr_score',0):.0f}")
+
+    # Higher team stack score is primary candidate
+    home_is_primary = home_stack["stack_score"] >= away_stack["stack_score"]
+    render_team_stack(col_home, home_stack, home_is_primary)
+    render_team_stack(col_away, away_stack, not home_is_primary)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 3 — SP TARGET BOARD
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("⚾ SP Target Board")
+    st.caption("Ace score: K rate + opponent strikeout rate + low implied total allowed. Value = ace score per $1K salary.")
+
+    # SP salary input
+    with st.expander("💵 Load SP Salaries (paste Name, Salary — one per line)"):
+        sp_sal_text = st.text_area(
+            "SP salaries:",
+            placeholder="Paul Skenes, 10500\nCorbin Burnes, 9800\nCade Cavalli, 7200",
+            height=100, key="dfs_sp_salary_text"
+        )
+    sp_salary_data = {}
+    if sp_sal_text.strip():
+        for line in sp_sal_text.strip().split("\n"):
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    sp_salary_data[parts[0]] = {
+                        "salary": int(parts[1].replace("$","").replace(",","")),
+                        "position": "SP"
+                    }
+                except Exception:
+                    pass
+
+    sp_targets = get_sp_targets(plays, sp_salary_data)
+
+    col_aces, col_vals = st.columns(2)
+
+    with col_aces:
+        st.markdown("#### 🎯 Aces (by matchup quality)")
+        for i, sp in enumerate(sp_targets["aces"], 1):
+            k_display = f"{sp['sp_k_rate']*100:.1f}%" if sp["sp_k_rate"] > 0 else "—"
+            opp_k = f"{sp['opp_team_k_rate']*100:.1f}%" if sp["opp_team_k_rate"] > 0 else "—"
+            sal_str = f"${sp['salary']:,}" if sp["salary"] > 0 else "No salary"
+            with st.container():
+                st.markdown(f"**{i}. {sp['name']}** ({sp['hand']}HP) vs {sp['opp_team']}")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Ace Score", f"{sp['ace_score']:.0f}")
+                c2.metric("SP K%", k_display)
+                c3.metric("Opp K%", opp_k)
+                c4.metric("Salary", sal_str)
+                st.caption(f"Opp implied: {sp['opp_implied']:.1f} runs | Park: {sp['park']}")
+                st.markdown("---")
+
+    with col_vals:
+        st.markdown("#### 💰 Values (ace score per $1K — needs salary loaded)")
+        if not sp_targets["values"]:
+            st.info("Load SP salaries above to see value rankings.")
+        else:
+            for i, sp in enumerate(sp_targets["values"], 1):
+                k_display = f"{sp['sp_k_rate']*100:.1f}%" if sp["sp_k_rate"] > 0 else "—"
+                sal_str = f"${sp['salary']:,}"
+                with st.container():
+                    st.markdown(f"**{i}. {sp['name']}** ({sp['hand']}HP) vs {sp['opp_team']}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Value Score", f"{sp['value_score']:.2f}")
+                    c2.metric("Ace Score", f"{sp['ace_score']:.0f}")
+                    c3.metric("Salary", sal_str)
+                    st.caption(f"Opp implied: {sp['opp_implied']:.1f} | SP K%: {k_display}")
+                    st.markdown("---")
+
+    # SP selectors for lineup builder
+    st.markdown("---")
+    all_sp_names = [s["name"] for s in sp_targets["all"]] if sp_targets["all"] else ["TBD"]
+    col_sp1, col_sp2 = st.columns(2)
+    with col_sp1:
+        sp1_sel = st.selectbox("🎯 SP1 (Ace)", all_sp_names, key="dfs_sp1_select")
+    with col_sp2:
+        if dk:
+            sp2_sel = st.selectbox("💰 SP2 (Value)", all_sp_names, index=min(1, len(all_sp_names)-1), key="dfs_sp2_select")
+        else:
+            sp2_sel = None
+            st.caption("FanDuel uses 1 SP only")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 4 — SALARY UPLOAD + AUTO LINEUP BUILDER
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("📋 Auto Lineup Builder")
+    st.caption(f"Upload your {platform} salary CSV → auto-builds 3 GPP lineups using your selected stacks.")
+
+    # Salary CSV upload
+    col_up, col_paste = st.columns([1, 2])
+    with col_up:
+        dfs_csv = st.file_uploader(f"Upload {platform} CSV", type=["csv"], key="dfs_stack_csv_upload")
+    with col_paste:
+        dfs_paste = st.text_area(
+            "Or paste (Name, Position, Salary):",
+            placeholder="Aaron Judge, OF, 6000\nJuan Soto, OF, 5800",
+            height=100, key="dfs_stack_salary_paste"
+        )
+
+    hitter_salaries = {}
+    all_salaries = {**sp_salary_data}
+
+    if dfs_csv:
+        try:
+            import io
+            df_up = pd.read_csv(io.StringIO(dfs_csv.read().decode("utf-8")))
+            name_col = next((c for c in df_up.columns if c.lower() in ("nickname","name","player name","playername")), None)
+            pos_col  = next((c for c in df_up.columns if c.lower() in ("position","pos")), None)
+            sal_col  = next((c for c in df_up.columns if c.lower() in ("salary","sal")), None)
+            if name_col and sal_col:
+                for _, row in df_up.iterrows():
+                    n = str(row[name_col]).strip()
+                    s = int(str(row[sal_col]).replace("$","").replace(",","").strip())
+                    pos = str(row[pos_col]).strip().upper() if pos_col else "OF"
+                    all_salaries[n] = {"salary": s, "position": pos}
+                    if pos.upper() != "SP" and pos.upper() != "P":
+                        hitter_salaries[n] = {"salary": s, "position": pos}
+                st.success(f"✅ {len(all_salaries)} players loaded from CSV")
+        except Exception as e:
+            st.error(f"CSV error: {e}")
+
+    if dfs_paste.strip():
+        for line in dfs_paste.strip().split("\n"):
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) >= 3:
+                try:
+                    n, pos, s = parts[0], parts[1].upper(), int(parts[2].replace("$","").replace(",",""))
+                    all_salaries[n] = {"salary": s, "position": pos}
+                    if pos not in ("SP","P"):
+                        hitter_salaries[n] = {"salary": s, "position": pos}
+                except Exception:
+                    pass
+
+    has_salaries = len(hitter_salaries) > 0
+
+    # Stack team selectors
+    all_teams = sorted(set(p.get("team","") for p in plays if p.get("team")))
+    col_pt, col_st = st.columns(2)
+    with col_pt:
+        primary_team_sel = st.selectbox(
+            f"🏆 Primary Stack ({primary_n}-man)",
+            all_teams,
+            index=all_teams.index(home_stack["team"]) if home_stack["team"] in all_teams else 0,
+            key="dfs_primary_team"
+        )
+    with col_st:
+        secondary_options = [t for t in all_teams if t != primary_team_sel]
+        default_secondary = away_stack["team"] if away_stack["team"] in secondary_options else secondary_options[0] if secondary_options else all_teams[0]
+        secondary_team_sel = st.selectbox(
+            f"📌 Secondary Stack ({secondary_n}-man)",
+            secondary_options,
+            index=secondary_options.index(default_secondary) if default_secondary in secondary_options else 0,
+            key="dfs_secondary_team"
+        )
+
+    if st.button(f"🚀 Build 3 GPP Lineups ({stack_label})", type="primary", key="dfs_build_lineups"):
+        if not has_salaries:
+            st.warning("⚠️ Load hitter salaries first — upload or paste the salary CSV above.")
+        else:
+            lineups_built = []
+            for i in range(3):
+                lu = build_dfs_lineup(
+                    plays=plays,
+                    salary_data=all_salaries,
+                    primary_team=primary_team_sel,
+                    secondary_team=secondary_team_sel,
+                    sp1_name=sp1_sel,
+                    sp2_name=sp2_sel or "",
+                    platform="DK" if dk else "FD",
+                    lineup_num=i,
+                )
+                if lu:
+                    lineups_built.append(lu)
+
+            if not lineups_built:
+                st.error("Could not build lineups — check that your primary/secondary team players have matching salaries in the uploaded CSV.")
+            else:
+                for i, lu in enumerate(lineups_built, 1):
+                    with st.expander(f"{'🥇' if i==1 else '🥈' if i==2 else '🥉'} Lineup #{i} — {lu['stack_label']} Stack | Sal: ${lu['total_salary']:,} | Proj Score: {lu['total_proj']:.0f}", expanded=(i==1)):
+
+                        # SP row
+                        if lu["sps"]:
+                            st.markdown("**Pitchers:**")
+                            for sp in lu["sps"]:
+                                st.write(f"  🎯 {sp['name']} — ${sp['salary']:,}")
+
+                        # Hitters table
+                        st.markdown("**Hitters:**")
+                        hitter_rows = []
+                        for p in lu["hitters"]:
+                            stack_tag = f"[{lu['primary_team']}★]" if p.get("team") == lu["primary_team"] else f"[{lu['secondary_team']}]"
+                            streak = "🔥" if "Hot" in p.get("streak_label","") else ""
+                            hitter_rows.append({
+                                "Stack": stack_tag,
+                                "Player": p["name"],
+                                "Team": p.get("team",""),
+                                "Pos": p.get("batter_position",""),
+                                "Slot": p.get("lineup_slot",""),
+                                "Salary": f"${p.get('salary',0):,}",
+                                "Score": f"{p.get('score',0):.0f}",
+                                "HR": f"{p.get('hr_score',0):.0f}",
+                                "Streak": streak or "—",
+                            })
+                        st.dataframe(pd.DataFrame(hitter_rows), use_container_width=True, hide_index=True)
+
+                        # Salary summary
+                        sal_cap = 50000 if dk else 35000
+                        sal_used = lu["total_salary"]
+                        st.caption(f"💰 Salary used: ${sal_used:,} / ${sal_cap:,} (${sal_cap - sal_used:,} remaining)")
+
+                        # Export string
+                        all_names = [sp["name"] for sp in lu["sps"]] + [p["name"] for p in lu["hitters"]]
+                        st.code(",".join(all_names), language=None)
+                        st.caption("☝️ Copy → paste into platform import tool")
+
+    elif not has_salaries:
+        st.info("📥 Upload or paste salary data above, then click Build Lineups.")
+
+
 def display_dfs_tab(plays: List[Dict]):
     """
     FanDuel DFS Optimizer tab.
@@ -8946,7 +9671,7 @@ else:
     st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V2.0: K Props + Moneyline redesigned + Hot Streaks tab")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
         "📊 O1.5 Leaderboard",
         "🎯 Tiered Breakdown",
         "💰 Parlay Builder",
@@ -8955,6 +9680,7 @@ else:
         "🏦 Moneyline",
         "🔥 Hot Streaks",
         "💣 HR Plays",
+        "🎯 DFS Stacks",
         "🏆 FanDuel DFS",
         "🎯 PrizePicks",
         "📈 Results Tracker",
@@ -9067,12 +9793,15 @@ else:
             st.info("Run the model first to see HR plays.")
 
     with tab9:
-        display_dfs_tab(st.session_state.plays if st.session_state.plays else [])
+        display_dfs_stack_tab(st.session_state.plays if st.session_state.plays else [])
 
     with tab10:
-        display_prizepicks_tab(st.session_state.plays if st.session_state.plays else [])
+        display_dfs_tab(st.session_state.plays if st.session_state.plays else [])
 
     with tab11:
+        display_prizepicks_tab(st.session_state.plays if st.session_state.plays else [])
+
+    with tab12:
         display_results_tracker()
 
 
