@@ -2973,44 +2973,51 @@ def compute_streak_score(recent: Dict, season_slg: float = 0.398) -> Tuple[float
     """
     Convert recent form data into a 0-100 score.
     Compares recent TB/game to expected TB/game from season SLG.
-    Expected TB/game ≈ SLG × 3.65 AB/game (MLB avg).
-    
+    Expected TB/game ≈ SLG × 3.7 AB/game (MLB avg PAs factoring in walks).
+
     Score 50 = on pace with season average (no momentum signal)
-    Score 70+ = hot streak (recent TB >> season expectation)
-    Score 30- = cold streak (recent TB << season expectation)
-    
-    Only activates with ≥ 3 recent games; degrades toward 50 with small samples.
+    Score 70+ = hot streak (recent TB well above expectation)
+    Score 30- = cold streak (recent TB well below expectation)
+
+    Scoring uses log-ratio to prevent ceiling crowding:
+      ratio 2.0x → ~75, ratio 2.5x → ~80, ratio 3.0x → ~84
+      ratio 0.5x → ~35, ratio 0.3x → ~25
+
+    Only activates with ≥ 3 recent games; small sample dampening < 5 games.
     """
     if not recent or recent.get("games", 0) < 3 or recent.get("tb_per_game") is None:
         return 50.0, "Form: no data"
 
     tb_recent  = recent["tb_per_game"]
     g          = recent["games"]
-    season_exp = season_slg * 3.65   # expected TB/game from season SLG
+    # Use 3.7 AB/game (consistent with display tab); season_slg fallback = 0.398
+    season_exp = max(0.01, season_slg * 3.7)
 
-    if season_exp <= 0:
-        return 50.0, "Form: no baseline"
+    # Log-ratio prevents ceiling collapse: ln(2.0) ≈ 0.69, ln(0.5) ≈ -0.69
+    import math as _math
+    log_ratio = _math.log(max(0.05, tb_recent) / season_exp)
 
-    # Ratio: recent vs expected (>1.0 = hot, <1.0 = cold)
-    ratio = tb_recent / season_exp
-    # Map: 0.3x → 15, 0.7x → 38, 1.0x → 50, 1.3x → 63, 1.8x → 75, 2.5x → 85
-    raw_score = 50 + (ratio - 1.0) * 50
-    raw_score = max(15.0, min(85.0, raw_score))
+    # Scale: log_ratio 0 → 50, +0.69 (2x) → 75, +1.10 (3x) → 84
+    #        -0.69 (0.5x) → 25, -1.20 (0.3x) → 18
+    raw_score = 50 + log_ratio * 36
+    raw_score = max(10.0, min(90.0, raw_score))
 
     # Dampen with small samples — blend toward 50 with < 5 games
     if g < 5:
-        raw_score = raw_score * (g / 5) + 50.0 * (1 - g / 5)
+        weight = g / 5
+        raw_score = raw_score * weight + 50.0 * (1 - weight)
 
     h  = recent.get("h_last_7", 0)
     ab = recent.get("ab_last_7", 1)
     hr = recent.get("hr_last_7", 0)
-    
-    if ratio >= 1.25:
-        label = f"🔥 Hot ({tb_recent:.1f} TB/g last {g}g | {h}-{ab}" + (f" {hr}HR" if hr else "") + ")"
-    elif ratio <= 0.75:
-        label = f"❄️ Cold ({tb_recent:.1f} TB/g last {g}g | {h}-{ab})"
+    ratio = tb_recent / season_exp
+
+    if ratio >= 1.4:
+        label = f"🔥 Hot ({tb_recent:.2f} TB/g last {g}g | {h}/{ab}" + (f" {hr}HR" if hr else "") + ")"
+    elif ratio <= 0.65:
+        label = f"❄️ Cold ({tb_recent:.2f} TB/g last {g}g | {h}/{ab})"
     else:
-        label = f"Form: {tb_recent:.1f} TB/g last {g}g"
+        label = f"Form: {tb_recent:.2f} TB/g last {g}g | {h}/{ab}"
 
     return round(raw_score, 1), label
 
@@ -4372,277 +4379,6 @@ def display_leaderboard(plays: List[Dict]):
                 st.markdown(f"**💣 HR Score: {p['hr_score']:.0f}**")
 
 
-def display_tiered_breakdown(plays: List[Dict]):
-    """Display tiered breakdown with expandable tier sections."""
-    
-    tier_groups = {
-        "🔒 TIER 1": [p for p in plays if p["tier"] == "🔒 TIER 1"],
-        "✅ TIER 2": [p for p in plays if p["tier"] == "✅ TIER 2"],
-        "📊 TIER 3": [p for p in plays if p["tier"] == "📊 TIER 3"],
-        "❌ NO PLAY": [p for p in plays if p["tier"] == "❌ NO PLAY"],
-    }
-    
-    st.header("🎯 Tiered Breakdown")
-    
-    tier_descriptions = {
-        "🔒 TIER 1": ("Strong plays. Parlay anchors. All edge indicators firing.", "#00ff88"),
-        "✅ TIER 2": ("Viable single plays or parlay fillers. Good but not elite.", "#ffdd00"),
-        "📊 TIER 3": ("Marginal. Single game only. Use with caution.", "#ff8800"),
-        "❌ NO PLAY": ("Below threshold. Fade.", "#666666"),
-    }
-    
-    for tier_name, tier_plays in tier_groups.items():
-        if not tier_plays and tier_name == "❌ NO PLAY":
-            continue
-        
-        color = tier_descriptions[tier_name][1]
-        desc = tier_descriptions[tier_name][0]
-        
-        with st.expander(f"{tier_name} ({len(tier_plays)} plays)", expanded=(tier_name in ["🔒 TIER 1", "✅ TIER 2"])):
-            if not tier_plays:
-                st.caption(f"No {tier_name} plays today.")
-                continue
-            
-            st.caption(desc)
-            
-            for p in tier_plays:
-                col1, col2, col3 = st.columns([3, 3, 2])
-                
-                with col1:
-                    tbd_flag = " ⚠️" if p.get("sp_tbd") else ""
-                    st.markdown(f"**{p['name']}** ({p['team']}) vs {p['opponent']}")
-                    st.caption(f"Score: {p['score']:.0f} | Prob: {p['prob']*100:.0f}% | Lineup: #{p['lineup_slot']} | {p['batter_hand']}HB vs {p['sp_hand']}HP")
-                    st.caption(f"SP: {p['sp_name']}{tbd_flag}")
-                
-                with col2:
-                    st.markdown("**Edges:**")
-                    edges = []
-                    risks = []
-                    
-                    if p["sub_batter"] >= 65:
-                        edges.append(f"✓ Strong contact quality ({p['sub_batter']:.0f}/100)")
-                    if p["sub_pitcher"] >= 65:
-                        edges.append(f"✓ Vulnerable SP ({p['sub_pitcher']:.0f}/100)")
-                    if p["sub_platoon"] >= 65:
-                        edges.append(f"✓ Platoon edge: {p['platoon_label'].split('(')[0].strip()}")
-                    if p["lineup_slot"] <= 4:
-                        edges.append(f"✓ Top-order slot #{p['lineup_slot']} (more PA)")
-                    if p.get("wind_effect") in ["out", "strong_out"]:
-                        edges.append(f"✓ Wind out ({p['wind_speed']} mph)")
-                    if p["implied_total"] >= 5.0:
-                        edges.append(f"✓ High implied runs ({p['implied_total']:.1f})")
-                    
-                    for e in edges[:3]:
-                        st.caption(e)
-                
-                with col3:
-                    st.markdown("**Risks:**")
-                    if p.get("sp_tbd"):
-                        st.caption("✗ ⚠️ Pitcher TBD")
-                    if p["k_rate"] and p["k_rate"] > 0.28:
-                        st.caption(f"✗ High K% ({p['k_rate']*100:.0f}%)")
-                    if p.get("wind_effect") == "in":
-                        st.caption(f"✗ Wind in ({p['wind_speed']} mph)")
-                    if p["temperature"] and p["temperature"] < 50:
-                        st.caption(f"✗ Cold ({p['temperature']:.0f}°F)")
-                    if p["lineup_slot"] >= 7:
-                        st.caption(f"✗ Low lineup slot #{p['lineup_slot']}")
-                    if p["implied_total"] and p["implied_total"] < 3.5:
-                        st.caption(f"✗ Low implied runs ({p['implied_total']:.1f})")
-                
-                st.markdown("---")
-
-
-def display_parlay_builder(plays: List[Dict], unit_size: int = 25):
-    """Display parlay builder — O1.5 only, O0.5 only, and mixed."""
-
-    st.header("💰 Parlay Builder")
-
-    parlay_mode = st.radio(
-        "Parlay type:",
-        ["🎯 O1.5 Only", "🎯 O0.5 Only", "🔀 Mixed (O0.5 + O1.5)"],
-        horizontal=True, index=0
-    )
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        num_legs = st.radio("Legs", [2, 3, 4, 5], index=1, horizontal=True)
-    with col2:
-        min_score = st.slider("Min score for parlay", 60, 90, 70)
-    with col3:
-        max_same_team = st.number_input("Max same-team legs", 1, 3, 1)
-
-    if parlay_mode == "🎯 O1.5 Only":
-        eligible = [p for p in plays if p["score"] >= min_score and not p.get("sp_tbd")]
-        st.info(f"📊 {len(eligible)} eligible O1.5 players (score ≥ {min_score})")
-        pool = plays
-
-    elif parlay_mode == "🎯 O0.5 Only":
-        # Re-score as hits model
-        hits_pool = []
-        for p in plays:
-            pitcher_mock = {"k_rate_allowed": 0.220, "era": 4.20, "fip": 4.20, "whip": 1.30, "hard_hit_allowed": 0.340}
-            try:
-                pit_label = p.get("pitcher_label", "")
-                if "K%:" in pit_label:
-                    pitcher_mock["k_rate_allowed"] = float(pit_label.split("K%:")[1].split("%")[0].strip()) / 100
-                if "FIP:" in pit_label:
-                    pitcher_mock["fip"] = float(pit_label.split("FIP:")[1].strip().split()[0])
-            except Exception:
-                pass
-            batter_mock = {
-                "k_rate": p.get("k_rate", 0.228), "wrc_plus": max(40,min(220,100+(p.get("xslg",0.398)-0.398)/0.005)), "avg": 0.255,
-                "bb_rate": p.get("bb_rate",0.082), "woba": p.get("xslg", 0.398) * 0.78,
-                "hard_hit_rate": p.get("hard_hit_rate", 0.370), "slg_proxy": p.get("xslg", 0.398),
-            }
-            h_score, h_prob, h_tier, _ = compute_hits_score_for_player(
-                batter_mock, pitcher_mock, p.get("batter_hand","R"), p.get("sp_hand","R"),
-                p.get("lineup_slot",5), p.get("park",p.get("team","")),
-                p.get("weather",{}), p.get("implied_total",0),
-                p.get("sp_tbd",False), p.get("lineup_confirmed",True)
-            )
-            hits_pool.append({**p, "score": h_score, "prob": h_prob, "tier": h_tier, "prop": "O0.5"})
-
-        eligible = [p for p in hits_pool if p["score"] >= min_score]
-        st.info(f"📊 {len(eligible)} eligible O0.5 players (h-score ≥ {min_score})")
-        pool = hits_pool
-
-    else:  # Mixed
-        # Build mixed pool: O1.5 eligible + O0.5 eligible
-        hits_pool = []
-        for p in plays:
-            pitcher_mock = {"k_rate_allowed": 0.220, "era": 4.20, "fip": 4.20, "whip": 1.30, "hard_hit_allowed": 0.340}
-            try:
-                pit_label = p.get("pitcher_label", "")
-                if "K%:" in pit_label:
-                    pitcher_mock["k_rate_allowed"] = float(pit_label.split("K%:")[1].split("%")[0].strip()) / 100
-                if "FIP:" in pit_label:
-                    pitcher_mock["fip"] = float(pit_label.split("FIP:")[1].strip().split()[0])
-            except Exception:
-                pass
-            batter_mock = {
-                "k_rate": p.get("k_rate", 0.228), "wrc_plus": max(40,min(220,100+(p.get("xslg",0.398)-0.398)/0.005)), "avg": 0.255,
-                "bb_rate": p.get("bb_rate",0.082), "woba": p.get("xslg", 0.398) * 0.78,
-                "hard_hit_rate": p.get("hard_hit_rate", 0.370), "slg_proxy": p.get("xslg", 0.398),
-            }
-            h_score, h_prob, h_tier, _ = compute_hits_score_for_player(
-                batter_mock, pitcher_mock, p.get("batter_hand","R"), p.get("sp_hand","R"),
-                p.get("lineup_slot",5), p.get("park",p.get("team","")),
-                p.get("weather",{}), p.get("implied_total",0),
-                p.get("sp_tbd",False), p.get("lineup_confirmed",True)
-            )
-            hits_pool.append({**p, "h_score": h_score, "h_prob": h_prob})
-
-        # Pick best market for each player
-        mixed_pool = []
-        for orig, hits in zip(plays, hits_pool):
-            o15_score = orig["score"]
-            o05_score = hits["h_score"]
-            # Use whichever market is stronger
-            if o15_score >= min_score and o05_score >= min_score:
-                # Both qualify — pick higher score
-                if o15_score >= o05_score:
-                    mixed_pool.append({**orig, "prop": "O1.5", "score": o15_score, "prob": orig["prob"]})
-                else:
-                    mixed_pool.append({**orig, "prop": "O0.5", "score": o05_score, "prob": hits["h_prob"]})
-            elif o15_score >= min_score:
-                mixed_pool.append({**orig, "prop": "O1.5"})
-            elif o05_score >= min_score:
-                mixed_pool.append({**orig, "prop": "O0.5", "score": o05_score, "prob": hits["h_prob"]})
-
-        eligible = mixed_pool
-        pool = mixed_pool
-        st.info(f"📊 {len(eligible)} mixed eligible ({sum(1 for p in eligible if p.get('prop')=='O1.5')} O1.5 + {sum(1 for p in eligible if p.get('prop')=='O0.5')} O0.5)")
-
-    if len(eligible) < num_legs:
-        st.warning(f"⚠️ Not enough eligible players for {num_legs} legs (have {len(eligible)}). Lower min score.")
-        return
-
-    parlays = build_parlays(pool, num_legs, max_same_team, min_score)
-
-    if not parlays:
-        st.warning("No valid parlays found with current filters.")
-        return
-
-    best = parlays[0]
-    st.subheader("⭐ Recommended Parlay")
-
-    col_a, col_b, col_c, col_d = st.columns(4)
-    with col_a: st.metric("Combined Prob", f"{best['combined_prob']:.1f}%")
-    with col_b: st.metric("Fair Payout", f"{best['fair_payout']:.2f}x")
-    with col_c: st.metric("Est. EV", f"{best['ev']:+.1f}%")
-    with col_d: st.metric("Avg Score", f"{best['avg_score']:.0f}")
-
-    hrb_legs = []
-    for player_name in best["players"]:
-        player = next((p for p in pool if p["name"] == player_name), None)
-        if player:
-            prop = player.get("prop", "O1.5")
-            prop_str = "Over 1.5 TB" if prop == "O1.5" else "Over 0.5 TB"
-            tag = "🎯" if prop == "O0.5" else "⚾"
-            st.markdown(f"{tag} **{player_name}** ({player['team']}) vs {player['opponent']} — {prop_str} | Score: {player['score']:.0f} | Prob: {player['prob']*100:.0f}%")
-            hrb_legs.append(f"{player_name} {prop_str}")
-
-    if best.get("corr_factor", 1.0) < 0.98:
-        st.caption(f"🔗 Correlation discount: {best['corr_factor']:.3f}x")
-
-    hrb_text = " + ".join(hrb_legs)
-    st.code(f"HardRock Bet: {hrb_text}", language=None)
-
-    st.markdown("---")
-    st.subheader("📊 All Parlay Options")
-    rows = []
-    for par in parlays:
-        rows.append({
-            "Players": " + ".join(par["players"]),
-            "Legs": par["num_legs"],
-            "Avg Score": f"{par['avg_score']:.0f}",
-            "Min Score": f"{par['min_score']:.0f}",
-            "Combined %": f"{par['combined_prob']:.1f}%",
-            "Fair Payout": f"{par['fair_payout']:.2f}x",
-            "EV%": f"{par['ev']:+.1f}%",
-            "Notes": par["notes"],
-        })
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-    # SGP
-    sgp_plays = [p for p in parlays if "SGP" in p.get("notes", "")]
-    if sgp_plays:
-        st.subheader("⭐ Same-Game Parlay Opportunities")
-        for sgp in sgp_plays[:3]:
-            players_info = [next((p for p in pool if p["name"] == n), None) for n in sgp["players"]]
-            valid = [p for p in players_info if p]
-            if valid:
-                game = valid[0]["opponent"] + " @ " + valid[0]["team"]
-                st.success(f"🎰 **SGP:** {game} | {' + '.join(sgp['players'])} | Combined: {sgp['combined_prob']:.1f}%")
-
-    # Custom builder
-    st.markdown("---")
-    st.subheader("🔧 Custom Parlay Builder")
-    eligible_names = [f"{p['name']} ({p['team']}, {p.get('prop','O1.5')}, {p['score']:.0f})" for p in eligible]
-    selected = st.multiselect("Select legs manually:", eligible_names, key="custom_parlay_select")
-
-    if len(selected) >= 2:
-        selected_plays = []
-        for sel in selected:
-            name_part = sel.split(" (")[0]
-            player = next((p for p in pool if p["name"] == name_part), None)
-            if player:
-                selected_plays.append(player)
-
-        if len(selected_plays) >= 2:
-            combined = 1.0
-            for p in selected_plays:
-                combined *= p["prob"]
-            col1, col2, col3 = st.columns(3)
-            with col1: st.metric("Combined Prob", f"{combined*100:.1f}%")
-            with col2: st.metric("Fair Payout", f"{1/combined:.2f}x")
-            with col3: st.metric("Legs", len(selected_plays))
-            hrb_custom = " + ".join([f"{p['name']} {'Over 1.5 TB' if p.get('prop','O1.5')=='O1.5' else 'Over 0.5 TB'}" for p in selected_plays])
-            st.code(f"HardRock Bet: {hrb_custom}", language=None)
-
-
 def display_hr_plays(plays: List[Dict]):
     """Display top HR upside plays."""
     
@@ -5896,7 +5632,7 @@ def display_hot_streaks_tab(plays: List[Dict]):
 
         # Derive season TB expectation from xSLG proxy (same as model)
         season_slg = p.get("xslg", 0.398) or 0.398
-        season_exp = season_slg * 4.2  # TB/game estimate from SLG
+        season_exp = season_slg * 3.7  # TB/game estimate from SLG (consistent with compute_streak_score)
         pct_above  = ((tb_pg / season_exp) - 1.0) * 100 if season_exp > 0 else 0.0
 
         streak_plays.append({
@@ -9671,10 +9407,8 @@ else:
     st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V2.0: K Props + Moneyline redesigned + Hot Streaks tab")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "📊 O1.5 Leaderboard",
-        "🎯 Tiered Breakdown",
-        "💰 Parlay Builder",
         "🎯 O0.5 Any Hit",
         "⚡ K Props",
         "🏦 Moneyline",
@@ -9697,9 +9431,6 @@ else:
             st.session_state.model_ran = True
             if plays:
                 save_picks_to_db(plays, date_str)
-                best_parlays = build_parlays(plays, 3, 1, 70.0)
-                if best_parlays:
-                    save_parlay_to_db(best_parlays[0], date_str)
                 # ── V1.9: Pre-fetch ump data and run differential for new tabs ──
                 try:
                     st.session_state["_ump_data"] = fetch_umpire_data()
@@ -9732,23 +9463,11 @@ else:
 
     with tab2:
         if st.session_state.plays:
-            display_tiered_breakdown(st.session_state.plays)
-        else:
-            st.info("Run the model first to see tiered breakdown.")
-
-    with tab3:
-        if st.session_state.plays:
-            display_parlay_builder(st.session_state.plays, unit_size)
-        else:
-            st.info("Run the model first to see parlay recommendations.")
-
-    with tab4:
-        if st.session_state.plays:
             display_hits_tab(st.session_state.plays)
         else:
             st.info("Run the model first to see O0.5 any-hit plays.")
 
-    with tab5:
+    with tab3:
         # ── K Props ──────────────────────────────────────
         if st.session_state.plays:
             ump_data = st.session_state.get("_ump_data", {})
@@ -9756,7 +9475,7 @@ else:
         else:
             st.info("Run the model first to see K prop scores.")
 
-    with tab6:
+    with tab4:
         # ── Moneyline ────────────────────────────────────
         if st.session_state.plays:
             _games_for_ml = fetch_schedule(st.session_state.analysis_date or date_str)
@@ -9779,29 +9498,29 @@ else:
         else:
             st.info("Run the model first to see moneyline analysis.")
 
-    with tab7:
+    with tab5:
         # ── Hot Streaks ───────────────────────────────────
         if st.session_state.plays:
             display_hot_streaks_tab(st.session_state.plays)
         else:
             st.info("Run the model first to see hot streak rankings.")
 
-    with tab8:
+    with tab6:
         if st.session_state.plays:
             display_hr_plays(st.session_state.plays)
         else:
             st.info("Run the model first to see HR plays.")
 
-    with tab9:
+    with tab7:
         display_dfs_stack_tab(st.session_state.plays if st.session_state.plays else [])
 
-    with tab10:
+    with tab8:
         display_dfs_tab(st.session_state.plays if st.session_state.plays else [])
 
-    with tab11:
+    with tab9:
         display_prizepicks_tab(st.session_state.plays if st.session_state.plays else [])
 
-    with tab12:
+    with tab10:
         display_results_tracker()
 
 
