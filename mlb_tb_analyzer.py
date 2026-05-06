@@ -5829,8 +5829,14 @@ def display_hot_streaks_tab(plays: List[Dict]):
             "prob":          p.get("prob", 0),
         })
 
-    # Sort: primary = sub_streak score, secondary = TB/game
-    streak_plays.sort(key=lambda x: (x["sub_streak"], x["tb_per_game"]), reverse=True)
+    # Sort: composite of streak score (50%) + absolute TB/g (50%)
+    # TB/g normalized: 3.0+ TB/g = 100, 0.5 TB/g = 0
+    # This prevents a barely-above-baseline player outranking a genuinely hot elite hitter
+    def streak_composite(p):
+        streak_sc  = p["sub_streak"]
+        tb_norm    = min(100, max(0, (p["tb_per_game"] - 0.5) / (3.5 - 0.5) * 100))
+        return streak_sc * 0.50 + tb_norm * 0.50
+    streak_plays.sort(key=streak_composite, reverse=True)
 
     if not streak_plays:
         st.info("No recent form data available — lineups may not be confirmed yet, "
@@ -7792,72 +7798,115 @@ def display_fd_command_center(plays: List[Dict]):
         )
 
     # ═══════════════════════════════════════════════════════════════════════
-    # SECTION 2 — TEAM STACK VIEWER
+    # SECTION 2 — TEAM STACK VIEWER (ranked list, no game selection required)
     # ═══════════════════════════════════════════════════════════════════════
     st.markdown("---")
-    st.subheader("🔗 Team Stack Viewer")
-    st.caption("Select a game → see 4-man stack candidates from each team with FD salary and projections.")
+    st.subheader("🔗 Stack Rankings")
+    st.caption(
+        "Teams ranked by stack score (implied total + park + wind). "
+        "Expand any team to see their top batters, salary, and hot/cold status. "
+        "Teams from the same game are noted — use those as bring-back targets."
+    )
 
     if game_scores:
-        game_options = {f"{g['away_team']} @ {g['home_team']} (Stack: {g['stack_score']:.1f})": g
-                        for g in game_scores}
-        sel_game_lbl = st.selectbox("Select game:", list(game_options.keys()), key="fd_cmd_game_sel")
-        sel_game = game_options[sel_game_lbl]
+        # Build a flat ranked list of all teams with their stack data
+        all_team_stacks = []
+        for g in game_scores:
+            for team in [g["home_team"], g["away_team"]]:
+                opp = g["away_team"] if team == g["home_team"] else g["home_team"]
+                stack_data = compute_team_stack_score(team, g, slate_plays)
+                stack_data["game_label"] = f"{g['away_team']}@{g['home_team']}"
+                stack_data["game_total"] = g["game_total"]
+                stack_data["opp_team"]   = opp
+                stack_data["park_hr"]    = PARK_HR_FACTORS.get(g["park"], 1.0)
+                stack_data["wind_effect"]= g.get("wind_effect","neutral")
+                stack_data["is_dome"]    = g.get("is_dome", False)
+                stack_data["game_stack_score"] = g["stack_score"]
+                all_team_stacks.append(stack_data)
 
-        home_t = sel_game["home_team"]
-        away_t = sel_game["away_team"]
+        # Sort by team stack score
+        all_team_stacks.sort(key=lambda x: x["stack_score"], reverse=True)
 
-        home_stack = compute_team_stack_score(home_t, sel_game, slate_plays)
-        away_stack = compute_team_stack_score(away_t, sel_game, slate_plays)
+        for rank, sd in enumerate(all_team_stacks[:12], 1):
+            team   = sd["team"]
+            score  = sd["stack_score"]
+            impl   = sd["implied"]
+            opp    = sd["opp_team"]
+            comp   = sd["components"]
+            park_hr = sd["park_hr"]
+            we     = sd["wind_effect"]
 
-        col_home, col_away = st.columns(2)
+            # Rank badge color
+            if rank == 1:   badge_color, badge = "#00ff88", "🥇 #1 STACK"
+            elif rank == 2: badge_color, badge = "#00cc66", "🥈 #2 STACK"
+            elif rank == 3: badge_color, badge = "#ffcc00", "🥉 #3 STACK"
+            elif rank <= 6: badge_color, badge = "#ff8800", f"#{rank}"
+            else:           badge_color, badge = "#666688", f"#{rank}"
 
-        def render_fd_stack_col(col, stack_data, badge_label):
-            with col:
-                team  = stack_data["team"]
-                score = stack_data["stack_score"]
-                comp  = stack_data["components"]
+            wind_str = "🏟️ Dome" if sd["is_dome"] else {
+                "out_strong":"💨 Out Strong","out":"💨 Out",
+                "in_strong":"💨 In Strong","in":"💨 In"
+            }.get(we,"→ Neutral")
 
-                st.markdown(f"### {team} {badge_label}")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Stack Score",  f"{score:.0f}")
-                c2.metric("Implied",      f"{stack_data['implied']:.1f}")
-                c3.metric("Hot Batters",  stack_data['streaking_count'])
-                c4.metric("Platoon Edge", f"{stack_data['favorable_platoon']}/6")
+            impl_str = f"{impl:.1f}R" if impl > 0.5 else "— R"
+            hot_flag = "🔥 " if sd["streaking_count"] >= 2 else ""
 
-                with st.expander("📊 Score Breakdown"):
-                    st.write(f"💰 Implied ({stack_data['implied']:.1f}R): **{comp['implied_score']:.0f}**/40")
-                    st.write(f"⚔️ SP Vuln: **{comp['pit_vuln_score']:.0f}**/25  |  Opp: {stack_data['sp_name']} ({stack_data['sp_hand']}HP)")
-                    st.write(f"💣 HR Potential: **{comp['hr_potential_score']:.0f}**/20  |  Avg HR score {stack_data['avg_hr_score']:.0f}")
-                    st.write(f"🔥 Streaks: **{comp['streak_score']:.0f}**/15")
+            label = (
+                f"{hot_flag}**{team}** vs {opp} &nbsp;|&nbsp; "
+                f"<span style='color:{badge_color}'>{badge} · Score {score:.0f}</span> &nbsp;|&nbsp; "
+                f"Impl {impl_str} · O/U {sd['game_total']:.1f} · "
+                f"Park {park_hr:.2f}x · {wind_str}"
+            )
 
-                # Player table with FD salary
-                players = sorted(stack_data["players"], key=lambda x: x.get("lineup_slot", 9))
-                rows_p = []
-                for p in players[:6]:
+            with st.expander(label, expanded=(rank <= 2)):
+                # Stack score breakdown in one line
+                st.caption(
+                    f"Implied {comp['implied_score']:.0f}/40 · "
+                    f"SP Vuln {comp['pit_vuln_score']:.0f}/25 (opp: {sd['sp_name']} {sd['sp_hand']}HP) · "
+                    f"HR Potential {comp['hr_potential_score']:.0f}/20 · "
+                    f"Streaks {comp['streak_score']:.0f}/15"
+                )
+
+                # Player table
+                players = sorted(sd["players"], key=lambda x: x.get("lineup_slot", 9))
+                rows_p  = []
+                for p in players[:7]:
                     sal_entry = _fd_name_match(p["name"], salary_data)
                     sal_str   = f"${sal_entry['salary']:,}" if sal_entry else "—"
                     fppg_str  = f"{sal_entry['fppg']:.1f}" if sal_entry else "—"
-                    streak    = "🔥" if "Hot" in p.get("streak_label","") else ("❄️" if "Cold" in p.get("streak_label","") else "")
                     inj_flag  = " ⚠️" if (sal_entry and sal_entry.get("injured")) else ""
+                    hot       = "🔥" if "Hot" in p.get("streak_label","") else (
+                                "❄️" if "Cold" in p.get("streak_label","") else "—")
                     fd_p      = next((fp for fp in fd_plays if fp["name"] == p["name"]), None)
                     proj_str  = f"{fd_p['fd_proj']:.1f}" if fd_p else "—"
                     rows_p.append({
-                        "Slot":    p.get("lineup_slot","?"),
+                        "#":       p.get("lineup_slot","?"),
                         "Player":  p["name"] + inj_flag,
-                        "Hand":    p.get("batter_hand","?"),
+                        "H":       p.get("batter_hand","?"),
                         "Salary":  sal_str,
                         "FD Proj": proj_str,
                         "FPPG":    fppg_str,
                         "Score":   f"{p.get('score',0):.0f}",
                         "HR Sc":   f"{p.get('hr_score',0):.0f}",
-                        "Hot":     streak or "—",
+                        "Hot":     hot,
                     })
-                st.dataframe(pd.DataFrame(rows_p), use_container_width=True, hide_index=True)
+                if rows_p:
+                    st.dataframe(
+                        pd.DataFrame(rows_p), use_container_width=True,
+                        hide_index=True, height=min(320, 55+len(rows_p)*35)
+                    )
 
-        home_is_primary = home_stack["stack_score"] >= away_stack["stack_score"]
-        render_fd_stack_col(col_home, home_stack, "🏆 STACK" if home_is_primary else "📌 MINI")
-        render_fd_stack_col(col_away, away_stack, "📌 MINI" if home_is_primary else "🏆 STACK")
+                # Bring-back note
+                opp_stack = next((s for s in all_team_stacks if s["team"] == opp), None)
+                if opp_stack:
+                    opp_top = sorted(opp_stack["players"],
+                                     key=lambda x: x.get("score",0), reverse=True)[:3]
+                    if opp_top:
+                        brings = " · ".join(
+                            f"{p['name']} (${(_fd_name_match(p['name'], salary_data) or {}).get('salary',0):,})"
+                            for p in opp_top
+                        )
+                        st.caption(f"🔄 Bring-back targets from {opp}: {brings}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION 3 — SP TARGET BOARD
@@ -7923,10 +7972,13 @@ def display_fd_command_center(plays: List[Dict]):
         ceiling  = fd_pts + variance
         floor    = max(0, fd_pts - variance * 0.6)
 
-        if fip < 3.2 and opp_implied < 4.5:   grade = "🔒 ACE"
-        elif fip < 3.8 and opp_implied < 5.0:  grade = "✅ TARGET"
-        elif opp_implied > 5.2 or fip > 4.8:   grade = "❌ FADE"
-        else:                                    grade = "⚠️ RISKY"
+        # SP Score 0-100: lower FIP + lower opp implied + higher K% = better score
+        # 100 = elite ace in perfect matchup, 50 = league avg, 0 = bad matchup
+        fip_score     = max(0, min(100, (6.0 - fip) / (6.0 - 2.5) * 60))      # FIP: 60% weight
+        k_score       = max(0, min(100, (k_rate - 0.12) / (0.35 - 0.12) * 25)) # K%: 25% weight
+        matchup_score = max(0, min(100, (6.0 - opp_implied) / (6.0 - 3.0) * 15))# Opp implied: 15%
+        sp_dfs_score  = round(fip_score + k_score + matchup_score)
+        grade = f"{sp_dfs_score}"  # just the number — display layer adds color
 
         salary  = sp_sal_entry["salary"] if sp_sal_entry else 0
         value   = round(fd_pts / (salary / 1000), 2) if salary > 0 else 0.0
@@ -7996,9 +8048,9 @@ def display_fd_command_center(plays: List[Dict]):
                 "H":        s["hand"],
                 "Opp":      s["opp"],
                 "Park":     s["park"],
-                "FD Proj":  s["fd_sp_proj"],
-                "Ceiling":  s["fd_ceiling"],
-                "Floor":    s["fd_floor"],
+                "FD Proj":  round(s["fd_sp_proj"], 1),
+                "Ceiling":  round(s["fd_ceiling"], 1),
+                "Floor":    round(s["fd_floor"], 1),
                 "FIP":      f"{s['fip']:.2f}",
                 "K%":       f"{s['k_rate']*100:.0f}%",
                 "Proj K":   f"{s['proj_k']:.0f}",
@@ -8013,12 +8065,14 @@ def display_fd_command_center(plays: List[Dict]):
         sp_df = pd.DataFrame(sp_rows)
 
         def _cg(v):
-            s = str(v)
-            if "ACE"    in s: return "color:#00ff88;font-weight:bold"
-            if "TARGET" in s: return "color:#66dd88;font-weight:bold"
-            if "FADE"   in s: return "color:#ff4444;font-weight:bold"
-            if "RISKY"  in s: return "color:#ffdd00"
-            return ""
+            try:
+                sc = int(float(str(v)))
+                if sc >= 75: return "color:#00ff88;font-weight:bold"
+                if sc >= 60: return "color:#66dd88"
+                if sc >= 45: return "color:#ffdd00"
+                if sc >= 30: return "color:#ff8800"
+                return "color:#ff4444"
+            except: return ""
 
         def _cp(v):
             try:
@@ -8030,7 +8084,7 @@ def display_fd_command_center(plays: List[Dict]):
             except: return ""
 
         st.dataframe(
-            sp_df.style.map(_cg, subset=["Grade"]).map(_cp, subset=["FD Proj","Ceiling"]),
+            sp_df.style.map(_cg, subset=["Score"]).map(_cp, subset=["FD Proj","Ceiling"]),
             use_container_width=True, hide_index=True
         )
     else:
@@ -8223,491 +8277,444 @@ def display_fd_command_center(plays: List[Dict]):
 def display_fd_hand_builder(plays: List[Dict]):
     """
     Tab 8 — FD Hand Builder
-    For single high-stakes entries. Maximum data density, manual slot selection.
-    Position-by-position ranked tables → click to lock → live salary/proj tracking.
+    Quick-reference intel for manual single-entry lineup construction.
+    Shows: top stack games, top 10 players per position, contrarian angles.
+    No clicking, no locking — just clean data to inform your decisions.
     """
-    # ── CSS ──────────────────────────────────────────────────────────────────
     st.markdown("""
     <style>
-    .hb-header {
+    .hb2-header {
         background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-        border: 1px solid #e94560;
-        border-radius: 12px;
-        padding: 20px 24px;
-        margin-bottom: 20px;
+        border: 1px solid #e94560; border-radius: 12px;
+        padding: 20px 24px; margin-bottom: 20px;
     }
-    .hb-title { color: #e94560; font-size: 28px; font-weight: 800; letter-spacing: -0.5px; }
-    .hb-sub { color: #a0a0b0; font-size: 13px; margin-top: 4px; }
-    .slot-card {
-        background: #1a1a2e;
-        border: 1px solid #2a2a4a;
-        border-radius: 8px;
-        padding: 10px 14px;
-        margin-bottom: 8px;
-        transition: all 0.2s;
+    .hb2-title { color: #e94560; font-size: 26px; font-weight: 800; }
+    .hb2-sub { color: #9090a8; font-size: 13px; margin-top: 4px; }
+    .pos-header {
+        background: #12122a; border-left: 4px solid #e94560;
+        padding: 8px 14px; border-radius: 0 8px 8px 0;
+        margin: 16px 0 8px 0; font-weight: 700; font-size: 15px; color: #e0e0ff;
     }
-    .slot-card-locked {
-        background: #0d2818;
-        border: 1px solid #00cc66;
-        border-radius: 8px;
-        padding: 10px 14px;
-        margin-bottom: 8px;
+    .stack-card {
+        background: #1a1a2e; border: 1px solid #2a2a4a;
+        border-radius: 10px; padding: 14px 18px; margin-bottom: 10px;
     }
-    .salary-bar-wrap {
-        background: #111;
-        border-radius: 20px;
-        height: 12px;
-        overflow: hidden;
-        margin: 8px 0;
-    }
-    .salary-fill-green { background: linear-gradient(90deg,#00cc66,#00ff88); height:12px; border-radius:20px; }
-    .salary-fill-yellow{ background: linear-gradient(90deg,#cc9900,#ffcc00); height:12px; border-radius:20px; }
-    .salary-fill-red   { background: linear-gradient(90deg,#cc2200,#ff4444); height:12px; border-radius:20px; }
-    .stat-pill {
-        display: inline-block;
-        background: #2a2a4a;
-        border-radius: 20px;
-        padding: 2px 10px;
-        font-size: 11px;
-        color: #a0c0ff;
-        margin-right: 4px;
-        margin-bottom: 4px;
+    .stack-rank { color: #e94560; font-size: 22px; font-weight: 900; }
+    .stack-team { color: #00ff88; font-size: 18px; font-weight: 700; }
+    .stack-note { color: #9090a8; font-size: 12px; margin-top: 4px; }
+    .contrarian-card {
+        background: linear-gradient(135deg,#0d2818,#1a2a0d);
+        border: 1px solid #00cc66; border-radius: 10px;
+        padding: 14px 18px; margin-bottom: 8px;
     }
     </style>
     """, unsafe_allow_html=True)
 
     st.markdown("""
-    <div class="hb-header">
-        <div class="hb-title">🔬 FD Hand Builder</div>
-        <div class="hb-sub">Single entry. Full data. Build position by position — click to lock players into your lineup.</div>
+    <div class="hb2-header">
+        <div class="hb2-title">🔬 FD Hand Builder — Intel Dashboard</div>
+        <div class="hb2-sub">Quick-reference for single high-stakes entries.
+        Top stacks · Top plays by position · Contrarian angles.
+        Use this alongside your own ownership research before finalizing.</div>
     </div>
     """, unsafe_allow_html=True)
 
     fd_plays    = st.session_state.get("fd_plays_current", [])
-    slate_data  = st.session_state.get("fd_slate_data", {})
     sp_sal_data = st.session_state.get("fd_sp_salary_data", {})
+    sp_proj     = st.session_state.get("fd_sp_projections", [])
 
     if not fd_plays:
         st.warning("⚠️ Load the FanDuel CSV in the **FD Command Center** tab first.")
         return
 
-    SAL_CAP = 35000
-    eligible_plays = [p for p in fd_plays
-                      if p.get("fd_salary", 0) > 0
-                      and not p.get("is_postponed", False)]
+    eligible = [p for p in fd_plays
+                if p.get("fd_salary",0) > 0
+                and not p.get("is_postponed",False)
+                and not p.get("fd_injured",False)]
 
-    # ── Session state for locked lineup ──────────────────────────────────────
-    if "hb_lineup" not in st.session_state:
-        st.session_state.hb_lineup = {
-            "P": None, "C/1B": None, "2B": None, "3B": None,
-            "SS": None, "OF1": None, "OF2": None, "OF3": None, "UTIL": None
-        }
-    lu = st.session_state.hb_lineup
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 1 — TOP STACKS
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown('<div class="pos-header">🔗 Top Stacks — Where to Build Your Core</div>',
+                unsafe_allow_html=True)
+    st.caption("Ranked by implied total + park factor + wind. Stack 4-5 batters from your #1 game.")
 
-    # ── Live salary / proj tracking ──────────────────────────────────────────
-    locked = [p for p in lu.values() if p is not None]
-    locked_hitters = [p for p in locked if p.get("slot","") != "P"]
-    sp_locked = lu.get("P")
+    raw_plays  = st.session_state.get("plays", fd_plays)
+    game_scores = compute_game_stack_scores(raw_plays if raw_plays else fd_plays)
 
-    sal_used = sum(p.get("fd_salary", p.get("salary",0)) for p in locked)
-    sal_left  = SAL_CAP - sal_used
-    proj_tot  = sum(p.get("fd_proj",0) for p in locked_hitters)
-    ceil_tot  = sum(p.get("fd_ceiling",0) for p in locked_hitters)
-    slots_filled = sum(1 for p in lu.values() if p is not None)
-
-    sal_pct   = min(1.0, sal_used / SAL_CAP)
-    bar_class = "salary-fill-green" if sal_used >= 34000 else ("salary-fill-yellow" if sal_used >= 31000 else "salary-fill-red")
-    sal_color = "#00ff88" if sal_used >= 34000 else ("#ffcc00" if sal_used >= 31000 else "#ff4444")
-    over_cap  = sal_used > SAL_CAP
-
-    # ── Top summary bar ──────────────────────────────────────────────────────
-    col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns(5)
-    col_s1.metric("Slots Filled", f"{slots_filled} / 9")
-    col_s2.metric("Salary Used", f"${sal_used:,}", delta=f"${sal_left:,} left" if not over_cap else f"-${-sal_left:,} OVER")
-    col_s3.metric("FD Proj", f"{proj_tot:.1f}")
-    col_s4.metric("Ceiling", f"{ceil_tot:.1f}")
-    col_s5.metric("Avg Salary/Spot", f"${sal_used//max(1,slots_filled):,}")
-
-    st.markdown(f"""
-    <div class="salary-bar-wrap">
-        <div class="{bar_class}" style="width:{sal_pct*100:.1f}%"></div>
-    </div>
-    <div style="color:{sal_color};font-size:12px;margin-bottom:12px">
-        ${sal_used:,} / $35,000 ({sal_pct*100:.0f}%) — ${sal_left:,} remaining
-        {"  ⚠️ OVER CAP" if over_cap else "  ✅ Valid" if slots_filled == 9 else ""}
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_reset, col_export = st.columns([1, 4])
-    with col_reset:
-        if st.button("🔄 Reset Lineup", key="hb_reset"):
-            st.session_state.hb_lineup = {
-                "P": None, "C/1B": None, "2B": None, "3B": None,
-                "SS": None, "OF1": None, "OF2": None, "OF3": None, "UTIL": None
-            }
-            st.rerun()
-
-    with col_export:
-        if slots_filled == 9 and not over_cap:
-            slot_order = ["P","C/1B","2B","3B","SS","OF1","OF2","OF3","UTIL"]
-            export_names = ",".join(lu[s]["name"] for s in slot_order if lu[s])
-            st.code(export_names, language=None)
-            st.caption("☝️ Copy → FanDuel import tool")
-        elif over_cap:
-            st.error("Over salary cap — remove a player to fix")
-        else:
-            st.caption(f"Fill all 9 slots to export ({9-slots_filled} remaining)")
-
-    st.markdown("---")
-
-    # ── Locked lineup display ─────────────────────────────────────────────────
-    if any(p is not None for p in lu.values()):
-        st.subheader("📋 Your Lineup")
-        slot_labels = {"P":"P","C/1B":"C/1B","2B":"2B","3B":"3B","SS":"SS",
-                       "OF1":"OF","OF2":"OF","OF3":"OF","UTIL":"UTIL"}
-        lu_rows = []
-        for slot_key, slot_label in slot_labels.items():
-            p = lu[slot_key]
-            if p:
-                hot = "🔥" if "Hot" in p.get("streak_label","") else ""
-                is_sp = slot_key == "P"
-                lu_rows.append({
-                    "Slot":    slot_label,
-                    "Player":  p["name"],
-                    "Team":    p.get("team",""),
-                    "Salary":  f"${p.get('fd_salary', p.get('salary',0)):,}",
-                    "FD Proj": f"{p.get('fd_proj',0):.1f}" if not is_sp else "—",
-                    "Ceiling": f"{p.get('fd_ceiling',0):.1f}" if not is_sp else "—",
-                    "HR Sc":   f"{p.get('hr_score',0):.0f}" if not is_sp else "—",
-                    "Hot":     hot or "—",
-                    "Opp SP":  p.get("sp_name","")[:14] if not is_sp else "—",
-                })
-
-        st.dataframe(pd.DataFrame(lu_rows), use_container_width=True, hide_index=True)
-
-        # Stack summary
-        team_counts = {}
-        for p in [v for v in lu.values() if v]:
-            t = p.get("team","")
-            if t: team_counts[t] = team_counts.get(t,0)+1
-        stacks = [(t,c) for t,c in sorted(team_counts.items(), key=lambda x:-x[1]) if c >= 2]
-        if stacks:
-            stack_str = " | ".join(f"**{t}** ×{c}" for t,c in stacks)
-            st.caption(f"🔗 Stacks: {stack_str}")
-
-        st.markdown("---")
-
-    # ── PITCHER SECTION ───────────────────────────────────────────────────────
-    st.subheader("⚾ Starting Pitcher")
-    sp_proj_list = st.session_state.get("fd_sp_projections", [])
-
-    sp_rows = []
-    for s in sp_proj_list[:12]:
-        sal_e = _fd_name_match(s["name"], sp_sal_data)
-        sal_v = sal_e["salary"] if sal_e else 0
-        locked_tag = "✅ LOCKED" if (lu["P"] and lu["P"].get("name") == s["name"]) else ""
-        sp_rows.append({
-            "🔒":     locked_tag,
-            "Grade":  s.get("grade","—"),
-            "SP":     s["name"],
-            "H":      s.get("hand","R"),
-            "Opp":    s.get("opp",""),
-            "FD Proj":s["fd_sp_proj"],
-            "Ceil":   s["fd_ceiling"],
-            "FIP":    f"{s['fip']:.2f}",
-            "K%":     f"{s.get('k_rate',0)*100:.0f}%",
-            "Proj K": f"{s.get('proj_k',0):.0f}",
-            "Opp Imp":f"{s['opp_implied']:.1f}" if s.get('opp_implied',0) > 0.5 else "—",
-            "Salary": f"${sal_v:,}" if sal_v else "—",
-            "Value":  f"{s['value']:.2f}x" if s.get('value',0) > 0 else "—",
-            "_name":  s["name"],
-            "_sal":   sal_v,
-        })
-
-    if sp_rows:
-        sp_df_disp = pd.DataFrame([{k:v for k,v in r.items() if not k.startswith("_")} for r in sp_rows])
-        def _sg(v):
-            s = str(v)
-            if "ACE" in s:    return "color:#00ff88;font-weight:bold"
-            if "TARGET" in s: return "color:#66dd88"
-            if "FADE" in s:   return "color:#ff4444"
-            if "RISKY" in s:  return "color:#ffdd00"
-            if "LOCKED" in s: return "color:#00ffcc;font-weight:bold"
-            return ""
-        def _sfp(v):
-            try:
-                f = float(v)
-                if f >= 30: return "color:#00ff88;font-weight:bold"
-                if f >= 22: return "color:#ffdd00"
-                return ""
-            except: return ""
-
-        st.dataframe(
-            sp_df_disp.style.map(_sg, subset=["🔒","Grade"]).map(_sfp, subset=["FD Proj","Ceil"]),
-            use_container_width=True, hide_index=True, height=280
-        )
-
-        # SP lock selector
-        sp_names_avail = [r["_name"] for r in sp_rows if r["_sal"] > 0]
-        col_sp_sel, col_sp_btn = st.columns([3, 1])
-        with col_sp_sel:
-            sp_pick = st.selectbox("Select SP to lock:", ["—"] + sp_names_avail, key="hb_sp_pick")
-        with col_sp_btn:
-            st.write("")
-            if st.button("🔒 Lock SP", key="hb_lock_sp") and sp_pick != "—":
-                sal_e = _fd_name_match(sp_pick, sp_sal_data)
-                lu["P"] = {
-                    "name": sp_pick, "salary": sal_e["salary"] if sal_e else 0,
-                    "fd_salary": sal_e["salary"] if sal_e else 0,
-                    "team": sal_e.get("team","") if sal_e else "",
-                    "slot": "P", "fd_proj": 0, "fd_ceiling": 0,
-                    "streak_label": "", "hr_score": 0,
-                }
-                st.session_state.hb_lineup = lu
-                st.rerun()
-
-    st.markdown("---")
-
-    # ── HITTER POSITION SECTIONS ──────────────────────────────────────────────
-    def _pos_eligible(rp_str, pos):
-        """Check if player with roster_pos string rp_str is eligible for FD slot pos."""
-        parts = [s.strip() for s in rp_str.split("/")]
-        if pos == "C/1B":
-            return "C" in parts or "1B" in parts
-        if pos == "OF":
-            return "OF" in parts or "LF" in parts or "CF" in parts or "RF" in parts
-        if pos == "UTIL":
-            return True
-        return pos in parts
-
-    POSITION_MAP = {
-        "C/1B":  {"slots": ["C/1B"],           "pos": "C/1B"},
-        "2B":    {"slots": ["2B"],              "pos": "2B"},
-        "3B":    {"slots": ["3B"],              "pos": "3B"},
-        "SS":    {"slots": ["SS"],              "pos": "SS"},
-        "OF":    {"slots": ["OF1","OF2","OF3"], "pos": "OF"},
-        "UTIL":  {"slots": ["UTIL"],            "pos": "UTIL"},
-    }
-
-    def get_eligible(pos_key):
-        pos = POSITION_MAP[pos_key]["pos"]
-        return [p for p in eligible_plays
-                if _pos_eligible(
-                    p.get("fd_roster_pos", p.get("fd_position","OF")).upper(), pos
-                )]
-
-    # Current locked names to exclude from selection tables
-    locked_names = set(p["name"] for p in lu.values() if p and p.get("name"))
-
-    def render_position(pos_key, label, budget_remaining):
-        slots = POSITION_MAP[pos_key]["slots"]
-        locked_in_pos = [lu[s] for s in slots if lu[s] is not None]
-
-        with st.expander(
-            f"{'✅' if locked_in_pos else '⬜'} **{label}** "
-            + ("— " + ", ".join(p['name'] for p in locked_in_pos) if locked_in_pos else f"({len(slots)} slot{'s' if len(slots)>1 else ''})"),
-            expanded=(not locked_in_pos)
-        ):
-            cands = get_eligible(pos_key)
-            cands = [p for p in cands if p["name"] not in locked_names or
-                     any(p["name"] == (lu[s] or {}).get("name") for s in slots)]
-            cands.sort(key=lambda x: x.get("fd_proj",0), reverse=True)
-
-            rows_p = []
-            for p in cands[:15]:
-                already = any(p["name"] == (lu[s] or {}).get("name") for s in slots)
-                fits    = p["fd_salary"] <= budget_remaining or already
-                hot     = "🔥" if "Hot" in p.get("streak_label","") else ""
-                rows_p.append({
-                    "":         "✅" if already else ("" if fits else "💸"),
-                    "Player":   p["name"],
-                    "Team":     p["team"],
-                    "Pos":      p.get("fd_position",""),
-                    "Salary":   f"${p['fd_salary']:,}",
-                    "FD Proj":  round(p.get("fd_proj",0),1),
-                    "Ceiling":  round(p.get("fd_ceiling",0),1),
-                    "Value":    f"{p.get('fd_value',0):.1f}x",
-                    "Own%":     f"{p.get('ownership',0):.0f}%",
-                    "Slot":     f"#{p.get('lineup_slot','')}",
-                    "HR Sc":    int(p.get("hr_score",0)),
-                    "Streak":   round(p.get("sub_streak",50),1),
-                    "xSLG":     f"{p.get('xslg',0):.3f}" if p.get("xslg") else "—",
-                    "Opp SP":   p.get("sp_name","")[:16],
-                    "Hot":      hot or "—",
-                    "_name":    p["name"],
-                    "_slot_key":pos_key,
-                })
-
-            df_p = pd.DataFrame([{k:v for k,v in r.items() if not k.startswith("_")} for r in rows_p])
-
-            def _cproj(v):
-                try:
-                    f = float(v)
-                    if f >= 20: return "color:#00ff88;font-weight:bold"
-                    if f >= 14: return "color:#ffdd00"
-                    return ""
-                except: return ""
-
-            def _cval(v):
-                try:
-                    f = float(str(v).replace("x",""))
-                    if f >= 4.0: return "color:#00ff88;font-weight:bold"
-                    if f >= 3.0: return "color:#ffdd00"
-                    return ""
-                except: return ""
-
-            def _co(v):
-                try:
-                    f = float(str(v).replace("%",""))
-                    if f <= 12: return "color:#00ff88"
-                    if f >= 35: return "color:#ff6666"
-                    return ""
-                except: return ""
-
-            if df_p.empty or "FD Proj" not in df_p.columns:
-                st.info("No salary-matched players at this position.")
+    col_s1, col_s2, col_s3 = st.columns(3)
+    for i, (col, g) in enumerate(zip([col_s1, col_s2, col_s3], game_scores[:3])):
+        with col:
+            rank_labels = ["🥇 PRIMARY", "🥈 SECONDARY", "🥉 CONSIDER"]
+            rank_colors = ["#e94560","#ffcc00","#9090a8"]
+            # Pick the better team to stack (higher implied)
+            if g["home_implied"] >= g["away_implied"]:
+                stack_team = g["home_team"]
+                vs_team    = g["away_team"]
+                team_impl  = g["home_implied"]
             else:
-                st.dataframe(
-                    df_p.style.map(_cproj, subset=["FD Proj","Ceiling"])
-                              .map(_cval,  subset=["Value"])
-                              .map(_co,    subset=["Own%"]),
-                    use_container_width=True, hide_index=True,
-                    height=min(380, 55 + len(rows_p) * 35)
+                stack_team = g["away_team"]
+                vs_team    = g["home_team"]
+                team_impl  = g["away_impl"] if "away_impl" in g else g["away_implied"]
+
+            park_hr  = PARK_HR_FACTORS.get(g["park"], 1.0)
+            wind_str = "🏟️ Dome" if g.get("is_dome") else {
+                "out_strong":"💨 Out Strong","out":"💨 Out",
+                "in_strong":"💨 In Strong","in":"💨 In"
+            }.get(g.get("wind_effect","neutral"),"→ Neutral")
+
+            # Top 4 players from stack team
+            team_players = sorted(
+                [p for p in eligible if p.get("team") == stack_team],
+                key=lambda x: x.get("fd_proj",0), reverse=True
+            )[:4]
+
+            impl_str = f"{team_impl:.1f}" if team_impl > 0.5 else "—"
+            st.markdown(
+                f"<div style='color:{rank_colors[i]};font-weight:900;font-size:13px'>{rank_labels[i]}</div>"
+                f"<div style='color:#00ff88;font-size:22px;font-weight:900'>{stack_team}</div>"
+                f"<div style='color:#9090a8;font-size:12px'>vs {vs_team} | O/U {g['game_total']:.1f} | "
+                f"Impl {impl_str}R | Park {park_hr:.2f}x | {wind_str}</div>",
+                unsafe_allow_html=True
+            )
+            if team_players:
+                for p in team_players:
+                    hot = "🔥 " if "Hot" in p.get("streak_label","") else ""
+                    sal = f"${p['fd_salary']:,}" if p["fd_salary"] > 0 else "—"
+                    st.markdown(
+                        f"<div style='padding:3px 0;font-size:13px'>"
+                        f"{hot}<b>{p['name']}</b> #{p.get('lineup_slot','')} "
+                        f"<span style='color:#9090a8'>{p.get('fd_position','')} · {sal} · "
+                        f"{p.get('fd_proj',0):.1f}pts · {p.get('ownership',0):.0f}% own</span></div>",
+                        unsafe_allow_html=True
+                    )
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 2 — SP TARGET BOARD
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown('<div class="pos-header">⚾ Starting Pitcher — Pick One</div>',
+                unsafe_allow_html=True)
+    st.caption("FD uses 1 SP. Score = FIP quality + K rate + matchup. Higher = better DFS play.")
+
+    if sp_proj:
+        sp_cols = st.columns(min(4, len(sp_proj[:8])))
+        for i, (col, s) in enumerate(zip(sp_cols * 4, sp_proj[:8])):
+            sal_e = _fd_name_match(s["name"], sp_sal_data) if sp_sal_data else None
+            sal_v = sal_e["salary"] if sal_e else 0
+            try:
+                score_int = int(float(str(s.get("grade","0"))))
+            except:
+                score_int = 0
+            sc_color = "#00ff88" if score_int >= 75 else "#ffdd00" if score_int >= 55 else "#ff8800"
+            with col:
+                st.markdown(
+                    f"<div style='background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;"
+                    f"padding:10px;margin-bottom:8px;text-align:center'>"
+                    f"<div style='color:{sc_color};font-size:24px;font-weight:900'>{score_int}</div>"
+                    f"<div style='font-size:12px;font-weight:700;color:#e0e0ff'>{s['name']}</div>"
+                    f"<div style='color:#9090a8;font-size:11px'>{s.get('opp','')} opp | FIP {s['fip']:.2f}</div>"
+                    f"<div style='color:#9090a8;font-size:11px'>K% {s.get('k_rate',0)*100:.0f}% | "
+                    f"${sal_v:,}" + (" | Impl " + str(round(s.get('opp_implied',0),1)) if s.get('opp_implied',0) > 0.5 else "") +
+                    f"</div></div>",
+                    unsafe_allow_html=True
                 )
 
-            # Lock selector
-            names_avail = [r["_name"] for r in rows_p
-                           if r[""] != "💸" or any(r["_name"] == (lu[s] or {}).get("name") for s in slots)]
+    st.markdown("---")
 
-            if len(slots) == 1:
-                slot_k = slots[0]
-                col_a, col_b, col_c = st.columns([3, 1, 1])
-                with col_a:
-                    pick = st.selectbox(f"Lock {label}:", ["—"] + names_avail, key=f"hb_pick_{pos_key}")
-                with col_b:
-                    st.write("")
-                    if st.button("🔒 Lock", key=f"hb_lock_{pos_key}") and pick != "—":
-                        player = next((p for p in cands if p["name"] == pick), None)
-                        if player:
-                            lu[slot_k] = {**player, "slot": slot_k}
-                            st.session_state.hb_lineup = lu
-                            st.rerun()
-                with col_c:
-                    st.write("")
-                    if lu[slot_k] and st.button("❌ Clear", key=f"hb_clear_{pos_key}"):
-                        lu[slot_k] = None
-                        st.session_state.hb_lineup = lu
-                        st.rerun()
-            else:
-                # OF: 3 slots
-                for i, slot_k in enumerate(slots, 1):
-                    col_a, col_b, col_c = st.columns([3, 1, 1])
-                    with col_a:
-                        locked_in_slot = lu[slot_k]
-                        default_name = locked_in_slot["name"] if locked_in_slot else "—"
-                        opts = ["—"] + [n for n in names_avail
-                                        if n not in [lu[s]["name"] for s in slots if lu[s] and s != slot_k]]
-                        idx = opts.index(default_name) if default_name in opts else 0
-                        pick = st.selectbox(f"OF {i}:", opts, index=idx, key=f"hb_pick_{slot_k}")
-                    with col_b:
-                        st.write("")
-                        if st.button("🔒", key=f"hb_lock_{slot_k}") and pick != "—":
-                            player = next((p for p in cands if p["name"] == pick), None)
-                            if player:
-                                lu[slot_k] = {**player, "slot": slot_k}
-                                st.session_state.hb_lineup = lu
-                                st.rerun()
-                    with col_c:
-                        st.write("")
-                        if lu[slot_k] and st.button("❌", key=f"hb_clear_{slot_k}"):
-                            lu[slot_k] = None
-                            st.session_state.hb_lineup = lu
-                            st.rerun()
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 3 — TOP 10 BY POSITION
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown('<div class="pos-header">🎯 Top Plays by Position</div>',
+                unsafe_allow_html=True)
+    st.caption("Sorted by FD projection. Color: proj (green=elite) · value (teal) · own% (red=chalk).")
 
-    # Budget for position filtering (salary remaining after all locked players)
-    current_budget = SAL_CAP - sal_used
+    def _pos_filter(plays_list, pos):
+        pos_map = {
+            "C/1B":  lambda rp: any(s in rp for s in ["C","1B"]),
+            "2B":    lambda rp: "2B" in rp,
+            "3B":    lambda rp: "3B" in rp,
+            "SS":    lambda rp: "SS" in rp,
+            "OF":    lambda rp: any(s in rp for s in ["OF","LF","RF","CF"]),
+            "UTIL":  lambda rp: True,
+        }
+        check = pos_map.get(pos, lambda rp: True)
+        return [p for p in plays_list
+                if check(p.get("fd_roster_pos", p.get("fd_position","OF")).upper())]
 
-    for pos_key, info in POSITION_MAP.items():
-        label = pos_key if pos_key != "OF" else "OF (3 slots)"
-        render_position(pos_key, label, current_budget)
+    def _build_pos_df(pos_plays, n=10):
+        rows = []
+        for p in sorted(pos_plays, key=lambda x: x.get("fd_proj",0), reverse=True)[:n]:
+            hot    = "🔥" if "Hot" in p.get("streak_label","") else ""
+            sal    = p.get("fd_salary",0)
+            proj   = p.get("fd_proj",0)
+            ceil   = p.get("fd_ceiling",0)
+            val    = p.get("fd_value",0)
+            own    = p.get("ownership",0)
+            hr_sc  = p.get("hr_score",0)
+            streak = p.get("sub_streak",50)
+            slot   = p.get("lineup_slot","")
+            sp     = p.get("sp_name","")[:14]
+            hand   = p.get("batter_hand","")
+            team   = p.get("team","")
+            # Why this player — build a note
+            notes = []
+            if proj >= 18:   notes.append("elite proj")
+            if val >= 4.0:   notes.append(f"{val:.1f}x value")
+            if hr_sc >= 55:  notes.append(f"HR score {hr_sc:.0f}")
+            if streak >= 72: notes.append("🔥 blazing hot")
+            if own <= 15:    notes.append("contrarian")
+            if sal <= 2500:  notes.append("min-price")
+            rows.append({
+                "Hot":    hot or "—",
+                "Player": p["name"],
+                "Team":   team,
+                "Slot":   f"#{slot}" if slot else "—",
+                "H":      hand,
+                "Salary": f"${sal:,}" if sal else "—",
+                "Proj":   round(proj,1),
+                "Ceil":   round(ceil,1),
+                "Value":  f"{val:.1f}x" if val else "—",
+                "Own%":   f"{own:.0f}%",
+                "HR Sc":  int(hr_sc),
+                "Streak": int(streak),
+                "Opp SP": sp,
+                "💡 Why": ", ".join(notes) if notes else "solid floor",
+            })
+        return pd.DataFrame(rows)
 
-    # ── GAME ENVIRONMENT SUMMARY ─────────────────────────────────────────────
-    if any(p is not None for p in lu.values()):
-        locked_teams = {}
-        for p in lu.values():
-            if p:
-                t = p.get("team","")
-                if t: locked_teams[t] = locked_teams.get(t,0)+1
+    def _style_pos_df(df):
+        def _cproj(v):
+            try:
+                f = float(v)
+                if f >= 20: return "color:#00ff88;font-weight:bold"
+                if f >= 15: return "color:#ffdd00"
+                if f >= 10: return "color:#ff8800"
+                return ""
+            except: return ""
+        def _cown(v):
+            try:
+                f = float(str(v).replace("%",""))
+                if f >= 35: return "color:#ff4444"
+                if f <= 12: return "color:#00ff88"
+                return ""
+            except: return ""
+        def _cval(v):
+            try:
+                f = float(str(v).replace("x",""))
+                if f >= 4.5: return "color:#00ffcc;font-weight:bold"
+                if f >= 3.5: return "color:#66dd88"
+                return ""
+            except: return ""
+        if df.empty or "Proj" not in df.columns:
+            return df.style
+        return df.style.map(_cproj, subset=["Proj","Ceil"]).map(_cown, subset=["Own%"]).map(_cval, subset=["Value"])
 
-        if locked_teams:
-            st.markdown("---")
-            st.subheader("🌍 Game Environment")
-            st.caption("Environment summary for teams in your lineup")
-            for team, count in sorted(locked_teams.items(), key=lambda x:-x[1]):
-                if count >= 2:
-                    team_plays = [p for p in fd_plays if p.get("team") == team]
-                    if team_plays:
-                        sample = team_plays[0]
-                        impl  = sample.get("implied_total", 0)
-                        park  = sample.get("park", team)
-                        sp    = sample.get("sp_name","TBD")
-                        sp_h  = sample.get("sp_hand","R")
-                        wind  = sample.get("wind_effect","neutral")
-                        dome  = sample.get("is_dome", False)
-                        park_hr = PARK_HR_FACTORS.get(park, 1.0)
+    POSITIONS = [
+        ("C/1B",  "⚡ Catcher / First Base"),
+        ("2B",    "🔷 Second Base"),
+        ("3B",    "🔶 Third Base"),
+        ("SS",    "💫 Shortstop"),
+        ("OF",    "🌿 Outfield (3 slots — pick 3)"),
+        ("UTIL",  "🔄 UTIL (any hitter)"),
+    ]
 
-                        wind_str = "🏟️ Dome" if dome else {
-                            "out_strong": "💨 Out Strong (+ceiling)",
-                            "out":        "💨 Out",
-                            "in_strong":  "💨 In Strong (suppressed)",
-                            "in":         "💨 In",
-                        }.get(wind, "→ Neutral")
+    for pos_key, pos_label in POSITIONS:
+        pos_plays = _pos_filter(eligible, pos_key)
+        df = _build_pos_df(pos_plays, n=10)
+        st.markdown(f"<div class='pos-header'>{pos_label}</div>", unsafe_allow_html=True)
+        if df.empty:
+            st.info(f"No salary-matched {pos_key} players in this slate.")
+        else:
+            st.dataframe(
+                _style_pos_df(df),
+                use_container_width=True, hide_index=True,
+                height=min(420, 55 + len(df) * 35)
+            )
 
-                        impl_str = f"{impl:.1f}" if impl > 0.5 else "—"
-                        grade_color = "#00ff88" if (impl > 4.8 and park_hr > 1.0) else "#ffcc00"
-                        st.markdown(
-                            f"<div style='background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;"
-                            f"padding:12px 16px;margin-bottom:8px'>"
-                            f"<b style='color:{grade_color}'>{team}</b> ×{count} — "
-                            f"Implied: <b>{impl_str}</b> runs | "
-                            f"Park HR: <b>{park_hr:.2f}x</b> | "
-                            f"Wind: <b>{wind_str}</b> | "
-                            f"Opp SP: <b>{sp} ({sp_h}HP)</b>"
-                            f"</div>",
-                            unsafe_allow_html=True
-                        )
+    st.markdown("---")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 4 — CONTRARIAN ANGLES
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown('<div class="pos-header">🎲 Contrarian Angles — How to Get Different</div>',
+                unsafe_allow_html=True)
+    st.caption("Low-ownership players with real upside. In tournaments you win by being RIGHT when others are wrong.")
+
+    contrarians = sorted(
+        [p for p in eligible
+         if p.get("ownership",100) <= 18
+         and p.get("fd_proj",0) >= 10.0
+         and p.get("fd_salary",0) >= 2000],
+        key=lambda x: x.get("fd_proj",0) / max(1, x.get("ownership",20)),
+        reverse=True
+    )[:8]
+
+    if contrarians:
+        c_rows = []
+        for p in contrarians:
+            hr_sc  = p.get("hr_score",0)
+            streak = p.get("sub_streak",50)
+            proj   = p.get("fd_proj",0)
+            own    = p.get("ownership",0)
+            sal    = p.get("fd_salary",0)
+            # Build the sell
+            reasons = []
+            if hr_sc >= 50: reasons.append(f"HR score {hr_sc:.0f}/100")
+            if streak >= 65: reasons.append("hot streak")
+            if p.get("fd_ceiling",0) >= 25: reasons.append(f"ceiling {p['fd_ceiling']:.0f}pts")
+            opp_sp = p.get("sp_name","")
+            sp_vuln = p.get("sub_pitcher",50)
+            if sp_vuln >= 58: reasons.append(f"opp SP vulnerable ({opp_sp})")
+            implied = p.get("implied_total",0)
+            if implied >= 4.8: reasons.append(f"{implied:.1f}R implied")
+            c_rows.append({
+                "Player":   p["name"],
+                "Team":     p.get("team",""),
+                "Pos":      p.get("fd_position",""),
+                "Salary":   f"${sal:,}",
+                "Proj":     round(proj,1),
+                "Ceil":     round(p.get("fd_ceiling",0),1),
+                "Own%":     f"{own:.0f}%",
+                "HR Sc":    int(hr_sc),
+                "Opp SP":   opp_sp[:14],
+                "🎯 Sell":  ", ".join(reasons) if reasons else "solid matchup, low owned",
+            })
+
+        df_c = pd.DataFrame(c_rows)
+        def _cown_c(v):
+            try:
+                f = float(str(v).replace("%",""))
+                if f <= 8:  return "color:#00ff88;font-weight:bold"
+                if f <= 15: return "color:#66dd88"
+                return ""
+            except: return ""
+        def _cproj_c(v):
+            try:
+                f = float(v)
+                if f >= 18: return "color:#00ff88;font-weight:bold"
+                if f >= 13: return "color:#ffdd00"
+                return ""
+            except: return ""
+        if not df_c.empty and "Proj" in df_c.columns:
+            st.dataframe(
+                df_c.style.map(_cown_c, subset=["Own%"]).map(_cproj_c, subset=["Proj","Ceil"]),
+                use_container_width=True, hide_index=True
+            )
+    else:
+        st.info("No strong contrarian plays identified on this slate.")
 
 
-# ============================================================================
-# FD LINEUP PORTFOLIO — Bulk GPP entry, auto-built, FD CSV export
-# ============================================================================
+def _build_all_singleton_lineup(fd_plays: List[Dict], sp_salary_data: Dict,
+                                 sp_proj_list: List[Dict]) -> Optional[Dict]:
+    """
+    Lineup 22: Pure model lineup — top 8 hitters by FD proj regardless of team,
+    paired with best value SP. No stack correlation, maximum projected points.
+    Benchmark lineup: wins almost never in GPP but useful as ceiling reference.
+    """
+    SAL_CAP = 35000
+
+    eligible = sorted(
+        [p for p in fd_plays
+         if p.get("fd_salary",0) > 0
+         and not p.get("is_postponed",False)
+         and not p.get("fd_injured",False)],
+        key=lambda x: x.get("fd_proj",0), reverse=True
+    )
+
+    # Best value SP (lowest salary with reasonable projection)
+    sp_with_sal = [s for s in sp_proj_list if s.get("salary",0) > 0]
+    value_sp = sorted(sp_with_sal, key=lambda x: x.get("value",0), reverse=True)
+    sp_name  = value_sp[0]["name"] if value_sp else None
+    sp_entry = _fd_name_match(sp_name, sp_salary_data) if sp_name else None
+    if not sp_entry:
+        return None
+
+    sp_salary = sp_entry["salary"]
+    hitter_budget = SAL_CAP - sp_salary
+
+    # Greedily pick top players by FD proj until budget exhausted
+    chosen = []
+    used_sal = 0
+    for p in eligible:
+        if len(chosen) >= 8:
+            break
+        if used_sal + p["fd_salary"] <= hitter_budget:
+            chosen.append(p)
+            used_sal += p["fd_salary"]
+
+    if len(chosen) < 8:
+        return None
+
+    assigned = _assign_fd_slots(chosen)
+    if assigned is None:
+        hitter_slots = ["C/1B","2B","3B","SS","OF","OF","OF","UTIL"]
+        assigned = [{**h, "slot": hitter_slots[min(i,7)]} for i,h in enumerate(chosen[:8])]
+
+    sp_slot = {"name": sp_name, "salary": sp_salary, "slot": "P",
+                "team": sp_entry.get("team",""), "fd_proj": 0,
+                "fd_ceiling": 0, "fd_floor": 0, "ownership": 0,
+                "streak_label": "", "fd_position": "P"}
+
+    all_players = [sp_slot] + assigned
+    final_sal   = sum(p.get("fd_salary", p.get("salary",0)) for p in all_players)
+
+    # Tag teams for exposure tracking
+    team_counts = {}
+    for p in assigned:
+        t = p.get("team","")
+        if t: team_counts[t] = team_counts.get(t,0)+1
+
+    return {
+        "players":          all_players,
+        "sp_name":          sp_name,
+        "sp_salary":        sp_salary,
+        "sp_upgraded":      False,
+        "primary_team":     max(team_counts, key=team_counts.get) if team_counts else "",
+        "secondary_team":   "",
+        "singleton":        "",
+        "singleton_team":   "",
+        "total_salary":     final_sal,
+        "salary_remaining": SAL_CAP - final_sal,
+        "total_proj":       round(sum(p.get("fd_proj",0) for p in assigned), 1),
+        "total_ceiling":    round(sum(p.get("fd_ceiling",0) for p in assigned), 1),
+        "structure":        "ALL-SINGLETON",
+        "lineup_num":       0,
+        "is_benchmark":     True,
+    }
+
 
 def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
                          n_lineups: int, max_exposure: float,
                          min_salary: int, sp_proj_list: List[Dict]) -> Tuple[List[Dict], Dict]:
     """
-    Build N GPP lineups with systematic SP/stack/singleton variation.
-    Returns (lineups, exposure_report).
+    Build N GPP lineups with structured stack exposure + singleton diversity.
 
-    Strategy:
-    - Pick top 3 SPs (1 ace by proj, 2 values by value_score) — rotate across lineups
-    - Pick top 4 primary stack teams by game_stack_score — rotate
-    - Pick top 3 secondary stacks — rotate
-    - Vary singletons from HR+streak pool
-    - Enforce max exposure per player across the portfolio
-    - All lineups target min_salary to cap
+    Architecture (for 22 lineups):
+      Lineups 1-12:  Stack A primary (55%) — rotate Stack B/C secondary, rotate singletons
+      Lineups 13-19: Stack B primary (32%) — rotate Stack A/C secondary, rotate singletons
+      Lineups 20-21: Stack C primary (9%)  — Stack A/B secondary, singletons
+      Lineup 22:     ALL-SINGLETON benchmark — pure model, no correlation
+
+    Stack D included dynamically: if game_score[3] within 1.0 of game_score[0],
+    add 2 Stack D lineups by redistributing from Stack C allocation.
+
+    Singleton diversity: once top stacks are locked, each lineup gets a unique
+    singleton from the HR+streak ranked pool. No singleton appears > 30% of lineups.
     """
-    SAL_CAP = 35000
+    SAL_CAP   = 35000
+    TOTAL_LU  = n_lineups
 
     if not fd_plays or not sp_salary_data:
         return [], {}
 
-    # ── Identify SP tiers ─────────────────────────────────────────────────────
+    # ── SP pool (up to 4 unique SPs, rotated across portfolio) ───────────────
     sp_with_sal = [s for s in sp_proj_list if s.get("salary",0) > 0]
     sp_ace      = sorted(sp_with_sal, key=lambda x: x.get("fd_sp_proj",0), reverse=True)[:3]
     sp_value    = sorted(sp_with_sal, key=lambda x: x.get("value",0), reverse=True)[:3]
 
-    # Merge into a unique ordered list: ace, value, ace, value...
     sp_pool = []
     seen_sp = set()
     for a, v in zip(sp_ace + sp_ace, sp_value + sp_value):
@@ -8718,62 +8725,130 @@ def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
     if not sp_pool:
         return [], {"error": "No SPs with salary found"}
 
-    # ── Identify stack teams ──────────────────────────────────────────────────
-    # Use raw plays from session state for game stack scoring
-    # (fd_plays are salary-enriched but may lack wind/park fields)
-    raw_plays = st.session_state.get("plays", fd_plays)
+    # SP exposure caps: no SP in more than 45% of stacked lineups
+    sp_cap_lineups = max(1, int((TOTAL_LU - 1) * 0.45))
+
+    # ── Stack team identification ─────────────────────────────────────────────
+    raw_plays   = st.session_state.get("plays", fd_plays)
     game_scores = compute_game_stack_scores(raw_plays if raw_plays else fd_plays)
-    # Top 4 teams by stack score (home team of top games)
-    stack_candidates = []
-    seen_stack_teams = set()
+
+    def team_has_pool(team):
+        return len([p for p in fd_plays
+                    if p.get("team") == team
+                    and p.get("fd_salary",0) > 0
+                    and not p.get("is_postponed",False)]) >= 4
+
+    # Build ordered team list by game stack score
+    stack_teams = []
+    seen_teams  = set()
     for g in game_scores:
         for team in [g["home_team"], g["away_team"]]:
-            if team not in seen_stack_teams:
-                pool_check = [p for p in fd_plays
-                              if p.get("team") == team
-                              and p.get("fd_salary",0) > 0
-                              and not p.get("is_postponed",False)]
-                if len(pool_check) >= 4:
-                    stack_candidates.append(team)
-                    seen_stack_teams.add(team)
-        if len(stack_candidates) >= 6:
+            if team not in seen_teams and team_has_pool(team):
+                stack_teams.append((team, g["stack_score"]))
+                seen_teams.add(team)
+        if len(stack_teams) >= 10:
             break
 
-    if len(stack_candidates) < 2:
-        return [], {"error": f"Not enough teams with 4+ salary-matched players. Found: {stack_candidates}"}
+    if len(stack_teams) < 2:
+        return [], {"error": f"Not enough teams with 4+ salary-matched players: {[t for t,_ in stack_teams]}"}
 
-    primary_teams   = stack_candidates[:4]
-    secondary_teams = stack_candidates[1:5]  # offset for diversity
+    # Dynamic Stack D inclusion: include if score within 1.0 of Stack A
+    top_score = stack_teams[0][1] if stack_teams else 0
+    use_stack_d = (len(stack_teams) >= 4 and
+                   abs(stack_teams[3][1] - top_score) <= 1.0)
 
-    # ── Singleton pool ─────────────────────────────────────────────────────────
-    all_eligible = [p for p in fd_plays
-                    if p.get("fd_salary",0) > 0
-                    and not p.get("is_postponed",False)
-                    and not p.get("fd_injured",False)]
-    singleton_pool = sorted(all_eligible, key=_singleton_score, reverse=True)
+    stack_a = stack_teams[0][0]
+    stack_b = stack_teams[1][0] if len(stack_teams) > 1 else stack_a
+    stack_c = stack_teams[2][0] if len(stack_teams) > 2 else stack_b
+    stack_d = stack_teams[3][0] if use_stack_d and len(stack_teams) > 3 else None
 
-    # ── Build lineups ─────────────────────────────────────────────────────────
+    # ── Exposure plan ─────────────────────────────────────────────────────────
+    # n_lineups=22: 12 A, 7 B, 2 C, (1 D if close), 1 benchmark
+    # Scale proportionally for other counts
+    stacked_count = TOTAL_LU - 1  # last lineup is always benchmark
+    alloc_a = round(stacked_count * 0.55)
+    alloc_b = round(stacked_count * 0.32)
+    alloc_c = stacked_count - alloc_a - alloc_b
+    alloc_d = 0
+
+    if stack_d:
+        # Steal 1-2 lineups from Stack C for Stack D
+        alloc_d = min(2, alloc_c)
+        alloc_c -= alloc_d
+
+    # Build schedule: list of (primary, secondary) pairs
+    schedule = []
+    secondary_options = [stack_b, stack_c, stack_a, stack_b, stack_c, stack_a]
+    if stack_d:
+        secondary_options += [stack_d, stack_a]
+
+    def pick_secondary(primary, idx):
+        """Pick secondary stack different from primary, rotating through options."""
+        opts = [t for t in secondary_options + [stack_b, stack_c]
+                if t != primary]
+        return opts[idx % len(opts)]
+
+    sec_idx = 0
+    for i in range(alloc_a):
+        schedule.append((stack_a, pick_secondary(stack_a, sec_idx)))
+        sec_idx += 1
+    for i in range(alloc_b):
+        schedule.append((stack_b, pick_secondary(stack_b, sec_idx)))
+        sec_idx += 1
+    for i in range(alloc_c):
+        schedule.append((stack_c, pick_secondary(stack_c, sec_idx)))
+        sec_idx += 1
+    for i in range(alloc_d):
+        schedule.append((stack_d, pick_secondary(stack_d, sec_idx)))
+        sec_idx += 1
+
+    # ── Singleton pool (ranked by HR+streak blend) ────────────────────────────
+    all_eligible = sorted(
+        [p for p in fd_plays
+         if p.get("fd_salary",0) > 0
+         and not p.get("is_postponed",False)
+         and not p.get("fd_injured",False)],
+        key=_singleton_score, reverse=True
+    )
+    singleton_cap = max(1, int(stacked_count * 0.30))  # no singleton > 30% of lineups
+    singleton_usage = {}  # name → count used
+
+    def next_singleton(primary_team, secondary_team, used_in_this_lineup):
+        """Pick highest-scored singleton not over-exposed, from a different game."""
+        stack_teams_set = {primary_team, secondary_team}
+        for cand in all_eligible:
+            name = cand["name"]
+            if name in used_in_this_lineup:
+                continue
+            if cand.get("team","") in stack_teams_set:
+                continue
+            if singleton_usage.get(name, 0) >= singleton_cap:
+                continue
+            return cand
+        # Fallback: relax team constraint
+        for cand in all_eligible:
+            name = cand["name"]
+            if name in used_in_this_lineup:
+                continue
+            if singleton_usage.get(name, 0) >= singleton_cap:
+                continue
+            return cand
+        return None
+
+    # ── Build stacked lineups ─────────────────────────────────────────────────
     lineups         = []
-    player_exposure = {}  # name → count
+    player_exposure = {}
+    sp_usage        = {}
 
-    for i in range(n_lineups):
-        # Rotate SP
-        sp_name = sp_pool[i % len(sp_pool)]
-
-        # Rotate primary and secondary — use modulo to cycle through options
-        n_prim = len(primary_teams)
-        n_sec  = len(secondary_teams)
-        primary_team   = primary_teams[i % n_prim]
-        # Secondary: avoid same team, cycle offset
-        sec_offset = (i + (n_sec // 2)) % n_sec
-        secondary_team = secondary_teams[sec_offset]
-        if secondary_team == primary_team:
-            secondary_team = secondary_teams[(sec_offset + 1) % n_sec]
-
-        # Check exposure caps — if SP is over-exposed, try next
-        if player_exposure.get(sp_name, 0) / max(1, i) > max_exposure:
-            sp_name = next((s for s in sp_pool if
-                           player_exposure.get(s, 0) / max(1, i) <= max_exposure), sp_pool[0])
+    for sched_idx, (primary_team, secondary_team) in enumerate(schedule):
+        # Pick SP (rotate, respect cap)
+        sp_name = None
+        for sp_cand in sp_pool:
+            if sp_usage.get(sp_cand, 0) < sp_cap_lineups:
+                sp_name = sp_cand
+                break
+        if not sp_name:
+            sp_name = sp_pool[sched_idx % len(sp_pool)]
 
         lu = _build_fd_gpp_lineup(
             fd_plays=fd_plays,
@@ -8781,29 +8856,101 @@ def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
             secondary_team=secondary_team,
             sp_name=sp_name,
             sp_salary_data=sp_salary_data,
-            lineup_num=i % 3,
+            lineup_num=sched_idx % 6,
             ace_sp_name="",
         )
 
         if lu is None:
-            continue
+            # Retry with relaxed secondary
+            for alt_sec in [stack_a, stack_b, stack_c]:
+                if alt_sec == primary_team:
+                    continue
+                lu = _build_fd_gpp_lineup(
+                    fd_plays=fd_plays,
+                    primary_team=primary_team,
+                    secondary_team=alt_sec,
+                    sp_name=sp_name,
+                    sp_salary_data=sp_salary_data,
+                    lineup_num=sched_idx % 6,
+                    ace_sp_name="",
+                )
+                if lu is not None:
+                    break
 
-        # Enforce minimum salary
+        if lu is None:
+            continue
         if lu["total_salary"] < min_salary:
             continue
 
-        # Update exposure tracking
+        # Track names already in this lineup (for singleton dedup)
+        names_in_lu = set(p.get("name","") for p in lu["players"])
+
+        # Pick and inject singleton (replace worst secondary player)
+        sing_cand = next_singleton(primary_team, secondary_team, names_in_lu)
+        if sing_cand:
+            sing_name = sing_cand["name"]
+            # Check if singleton already in lineup (via stack)
+            if sing_name not in names_in_lu:
+                # Find secondary player with lowest fd_proj to swap
+                sec_players = [p for p in lu["players"]
+                               if p.get("team","") == secondary_team
+                               and p.get("slot","") not in ("P",)]
+                if sec_players:
+                    worst_sec = min(sec_players, key=lambda x: x.get("fd_proj",0))
+                    # Only swap if singleton is a meaningful upgrade or different game
+                    sing_team = sing_cand.get("team","")
+                    if (sing_team not in {primary_team, secondary_team} and
+                            _singleton_score(sing_cand) > _singleton_score(worst_sec) * 0.7):
+                        lu["players"] = [
+                            {**sing_cand, "slot": worst_sec.get("slot","OF"),
+                             "is_singleton": True}
+                            if p is worst_sec else p
+                            for p in lu["players"]
+                        ]
+                        lu["singleton"]      = sing_name
+                        lu["singleton_team"] = sing_team
+                        lu["structure"]      = f"4-3-1"
+                        singleton_usage[sing_name] = singleton_usage.get(sing_name, 0) + 1
+
+        # Track exposure
         for p in lu["players"]:
             n = p.get("name","")
-            if n: player_exposure[n] = player_exposure.get(n,0) + 1
+            if n:
+                player_exposure[n] = player_exposure.get(n,0) + 1
+        sp_usage[sp_name] = sp_usage.get(sp_name, 0) + 1
 
-        lu["lineup_index"] = i + 1
-        lu["sp_tier"] = "ACE" if sp_name in [s["name"] for s in sp_ace[:1]] else "VALUE"
+        lu["lineup_index"] = len(lineups) + 1
+        lu["sp_tier"]      = "ACE" if sp_name in [s["name"] for s in sp_ace[:1]] else "VALUE"
+        lu["primary_stack"] = primary_team
         lineups.append(lu)
+
+    # ── Lineup 22 (N): All-singleton benchmark ────────────────────────────────
+    benchmark = _build_all_singleton_lineup(fd_plays, sp_salary_data, sp_proj_list)
+    if benchmark:
+        benchmark["lineup_index"] = len(lineups) + 1
+        benchmark["sp_tier"]      = "VALUE"
+        for p in benchmark["players"]:
+            n = p.get("name","")
+            if n: player_exposure[n] = player_exposure.get(n,0) + 1
+        lineups.append(benchmark)
 
     # ── Exposure report ───────────────────────────────────────────────────────
     n_built = len(lineups)
-    exposure_report = {}
+    exposure_report = {
+        "_stack_plan": {
+            "A": f"{stack_a} ({alloc_a} lineups)",
+            "B": f"{stack_b} ({alloc_b} lineups)",
+            "C": f"{stack_c} ({alloc_c} lineups)",
+            "D": f"{stack_d} ({alloc_d} lineups)" if stack_d else "not included",
+            "benchmark": "1 all-singleton lineup",
+            "stack_d_reason": (
+                f"Stack D included — score gap {abs(stack_teams[3][1]-top_score):.1f} ≤ 1.0"
+                if stack_d else
+                f"Stack D skipped — score gap {abs(stack_teams[3][1]-top_score):.1f} > 1.0"
+                if len(stack_teams) >= 4 else "Stack D unavailable"
+            ),
+        }
+    }
     for name, count in sorted(player_exposure.items(), key=lambda x: -x[1]):
         pct = count / max(1, n_built) * 100
         exposure_report[name] = {"count": count, "pct": round(pct,1),
@@ -8870,8 +9017,8 @@ def display_fd_portfolio_builder(plays: List[Dict]):
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         n_lineups = st.select_slider(
-            "Lineups to build", options=[3,5,10,15,20,25,30],
-            value=20, key="port_n_lineups"
+            "Lineups to build", options=[3,5,10,15,22,25,30],
+            value=22, key="port_n_lineups"
         )
     with col2:
         max_exp = st.slider(
@@ -8976,17 +9123,16 @@ def display_fd_portfolio_builder(plays: List[Dict]):
         import io as _io_port
         buf = _io_port.StringIO()
         # FD format header
+        # FD bulk import format: OF slots must map correctly
+        # Internal slots: OF1, OF2, OF3 → CSV columns: OF, OF, OF (same name, different positions)
         buf.write("entry-id,contest-id,contest-name,P,C/1B,2B,3B,SS,OF,OF,OF,UTIL\n")
-        slot_order = ["P","C/1B","2B","3B","SS","OF1","OF2","OF3","UTIL"]
+        fd_slot_order = ["P","C/1B","2B","3B","SS","OF1","OF2","OF3","UTIL"]
         for lu in lineups:
             player_by_slot = {p.get("slot",""):p for p in lu["players"]}
             row_names = []
-            for slot in slot_order:
+            for slot in fd_slot_order:
                 p = player_by_slot.get(slot)
-                if p:
-                    row_names.append(p["name"])
-                else:
-                    row_names.append("")
+                row_names.append(p["name"] if p else "")
             buf.write(f",,Propex GPP,{','.join(row_names)}\n")
 
         csv_str = buf.getvalue()
@@ -9002,27 +9148,37 @@ def display_fd_portfolio_builder(plays: List[Dict]):
         st.subheader(f"📋 All {len(lineups)} Lineups")
         st.caption("★ = primary stack  ◆ = secondary  💎 = singleton")
 
+        # Show stack plan from exposure report
+        plan = exp_report.get("_stack_plan",{})
+        if plan:
+            with st.expander("📊 Stack Allocation Plan"):
+                col_pa, col_pb, col_pc, col_pd = st.columns(4)
+                col_pa.metric("Stack A", plan.get("A","—"))
+                col_pb.metric("Stack B", plan.get("B","—"))
+                col_pc.metric("Stack C", plan.get("C","—"))
+                col_pd.metric("Stack D", plan.get("D","not included"))
+                st.caption(f"Stack D decision: {plan.get('stack_d_reason','—')}")
+                st.caption(f"Benchmark: {plan.get('benchmark','—')}")
+
         grid_rows = []
         for lu in lineups:
-            sp_tag = "🎯" if lu.get("sp_tier","") == "ACE" else "💰"
-            player_by_slot = {p.get("slot",""):p for p in lu["players"]}
-            hitters = [p for p in lu["players"] if p.get("slot","") != "P"]
-
-            prim_names = [p["name"] for p in hitters if p.get("team") == lu["primary_team"]]
-            sec_names  = [p["name"] for p in hitters if p.get("team") == lu["secondary_team"]]
-            sing_name  = lu.get("singleton","")
+            is_bench = lu.get("is_benchmark", False)
+            sp_tag   = "🧪" if is_bench else ("🎯" if lu.get("sp_tier","") == "ACE" else "💰")
+            sing_name = lu.get("singleton","")
+            struct    = lu.get("structure","4-4")
+            label     = "🧪 BENCHMARK" if is_bench else struct
 
             grid_rows.append({
-                "#":          lu["lineup_index"],
-                "SP":         f"{sp_tag} {lu['sp_name']}",
-                "Structure":  lu.get("structure","4-4"),
-                "Primary":    lu["primary_team"],
-                "Secondary":  lu["secondary_team"],
-                "Singleton":  sing_name or "—",
-                "Proj":       round(lu["total_proj"],1),
-                "Ceiling":    round(lu["total_ceiling"],1),
-                "Salary":     f"${lu['total_salary']:,}",
-                "Left":       f"${lu['salary_remaining']:,}",
+                "#":         lu["lineup_index"],
+                "SP":        f"{sp_tag} {lu['sp_name']}",
+                "Type":      label,
+                "Primary":   lu.get("primary_stack", lu.get("primary_team","")),
+                "Secondary": lu.get("secondary_team","—") if not is_bench else "ALL-SINGLETON",
+                "Singleton": sing_name or ("N/A" if is_bench else "—"),
+                "Proj":      round(lu["total_proj"],1),
+                "Ceiling":   round(lu["total_ceiling"],1),
+                "Salary":    f"${lu['total_salary']:,}",
+                "Left":      f"${lu['salary_remaining']:,}",
             })
 
         grid_df = pd.DataFrame(grid_rows)
@@ -9044,7 +9200,8 @@ def display_fd_portfolio_builder(plays: List[Dict]):
             except: return ""
 
         st.dataframe(
-            grid_df.style.map(_gproj, subset=["Proj","Ceiling"]).map(_gsal, subset=["Salary"]),
+            grid_df.style.map(_gproj, subset=["Proj","Ceiling"]).map(_gsal, subset=["Salary"])
+                         .map(lambda v: "color:#9b59b6;font-style:italic" if "BENCHMARK" in str(v) else "", subset=["Type"]),
             use_container_width=True, hide_index=True, height=min(600, 55 + len(lineups)*35)
         )
 
