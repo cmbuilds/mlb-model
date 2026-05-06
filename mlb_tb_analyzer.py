@@ -7514,19 +7514,36 @@ def _build_fd_gpp_lineup(fd_plays: List[Dict], primary_team: str,
     hitters     = primary_stack + secondary_stack
     current_sal = total_sal(hitters, active_sp_sal)
 
-    # Over cap: downgrade
-    for _ in range(10):
+    def sal_score(p):
+        """Composite player score for swap decisions."""
+        return (p.get("fd_proj",0) * 0.55 +
+                p.get("fd_ceiling",0) * 0.30 +
+                (p.get("fd_salary",0) / 1000.0) * 0.15)
+
+    # ── Over cap: swap worst player for cheaper alternative ──────────────
+    for _ in range(15):
         if current_sal <= SAL_CAP:
             break
-        worst = max(hitters, key=lambda x: x["fd_salary"])
-        pool  = primary_pool if worst.get("team") == primary_team else secondary_pool
+        overflow = current_sal - SAL_CAP
+        worst = min(hitters, key=sal_score)
+        team  = worst.get("team","")
+        pool  = primary_pool if team == primary_team else secondary_pool
         subs  = sorted(
-            [p for p in pool if p not in hitters
-             and p["fd_salary"] < worst["fd_salary"]],
-            key=lambda x: x.get("fd_proj",0), reverse=True
+            [p for p in pool
+             if p not in hitters and p["fd_salary"] <= worst["fd_salary"] - overflow],
+            key=sal_score, reverse=True
         )
+        if not subs:
+            # Try cross-team
+            subs = sorted(
+                [p for p in fd_plays
+                 if eligible(p) and p not in hitters
+                 and p["fd_salary"] <= worst["fd_salary"] - overflow
+                 and p.get("team","") in {primary_team, secondary_team}],
+                key=sal_score, reverse=True
+            )
         if subs:
-            hitters = [subs[0] if p is worst else p for p in hitters]
+            hitters     = [subs[0] if p is worst else p for p in hitters]
             current_sal = total_sal(hitters, active_sp_sal)
         else:
             break
@@ -7588,46 +7605,53 @@ def _build_fd_gpp_lineup(fd_plays: List[Dict], primary_team: str,
                     singleton_added = True
                     break
 
-    # ── HITTER SALARY UPGRADE ────────────────────────────────────────────
-    # Use remaining budget to upgrade the cheapest hitter within each team pool
-    for _ in range(10):
+    # ── HITTER SALARY OPTIMIZER ─────────────────────────────────────────
+    # Pass 1: Swap-upgrade — for each player, check if any better player
+    # fits in their "slot budget" (budget remaining + that player's salary).
+    # This is the Ohtani fix: swap a cheap player OUT to afford Ohtani.
+    for _pass in range(4):
+        improved = False
+        for i, cur in enumerate(list(hitters)):
+            slot_budget = SAL_CAP - current_sal + cur["fd_salary"]
+            team = cur.get("team","")
+            pool = primary_pool if team == primary_team else secondary_pool
+            cands = sorted(
+                [p for p in (pool + [x for x in fd_plays if eligible(x) and x.get("team","") not in {primary_team, secondary_team}])
+                 if p not in hitters
+                 and p["fd_salary"] <= slot_budget
+                 and sal_score(p) > sal_score(cur) * 1.02],
+                key=sal_score, reverse=True
+            )
+            if cands:
+                hitters[i]  = cands[0]
+                current_sal = total_sal(hitters, active_sp_sal)
+                improved    = True
+                break
+        if not improved:
+            break
+
+    # Pass 2: Fill remaining salary — replace cheapest player with best
+    # option that uses more salary (even if slightly lower proj is OK)
+    for _ in range(12):
         if current_sal >= SAL_SOFT_TARGET:
             break
         budget_left = SAL_CAP - current_sal
-        if budget_left < 100:
+        if budget_left < 200:
             break
         cheapest = min(hitters, key=lambda x: x.get("fd_salary",0))
-        team = cheapest.get("team","")
-        pool = primary_pool if team == primary_team else secondary_pool
         upgrades = sorted(
-            [p for p in pool
-             if p not in hitters
-             and p["fd_salary"] > cheapest["fd_salary"]
-             and p["fd_salary"] - cheapest["fd_salary"] <= budget_left
-             and p.get("fd_proj",0) > cheapest.get("fd_proj",0)],
-            key=lambda x: x.get("fd_proj",0), reverse=True
+            [p for p in fd_plays
+             if eligible(p) and p not in hitters
+             and cheapest["fd_salary"] + 100 <= p.get("fd_salary",0) <= cheapest["fd_salary"] + budget_left
+             and p.get("fd_proj",0) >= cheapest.get("fd_proj",0) * 0.78],
+            key=lambda x: (x.get("fd_salary",0), x.get("fd_proj",0)),
+            reverse=True
         )
         if upgrades:
-            best = upgrades[0]
-            hitters = [best if p is cheapest else p for p in hitters]
+            hitters     = [upgrades[0] if p is cheapest else p for p in hitters]
             current_sal = total_sal(hitters, active_sp_sal)
         else:
-            # Try upgrading from the full eligible pool (includes singleton position)
-            all_upgrades = sorted(
-                [p for p in fd_plays
-                 if eligible(p)
-                 and p not in hitters
-                 and p.get("fd_salary",0) > cheapest.get("fd_salary",0)
-                 and p.get("fd_salary",0) - cheapest.get("fd_salary",0) <= budget_left
-                 and p.get("fd_proj",0) > cheapest.get("fd_proj",0) * 0.85],
-                key=lambda x: x.get("fd_proj",0), reverse=True
-            )
-            if all_upgrades:
-                best = all_upgrades[0]
-                hitters = [best if p is cheapest else p for p in hitters]
-                current_sal = total_sal(hitters, active_sp_sal)
-            else:
-                break
+            break
 
     # ── SLOT ASSIGNMENT ──────────────────────────────────────────────────
     assigned = _assign_fd_slots(hitters)
@@ -8634,8 +8658,18 @@ def display_fd_hand_builder(plays: List[Dict]):
     </style>
     """, unsafe_allow_html=True)
 
-    # Site toggle
-    hb_site = st.radio("Platform", ["FanDuel", "DraftKings"], horizontal=True, key="hb_site_toggle")
+    # Auto-detect which platform has data loaded — default to whichever was most recently loaded
+    has_fd = bool(st.session_state.get("fd_plays_current"))
+    has_dk = bool(st.session_state.get("dk_slate_data"))
+
+    if has_dk and not has_fd:
+        auto_idx = 1   # DraftKings
+    else:
+        auto_idx = 0   # FanDuel (default)
+
+    # Site toggle — auto-selects based on what's loaded, user can override
+    hb_site = st.radio("Platform", ["FanDuel", "DraftKings"], horizontal=True,
+                       index=auto_idx, key="hb_site_toggle")
 
     st.markdown(f"""
     <div class="hb2-header">
@@ -8673,6 +8707,18 @@ def display_fd_hand_builder(plays: List[Dict]):
             labels = ["🥇 PRIMARY", "🥈 SECONDARY", "🥉 CONSIDER"]
             colors = ["#ff8800", "#3399ff", "#9966ff"]
             for col, gs, lbl, clr in zip(gcols, top3_games, labels, colors):
+                # Assign all variables BEFORE rendering
+                home_t   = gs.get("home_team","")
+                away_t   = gs.get("away_team","")
+                home_imp = gs.get("home_implied", 0)
+                away_imp = gs.get("away_implied", 0)
+                best_team = home_t if home_imp >= away_imp else away_t
+                opp_team  = away_t if best_team == home_t else home_t
+                top_team_plays = sorted(
+                    [p for p in dk_plays
+                     if p.get("dk_team","") == best_team or p.get("team","") == best_team],
+                    key=lambda x: x["dk_proj"], reverse=True
+                )[:5]
                 with col:
                     st.markdown(
                         f"<div style='color:{clr};font-size:0.7rem;font-weight:700'>{lbl}</div>"
@@ -8680,17 +8726,9 @@ def display_fd_hand_builder(plays: List[Dict]):
                         f"<div style='color:#9090a8;font-size:0.75rem'>{away_t}@{home_t} | O/U {gs.get('game_total',0):.1f} | Impl {max(home_imp,away_imp):.1f}R</div>",
                         unsafe_allow_html=True
                     )
-                    # game_stacks has home_team/away_team, find which team in this game has best implied
-                home_t = gs.get("home_team","")
-                away_t = gs.get("away_team","")
-                home_imp = gs.get("home_implied", 0)
-                away_imp = gs.get("away_implied", 0)
-                best_team = home_t if home_imp >= away_imp else away_t
-                top_team_plays = [p for p in dk_plays
-                                  if p.get("dk_team","") == best_team
-                                  or p.get("team","") == best_team][:4]
-                for p in top_team_plays:
-                    st.write(f"**{p['name']}** #{p.get('lineup_slot','?')} · ${p['dk_salary']:,} · {p['dk_proj']:.1f}pts · {p.get('dk_ownership',15):.0f}% own")
+                    for p in top_team_plays:
+                        hot = "🔥 " if p.get("sub_streak",0) >= 65 else ""
+                        st.write(f"{hot}**{p['name']}** #{p.get('lineup_slot','?')} · ${p['dk_salary']:,} · {p['dk_proj']:.1f}pts · {p.get('dk_ownership',15):.0f}% own")
 
         st.markdown("---")
 
@@ -9073,11 +9111,11 @@ def display_fd_hand_builder(plays: List[Dict]):
 def _build_all_singleton_lineup(fd_plays: List[Dict], sp_salary_data: Dict,
                                  sp_proj_list: List[Dict]) -> Optional[Dict]:
     """
-    Lineup 22: Pure model lineup — top 8 hitters by FD proj regardless of team,
-    paired with best value SP. No stack correlation, maximum projected points.
-    Benchmark lineup: wins almost never in GPP but useful as ceiling reference.
+    Benchmark lineup: Top 8 hitters by FD proj, paired with ace SP.
+    Uses salary upgrade pass to target within $1,000 of the $35K cap.
     """
-    SAL_CAP = 35000
+    SAL_CAP    = 35000
+    SAL_TARGET = 34000   # leave at most $1,000 on the table
 
     eligible = sorted(
         [p for p in fd_plays
@@ -9086,21 +9124,30 @@ def _build_all_singleton_lineup(fd_plays: List[Dict], sp_salary_data: Dict,
          and not p.get("fd_injured",False)],
         key=lambda x: x.get("fd_proj",0), reverse=True
     )
+    if not eligible:
+        return None
 
-    # Best value SP (lowest salary with reasonable projection)
+    # Use ace SP — benchmark wants highest ceiling
     sp_with_sal = [s for s in sp_proj_list if s.get("salary",0) > 0]
-    value_sp = sorted(sp_with_sal, key=lambda x: x.get("value",0), reverse=True)
-    sp_name  = value_sp[0]["name"] if value_sp else None
-    sp_entry = _fd_name_match(sp_name, sp_salary_data) if sp_name else None
+    if not sp_with_sal:
+        return None
+    ace_sp   = sorted(sp_with_sal, key=lambda x: x.get("fd_sp_proj", x.get("value",0)), reverse=True)
+    sp_name  = ace_sp[0]["name"]
+    sp_entry = _fd_name_match(sp_name, sp_salary_data)
+    if not sp_entry:
+        for s in ace_sp:
+            sp_entry = _fd_name_match(s["name"], sp_salary_data)
+            if sp_entry:
+                sp_name = s["name"]
+                break
     if not sp_entry:
         return None
 
-    sp_salary = sp_entry["salary"]
+    sp_salary     = sp_entry["salary"]
     hitter_budget = SAL_CAP - sp_salary
 
-    # Greedily pick top players by FD proj until budget exhausted
-    chosen = []
-    used_sal = 0
+    # Greedy pick
+    chosen, used_sal = [], 0
     for p in eligible:
         if len(chosen) >= 8:
             break
@@ -9111,43 +9158,53 @@ def _build_all_singleton_lineup(fd_plays: List[Dict], sp_salary_data: Dict,
     if len(chosen) < 8:
         return None
 
+    # Salary upgrade: replace cheapest with better option within budget
+    for _ in range(10):
+        if used_sal >= SAL_TARGET:
+            break
+        budget_left = hitter_budget - used_sal
+        cheapest    = min(chosen, key=lambda x: x["fd_salary"])
+        upgrades = sorted(
+            [p for p in eligible
+             if p not in chosen
+             and p["fd_salary"] > cheapest["fd_salary"]
+             and p["fd_salary"] - cheapest["fd_salary"] <= budget_left],
+            key=lambda x: x.get("fd_proj",0), reverse=True
+        )
+        if upgrades:
+            best  = upgrades[0]
+            chosen = [best if p is cheapest else p for p in chosen]
+            used_sal = sum(p["fd_salary"] for p in chosen)
+        else:
+            break
+
     assigned = _assign_fd_slots(chosen)
     if assigned is None:
-        hitter_slots = ["C/1B","2B","3B","SS","OF","OF","OF","UTIL"]
-        assigned = [{**h, "slot": hitter_slots[min(i,7)]} for i,h in enumerate(chosen[:8])]
+        slots = ["C/1B","2B","3B","SS","OF","OF","OF","UTIL"]
+        assigned = [{**h, "slot": slots[min(i,7)]} for i,h in enumerate(chosen[:8])]
 
     sp_slot = {"name": sp_name, "salary": sp_salary, "slot": "P",
-                "team": sp_entry.get("team",""), "fd_proj": 0,
-                "fd_ceiling": 0, "fd_floor": 0, "ownership": 0,
-                "streak_label": "", "fd_position": "P"}
+               "team": sp_entry.get("team",""), "fd_proj": 0,
+               "fd_ceiling": 0, "fd_floor": 0, "ownership": 0,
+               "streak_label": "", "fd_position": "P"}
 
     all_players = [sp_slot] + assigned
     final_sal   = sum(p.get("fd_salary", p.get("salary",0)) for p in all_players)
-
-    # Tag teams for exposure tracking
     team_counts = {}
     for p in assigned:
         t = p.get("team","")
         if t: team_counts[t] = team_counts.get(t,0)+1
 
     return {
-        "players":          all_players,
-        "sp_name":          sp_name,
-        "sp_salary":        sp_salary,
-        "sp_upgraded":      False,
-        "primary_team":     max(team_counts, key=team_counts.get) if team_counts else "",
-        "secondary_team":   "",
-        "singleton":        "",
-        "singleton_team":   "",
-        "total_salary":     final_sal,
-        "salary_remaining": SAL_CAP - final_sal,
-        "total_proj":       round(sum(p.get("fd_proj",0) for p in assigned), 1),
-        "total_ceiling":    round(sum(p.get("fd_ceiling",0) for p in assigned), 1),
-        "structure":        "ALL-SINGLETON",
-        "lineup_num":       0,
-        "is_benchmark":     True,
+        "players": all_players, "sp_name": sp_name, "sp_salary": sp_salary,
+        "sp_upgraded": False,
+        "primary_team": max(team_counts, key=team_counts.get) if team_counts else "",
+        "secondary_team": "", "singleton": "", "singleton_team": "",
+        "total_salary": final_sal, "salary_remaining": SAL_CAP - final_sal,
+        "total_proj": round(sum(p.get("fd_proj",0) for p in assigned), 1),
+        "total_ceiling": round(sum(p.get("fd_ceiling",0) for p in assigned), 1),
+        "structure": "ALL-SINGLETON", "lineup_num": 0, "is_benchmark": True,
     }
-
 
 def detect_slate_shape(
     stack_teams: List[tuple],   # [(team, score), ...] sorted best→worst
