@@ -4482,6 +4482,112 @@ def display_leaderboard(plays: List[Dict]):
         csv = df.to_csv(index=False)
         st.download_button("📥 Export CSV", csv, f"mlb_tb_picks_{datetime.now(EST).strftime('%Y%m%d')}.csv", "text/csv")
     
+    # ── 🔥 PARLAY TARGETS — Hot + Model convergence ───────────────────────────
+    st.markdown("---")
+    st.subheader("🔥 Parlay Targets — Hot Streak + Model Convergence")
+    st.caption(
+        "Players who score well on BOTH the O1.5 TB model AND the hot streak signal. "
+        "Highest-conviction parlay legs — model confidence backed by real recent form."
+    )
+
+    # Filter: must have real recent form data AND a meaningful model score
+    parlay_candidates = [
+        p for p in (filtered if filtered else plays)
+        if p.get("score", 0) >= 60
+        and p.get("sub_streak", 0) >= 55
+        and p.get("recent_tb_per_game") is not None
+        and p.get("recent_games", 0) >= 3
+    ]
+    # Rank by composite: 60% model score + 40% streak score (model is primary pick driver)
+    parlay_candidates.sort(
+        key=lambda x: x.get("score", 0) * 0.60 + x.get("sub_streak", 0) * 0.40,
+        reverse=True
+    )
+    top_parlay = parlay_candidates[:4]
+
+    if top_parlay:
+        # ── Player cards ──────────────────────────────────────────────────────
+        card_cols = st.columns(min(4, len(top_parlay)))
+        for col, p in zip(card_cols, top_parlay):
+            model_sc  = p.get("score", 0)
+            streak_sc = p.get("sub_streak", 0)
+            tb_pg     = p.get("recent_tb_per_game", 0) or 0
+            prob      = p.get("prob", 0.5)
+            composite = model_sc * 0.60 + streak_sc * 0.40
+
+            # Color by composite strength
+            if composite >= 72:
+                card_color = "#00ff88"; label = "🔥🔥 ELITE"
+            elif composite >= 64:
+                card_color = "#ff8800"; label = "🔥 STRONG"
+            else:
+                card_color = "#ffdd00"; label = "📈 SOLID"
+
+            model_color  = "#00ff88" if model_sc >= 70 else "#ffdd00" if model_sc >= 60 else "#ff8800"
+            streak_color = "#ff4444" if streak_sc >= 70 else "#ff8800" if streak_sc >= 60 else "#ffdd00"
+
+            with col:
+                st.markdown(
+                    f"<div style='background:#1a1a2e;border:2px solid {card_color};"
+                    f"border-radius:12px;padding:14px 12px;text-align:center;margin-bottom:6px'>"
+                    f"<div style='font-size:0.65rem;color:{card_color};font-weight:700;"
+                    f"letter-spacing:0.1em;margin-bottom:4px'>{label}</div>"
+                    f"<div style='font-size:1.05rem;font-weight:800;color:#e0e0ff;margin-bottom:2px'>"
+                    f"{p['name']}</div>"
+                    f"<div style='font-size:0.75rem;color:#9090a8;margin-bottom:10px'>"
+                    f"{p['team']} · #{p.get('lineup_slot','?')} · vs {p.get('sp_name','TBD')[:14]}</div>"
+                    f"<div style='display:flex;justify-content:space-around;margin-bottom:8px'>"
+                    f"<div><div style='font-size:1.4rem;font-weight:900;color:{model_color}'>{model_sc:.0f}</div>"
+                    f"<div style='font-size:0.6rem;color:#888'>MODEL</div></div>"
+                    f"<div style='color:#444;font-size:1.2rem;padding-top:4px'>|</div>"
+                    f"<div><div style='font-size:1.4rem;font-weight:900;color:{streak_color}'>{streak_sc:.0f}</div>"
+                    f"<div style='font-size:0.6rem;color:#888'>STREAK</div></div>"
+                    f"</div>"
+                    f"<div style='font-size:0.75rem;color:#b0b0c8'>"
+                    f"{tb_pg:.2f} TB/g last 7 · {prob*100:.0f}% prob</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+        # ── Auto-generated parlay strings ─────────────────────────────────────
+        st.markdown("")
+        if len(top_parlay) >= 2:
+            leg2 = top_parlay[:2]
+            leg3 = top_parlay[:3]
+
+            p2_str = " + ".join(f"{p['name']} O1.5 TB" for p in leg2)
+            p3_str = " + ".join(f"{p['name']} O1.5 TB" for p in leg3)
+
+            pcol2, pcol3 = st.columns(2)
+            with pcol2:
+                st.markdown(
+                    f"<div style='background:#0d1a0d;border:1px solid #00cc66;"
+                    f"border-radius:8px;padding:10px 12px'>"
+                    f"<div style='color:#00cc66;font-size:0.7rem;font-weight:700;"
+                    f"letter-spacing:0.1em;margin-bottom:4px'>2-LEG PARLAY</div>"
+                    f"<div style='color:#e0e0e0;font-size:0.85rem;font-weight:600'>{p2_str}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+            with pcol3:
+                if len(top_parlay) >= 3:
+                    st.markdown(
+                        f"<div style='background:#0d1a0d;border:1px solid #00cc66;"
+                        f"border-radius:8px;padding:10px 12px'>"
+                        f"<div style='color:#00cc66;font-size:0.7rem;font-weight:700;"
+                        f"letter-spacing:0.1em;margin-bottom:4px'>3-LEG PARLAY</div>"
+                        f"<div style='color:#e0e0e0;font-size:0.85rem;font-weight:600'>{p3_str}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.info("Need 3+ qualifying plays for a 3-leg parlay.")
+    else:
+        st.info(
+            "No plays currently qualify (need Score ≥ 60 + Streak Score ≥ 55 + 3 recent games). "
+            "Run the model once lineups post — streak data requires confirmed lineup slots."
+        )
+
     # Expandable detail cards for top plays
     st.markdown("---")
     st.subheader("🏆 Top Plays — Full Breakdown")
