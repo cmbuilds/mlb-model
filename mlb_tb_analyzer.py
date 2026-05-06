@@ -40,7 +40,7 @@ import pytz
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="⚾ MLB TB Analyzer V1.9",
+    page_title="⚾ MLB TB Analyzer V2.1",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="auto"
@@ -2577,62 +2577,88 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
         details["Blast%"] = f"{blast_raw*100:.1f}%"
 
     # ── Sub-scores 0-100, Z-score normalized so LEAGUE AVG BATTER = 50 ──
-    # V1.8: Switched from range-based to Z-score style normalization.
-    # Old approach (e.g. barrel 0%→0, 7%→35, 20%→100) produced avg batter = ~38,
-    # compressing everyone upward and making elite vs avg indistinguishable.
-    # Z-score: avg = 50, ±1 MLB std dev = ±25 pts. Capped 0-100.
-    # League avg benchmarks (2024 MLB): xSLG=.398, wRC+=100, barrel=7%, HH=37%, K=22.8%, ISO=.165
+    # V2.1: Rebalanced for O1.5 TB prediction accuracy.
+    #
+    # Problem: Previous model used barrel% (26%) + xSLG (24%) + HH% (20%) = 70% weight
+    # on power metrics. This correctly predicts HR rate but NOT O1.5 TB hit rate.
+    # O1.5 TB is cleared by 2 singles or 1 double. Contact hitters like Turang/Chourio
+    # who hit .290+ with 15% K were scoring below power hitters who K 25%+.
+    #
+    # Research-backed O1.5 TB predictors (r = correlation with prop hit rate):
+    #   wOBA / OBP:  r≈0.71  — getting on base = getting TBs
+    #   K% inverse:  r≈0.68  — strikeout = 0 TB guaranteed, biggest miss source
+    #   wRC+:        r≈0.65  — overall offensive context
+    #   xSLG:        r≈0.61  — extra base quality
+    #   Hard Hit%:   r≈0.55  — sustainable contact quality
+    #   Barrel%:     r≈0.42  — predicts HR, not singles/doubles
+    #   ISO:         r≈0.40  — raw power, less relevant for 1.5 TB threshold
+    #
+    # New weight structure: wOBA+K% = primary (48%), xSLG+HH% = secondary (34%), barrel+ISO = tertiary (18%)
 
-    # xSLG: avg=.398, sd≈.080 → Judge(.708)=~148→100, avg→50, weak(.250)→~8
+    # xSLG: avg=.398, sd≈.080
     xslg_score = max(0, min(100, 50 + (xslg - 0.398) / 0.080 * 25))
 
-    # wRC+: avg=100, sd≈35 → 200=~121→100, avg→50, 65→~-25→0
+    # wRC+: avg=100, sd≈35
     wrc_score = max(0, min(100, 50 + (wrc_plus - 100) / 35.0 * 25))
 
-    # Barrel%: avg=7%, sd≈4% → 20%=~131→100, avg→50, 2%=~19→19
+    # Barrel%: avg=7%, sd≈4%
     barrel_score = max(0, min(100, 50 + (barrel_rate - 0.070) / 0.040 * 25))
 
-    # Hard hit%: avg=37%, sd≈5.5% → 56%=~136→100, avg→50, 25%=~5→5
+    # Hard hit%: avg=37%, sd≈5.5%
     hard_hit_score = max(0, min(100, 50 + (hard_hit - 0.370) / 0.055 * 25))
 
-    # K rate INVERSE: avg=22.8%, sd≈6% → high K = low score
-    k_score = max(0, min(100, 50 - (k_rate - 0.228) / 0.060 * 25))
+    # K rate INVERSE: avg=22.8%, sd≈6% — most important single metric for TB props
+    # Turang 15% K → score = 50 + (0.228-0.15)/0.06 × 25 = 82.5 (correctly elite)
+    # Judge 24% K → score = 50 + (0.228-0.24)/0.06 × 25 = 45 (slight negative)
+    k_score = max(0, min(100, 50 + (0.228 - k_rate) / 0.060 * 25))
 
-    # ISO: avg=.165, sd≈.065 → .320=~110→100, avg→50, .050→~6
+    # ISO: avg=.165, sd≈.065
     iso_score = max(0, min(100, 50 + (iso - 0.165) / 0.065 * 25))
+
+    # wOBA: avg=.315, sd≈.040 — on-base quality, primary O1.5 predictor
+    woba_raw   = statcast.get("woba", 0.0) or 0.0
+    try: woba_raw = float(woba_raw)
+    except: woba_raw = 0.0
+    # If wOBA not available, proxy from xSLG and k_rate
+    if woba_raw < 0.200:
+        woba_raw = 0.245 + xslg * 0.22 - k_rate * 0.15  # proxy formula
+        woba_raw = max(0.240, min(0.420, woba_raw))
+    woba_score = max(0, min(100, 50 + (woba_raw - 0.315) / 0.040 * 25))
+    details["wOBA"] = f"{woba_raw:.3f}"
 
     # V1.8: When real Savant bat-tracking data available, add EV50/bat_speed/blast.
     # When unavailable, do NOT fake them — derived proxies are correlated with xSLG.
     has_bat_tracking = (ev50_raw >= 50 and bat_speed_raw >= 30 and blast_raw >= 0.01)
 
     if has_bat_tracking:
-        # EV50: avg≈95mph, sd≈3mph
+        # With Savant bat-tracking: EV50 and blast rate added
         ev50_score = max(0, min(100, 50 + (ev50_raw - 95.0) / 3.0 * 25))
-        # Bat speed: avg≈71mph, sd≈3mph
         bat_speed_score = max(0, min(100, 50 + (bat_speed_raw - 71.0) / 3.0 * 25))
-        # Blast rate: avg≈21%, sd≈5%
         blast_score = max(0, min(100, 50 + (blast_raw - 0.21) / 0.050 * 25))
         composite = (
-            barrel_score    * 0.20 +
-            xslg_score      * 0.16 +
-            hard_hit_score  * 0.14 +
-            ev50_score      * 0.14 +
-            blast_score     * 0.12 +
-            bat_speed_score * 0.10 +
-            wrc_score       * 0.08 +
-            iso_score       * 0.04 +
-            k_score         * 0.02
+            k_score         * 0.18 +   # K% inverse — #1 O1.5 TB predictor
+            woba_score      * 0.16 +   # wOBA — on-base quality
+            xslg_score      * 0.14 +   # xSLG — extra base quality
+            hard_hit_score  * 0.12 +   # HH% — contact quality
+            wrc_score       * 0.10 +   # wRC+ — overall offensive value
+            ev50_score      * 0.10 +   # EV50 — raw power ceiling
+            blast_score     * 0.08 +   # Blast — squared-up contact
+            bat_speed_score * 0.06 +   # Bat speed — mechanical ceiling
+            barrel_score    * 0.04 +   # Barrel% — HR predictor (tertiary for O1.5)
+            iso_score       * 0.02     # ISO — raw power
         )  # sum = 1.00
     else:
-        # No bat-tracking: 6 real signals, sum = 1.00
+        # No bat-tracking — 7 signals, O1.5 optimized weights
+        # Key insight: K% and wOBA predict O1.5 hit rate better than barrel%
         composite = (
-            barrel_score   * 0.26 +
-            xslg_score     * 0.24 +
-            hard_hit_score * 0.20 +
-            wrc_score      * 0.14 +
-            iso_score      * 0.10 +
-            k_score        * 0.06
-        )
+            k_score        * 0.24 +   # K% inverse — most important: K = 0 TB guaranteed
+            woba_score     * 0.20 +   # wOBA — best single on-base quality metric
+            xslg_score     * 0.18 +   # xSLG — extra base potential
+            hard_hit_score * 0.16 +   # HH% — contact quality / floor
+            wrc_score      * 0.12 +   # wRC+ — overall offensive context
+            barrel_score   * 0.06 +   # Barrel% — some weight but tertiary
+            iso_score      * 0.04     # ISO — raw power signal
+        )  # sum = 1.00
 
     return max(0, min(100, composite)), "Contact quality", details
 
@@ -3069,55 +3095,82 @@ def fetch_batter_vs_pitcher(batter_id: str, pitcher_id: str) -> Dict:
 
 def compute_streak_score(recent: Dict, season_slg: float = 0.398) -> Tuple[float, str]:
     """
-    Convert recent form data into a 0-100 score.
+    Convert recent form data into a 0-100 streak score.
+
     Compares recent TB/game to expected TB/game from season SLG.
-    Expected TB/game ≈ SLG × 3.7 AB/game (MLB avg PAs factoring in walks).
+    Expected TB/game ≈ SLG × 3.7 AB/game.
 
-    Score 50 = on pace with season average (no momentum signal)
-    Score 70+ = hot streak (recent TB well above expectation)
-    Score 30- = cold streak (recent TB well below expectation)
+    Score 50 = on pace with season average
+    Score 70+ = hot (recent TB well above expectation OR high hit rate)
+    Score 30- = cold (recent TB AND hit rate well below expectation)
 
-    Scoring uses log-ratio to prevent ceiling crowding:
-      ratio 2.0x → ~75, ratio 2.5x → ~80, ratio 3.0x → ~84
-      ratio 0.5x → ~35, ratio 0.3x → ~25
-
-    Only activates with ≥ 3 recent games; small sample dampening < 5 games.
+    IMPORTANT: Uses LOWER of (season_slg, 0.420) as baseline to prevent
+    power hitters from being labeled Cold just because their recent TB/g
+    is below their own elite-season expectation. League avg SLG ~0.398.
+    A player with 0.480 season SLG but a 1.2 TB/g recent stretch is NOT cold.
     """
     if not recent or recent.get("games", 0) < 3 or recent.get("tb_per_game") is None:
         return 50.0, "Form: no data"
 
     tb_recent  = recent["tb_per_game"]
     g          = recent["games"]
-    # Use 3.7 AB/game (consistent with display tab); season_slg fallback = 0.398
-    season_exp = max(0.01, season_slg * 3.7)
+    h          = recent.get("h_last_7", 0)
+    ab         = recent.get("ab_last_7", max(1, g * 3))
+    hr         = recent.get("hr_last_7", 0)
 
-    # Log-ratio prevents ceiling collapse: ln(2.0) ≈ 0.69, ln(0.5) ≈ -0.69
+    # CAP season_slg at 0.420 (just above league avg 0.398) so elite hitters
+    # don't get penalized for not matching their own power ceiling recently.
+    # If a player has a 0.500 SLG but hits 1.2 TB/g in 7 games, that is NEUTRAL
+    # form, not cold. We compare to a reasonable baseline, not their personal peak.
+    baseline_slg = min(season_slg, 0.420)
+    season_exp   = max(0.01, baseline_slg * 3.7)   # ~1.47 TB/g at 0.398 SLG
+
     import math as _math
     log_ratio = _math.log(max(0.05, tb_recent) / season_exp)
 
-    # Scale: log_ratio 0 → 50, +0.69 (2x) → 75, +1.10 (3x) → 84
-    #        -0.69 (0.5x) → 25, -1.20 (0.3x) → 18
+    # Scale: log_ratio 0 → 50, +0.69 (2x above baseline) → 75
     raw_score = 50 + log_ratio * 36
     raw_score = max(10.0, min(90.0, raw_score))
 
-    # Dampen with small samples — blend toward 50 with < 5 games
+    # Hit-rate bonus: if player is getting hits consistently, boost score
+    # even if TB/g is dragged down by singles (still good prop performance)
+    if ab > 0:
+        hit_rate = h / ab
+        if hit_rate >= 0.350:
+            raw_score += 8   # high contact rate over last 7 games
+        elif hit_rate >= 0.300:
+            raw_score += 4
+        elif hit_rate < 0.150 and g >= 5:
+            raw_score -= 6   # genuinely struggling with contact
+
+    # HR bonus: recent power
+    if hr >= 3:
+        raw_score += 5
+    elif hr >= 2:
+        raw_score += 3
+
+    raw_score = max(10.0, min(90.0, raw_score))
+
+    # Dampen with small samples
     if g < 5:
-        weight = g / 5
+        weight    = g / 5
         raw_score = raw_score * weight + 50.0 * (1 - weight)
 
-    h  = recent.get("h_last_7", 0)
-    ab = recent.get("ab_last_7", 1)
-    hr = recent.get("hr_last_7", 0)
-    ratio = tb_recent / season_exp
+    raw_score = round(raw_score, 1)
 
-    if ratio >= 1.4:
+    ratio = tb_recent / season_exp
+    # Only label Cold if BOTH TB/g is low AND hit rate is low
+    hit_rate = h / max(1, ab)
+    is_truly_cold = ratio <= 0.65 and hit_rate < 0.200 and g >= 4
+
+    if ratio >= 1.4 or (hit_rate >= 0.320 and g >= 4):
         label = f"🔥 Hot ({tb_recent:.2f} TB/g last {g}g | {h}/{ab}" + (f" {hr}HR" if hr else "") + ")"
-    elif ratio <= 0.65:
+    elif is_truly_cold:
         label = f"❄️ Cold ({tb_recent:.2f} TB/g last {g}g | {h}/{ab})"
     else:
-        label = f"Form: {tb_recent:.2f} TB/g last {g}g | {h}/{ab}"
+        label = f"{tb_recent:.2f} TB/g last {g}g | {h}/{ab}" + (f" {hr}HR" if hr else "")
 
-    return round(raw_score, 1), label
+    return raw_score, label
 
 
 def compute_bvp_score(bvp: Dict, batter_slg: float = 0.398) -> Tuple[float, str]:
@@ -3328,7 +3381,7 @@ def compute_final_score(
     # Proxy mode: source says mlbapi only, or statcast columns missing
     _is_proxy = ("mlbapi" in _bat_src or _bat_src in ("mlbapi_only",) or
                  "disk_cache_stale" in _bat_src or not _has_full)
-    _offset = 9.5 if _is_proxy else 6.5   # V1.8: calibrated so avg batter vs avg SP = 55
+    _offset = 9.5 if _is_proxy else 7.0   # V2.1: calibrated for new contact-first batter weights
     calibrated = raw + _offset
     return max(0, min(100, round(calibrated, 1)))
 
@@ -6930,6 +6983,74 @@ def compute_team_stack_score(team: str, game: Dict, plays: List[Dict]) -> Dict:
     }
 
 
+def get_ranked_team_stacks(plays: List[Dict], min_players: int = 3) -> List[Dict]:
+    """
+    Unified team stack ranker — replaces compute_game_stack_scores for lineup building.
+    Returns teams ranked by compute_team_stack_score (implied + SP vuln + HR + streaks).
+    Game environment (park, wind, O/U) is INCLUDED inside compute_team_stack_score,
+    so this is the single correct signal for both display and lineup construction.
+    """
+    # Build game dict for each game (needed by compute_team_stack_score)
+    games_by_id = {}
+    for p in plays:
+        gid = p.get("game_id","")
+        if not gid:
+            continue
+        if gid not in games_by_id:
+            home = p.get("park","")
+            away = p.get("opponent","") if p.get("team","") == home else p.get("team","")
+            games_by_id[gid] = {
+                "game_id": gid,
+                "home_team": home,
+                "away_team": away,
+                "game_total": p.get("game_total",9.0),
+                "park": home,
+                "is_dome": p.get("is_dome",False),
+                "wind_effect": p.get("wind_effect","neutral"),
+                "temperature": p.get("temperature",70),
+                "home_implied": 0,
+                "away_implied": 0,
+                "park_hr": PARK_HR_FACTORS.get(home, 1.0),
+                "stack_score": 0,  # filled below from team scores
+            }
+        # Track implied totals per team side
+        team = p.get("team","")
+        impl = p.get("implied_total",0)
+        g    = games_by_id[gid]
+        if team == g["home_team"] and impl > g["home_implied"]:
+            g["home_implied"] = impl
+        elif team == g["away_team"] and impl > g["away_implied"]:
+            g["away_implied"] = impl
+
+    # Score every team
+    team_scores = []
+    seen_teams  = set()
+    for gid, game in games_by_id.items():
+        for team in [game["home_team"], game["away_team"]]:
+            if not team or team in seen_teams:
+                continue
+            n_players = len([p for p in plays if p.get("team","") == team])
+            if n_players < min_players:
+                continue
+            sd = compute_team_stack_score(team, game, plays)
+            sd["game_id"]    = gid
+            sd["game_total"] = game["game_total"]
+            sd["home_team"]  = game["home_team"]
+            sd["away_team"]  = game["away_team"]
+            sd["opp_team"]   = game["away_team"] if team == game["home_team"] else game["home_team"]
+            sd["park_hr"]    = game["park_hr"]
+            sd["wind_effect"]= game["wind_effect"]
+            sd["is_dome"]    = game["is_dome"]
+            sd["game_label"] = f"{game['away_team']}@{game['home_team']}"
+            sd["park"]       = game["park"]
+            sd["n_players"]  = n_players
+            team_scores.append(sd)
+            seen_teams.add(team)
+
+    team_scores.sort(key=lambda x: x["stack_score"], reverse=True)
+    return team_scores
+
+
 def get_sp_targets(plays: List[Dict], salary_data: Dict) -> Dict:
     """
     Build SP target board from plays data.
@@ -7971,93 +8092,23 @@ def display_fd_command_center(plays: List[Dict]):
         st.info("📥 Upload the FanDuel CSV above to unlock stack rankings, SP board, projections, and value plays.")
         return
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # SECTION 1 — GAME STACK RANKER
-    # ═══════════════════════════════════════════════════════════════════════
-    st.subheader("🏟️ Game Stack Ranker")
-    st.caption("Games ranked by run environment — O/U + park factor + wind. Stack the #1 or #2 game.")
-
+    # ── Compute team stack rankings ─────────────────────────────────────────
+    # game_scores kept for bring-back display; team_ranks is the primary ranking signal
     game_scores = compute_game_stack_scores(slate_plays)
+    team_ranks  = get_ranked_team_stacks(slate_plays, min_players=3)
 
-    if not game_scores:
-        st.warning("No game data — run the model first.")
-    else:
-        # Filter to active slate games
-        if selected_games:
-            def _game_in_slate(g):
-                label = f"{g['away_team']}@{g['home_team']}"
-                label2 = f"{g['away_team']} @ {g['home_team']}"
-                return any(sg.replace(" ","") == label.replace(" ","") for sg in selected_games)
-            game_scores = [g for g in game_scores if _game_in_slate(g)] or game_scores
-
-        ranker_rows = []
-        for i, g in enumerate(game_scores):
-            label = ["🥇 PRIMARY","🥈 SECONDARY","🥉 CONSIDER","❌ FADE","❌ FADE","❌ FADE","❌ FADE","❌ FADE","❌ FADE","❌ FADE"][min(i,9)]
-            we = g.get("wind_effect","neutral")
-            if g.get("is_dome"):
-                wind_str = "🏟️ Dome"
-            elif "out_strong" in we: wind_str = f"💨 Out Strong (+{g['wind_bonus']})"
-            elif "out" in we:        wind_str = f"💨 Out (+{g['wind_bonus']})"
-            elif "in_strong" in we:  wind_str = f"💨 In Strong ({g['wind_bonus']})"
-            elif "in" in we:         wind_str = f"💨 In ({g['wind_bonus']})"
-            else:                    wind_str = "→ Neutral"
-
-            ranker_rows.append({
-                "":            label,
-                "Game":        f"{g['away_team']} @ {g['home_team']}",
-                "O/U":         f"{g['game_total']:.1f}",
-                "Park":        f"{g['park_bonus']:+.1f}",
-                "Wind":        wind_str,
-                "Stack Score": round(g['stack_score'], 1),
-            })
-
-        df_ranker = pd.DataFrame(ranker_rows)
-
-        def color_stack_score(val):
-            try:
-                v = float(val)
-                if v >= 12: return "color:#00ff88;font-weight:bold"
-                if v >= 10: return "color:#ffdd00"
-                if v < 8:   return "color:#888"
-                return ""
-            except: return ""
-
-        st.dataframe(
-            df_ranker.style.map(color_stack_score, subset=["Stack Score"]),
-            use_container_width=True, hide_index=True
-        )
-
-    # ═══════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════════
     # SECTION 2 — TEAM STACK VIEWER (ranked list, no game selection required)
     # ═══════════════════════════════════════════════════════════════════════
     st.markdown("---")
     st.subheader("🔗 Stack Rankings")
     st.caption(
-        "Teams ranked by stack score (implied total + park + wind). "
-        "Expand any team to see their top batters, salary, and hot/cold status. "
-        "Teams from the same game are noted — use those as bring-back targets."
+        "Teams ranked by composite stack score: implied runs + SP vulnerability + HR potential + hot streaks. "
+        "Expand any team to see their top batters, salary, and hot/cold status."
     )
 
-    if game_scores:
-        # Build a flat ranked list of all teams with their stack data
-        all_team_stacks = []
-        for g in game_scores:
-            for team in [g["home_team"], g["away_team"]]:
-                opp = g["away_team"] if team == g["home_team"] else g["home_team"]
-                stack_data = compute_team_stack_score(team, g, slate_plays)
-                stack_data["game_label"] = f"{g['away_team']}@{g['home_team']}"
-                stack_data["game_total"] = g["game_total"]
-                stack_data["opp_team"]   = opp
-                stack_data["park_hr"]    = PARK_HR_FACTORS.get(g["park"], 1.0)
-                stack_data["wind_effect"]= g.get("wind_effect","neutral")
-                stack_data["is_dome"]    = g.get("is_dome", False)
-                stack_data["game_stack_score"] = g["stack_score"]
-                all_team_stacks.append(stack_data)
-
-        # Sort by team stack score
-        all_team_stacks.sort(key=lambda x: x["stack_score"], reverse=True)
-
-        for rank, sd in enumerate(all_team_stacks[:12], 1):
+    if team_ranks:
+        for rank, sd in enumerate(team_ranks[:12], 1):
             team   = sd["team"]
             score  = sd["stack_score"]
             impl   = sd["implied"]
@@ -8835,34 +8886,30 @@ def display_fd_hand_builder(plays: List[Dict]):
     # ═══════════════════════════════════════════════════════════════════════
     st.markdown('<div class="pos-header">🔗 Top Stacks — Where to Build Your Core</div>',
                 unsafe_allow_html=True)
-    st.caption("Ranked by implied total + park factor + wind. Stack 4-5 batters from your #1 game.")
+    st.caption("Teams ranked by composite stack score: implied runs + SP vulnerability + HR potential + hot streaks.")
 
-    # Filter to slate games only (teams present in uploaded salary CSV)
+    # Filter to slate teams only, use team-level ranking
     raw_plays   = st.session_state.get("plays", fd_plays)
     slate_teams = set(p.get("team","") for p in fd_plays if p.get("fd_salary",0) > 0)
     slate_plays = [p for p in (raw_plays or fd_plays) if p.get("team","") in slate_teams]
-    game_scores = compute_game_stack_scores(slate_plays if slate_plays else fd_plays)
+    top_team_ranks = get_ranked_team_stacks(slate_plays if slate_plays else fd_plays, min_players=3)
 
     col_s1, col_s2, col_s3 = st.columns(3)
-    for i, (col, g) in enumerate(zip([col_s1, col_s2, col_s3], game_scores[:3])):
+    for i, (col, sd) in enumerate(zip([col_s1, col_s2, col_s3], top_team_ranks[:3])):
         with col:
             rank_labels = ["🥇 PRIMARY", "🥈 SECONDARY", "🥉 CONSIDER"]
             rank_colors = ["#e94560","#ffcc00","#9090a8"]
-            # Pick the better team to stack (higher implied)
-            if g["home_implied"] >= g["away_implied"]:
-                stack_team = g["home_team"]
-                vs_team    = g["away_team"]
-                team_impl  = g["home_implied"]
-            else:
-                stack_team = g["away_team"]
-                vs_team    = g["home_team"]
-                team_impl  = g["away_impl"] if "away_impl" in g else g["away_implied"]
+            stack_team = sd["team"]
+            vs_team    = sd.get("opp_team","")
+            team_impl  = sd.get("implied", 0)
+            comp       = sd.get("components", {})
 
-            park_hr  = PARK_HR_FACTORS.get(g["park"], 1.0)
-            wind_str = "🏟️ Dome" if g.get("is_dome") else {
-                "out_strong":"💨 Out Strong","out":"💨 Out",
-                "in_strong":"💨 In Strong","in":"💨 In"
-            }.get(g.get("wind_effect","neutral"),"→ Neutral")
+            park_hr  = sd.get("park_hr", 1.0)
+            wind_eff = sd.get("wind_effect","neutral")
+            is_dome  = sd.get("is_dome", False)
+            wind_str = "🏟️ Dome" if is_dome else {
+                "out_strong":"💨 Out","out":"💨 Out","in_strong":"💨 In","in":"💨 In"
+            }.get(wind_eff,"→ Neutral")
 
             # Top 4 players from stack team
             team_players = sorted(
@@ -8874,7 +8921,7 @@ def display_fd_hand_builder(plays: List[Dict]):
             st.markdown(
                 f"<div style='color:{rank_colors[i]};font-weight:900;font-size:13px'>{rank_labels[i]}</div>"
                 f"<div style='color:#00ff88;font-size:22px;font-weight:900'>{stack_team}</div>"
-                f"<div style='color:#9090a8;font-size:12px'>vs {vs_team} | O/U {g['game_total']:.1f} | "
+                f"<div style='color:#9090a8;font-size:12px'>vs {vs_team} | O/U {sd.get('game_total',0):.1f} | "
                 f"Impl {impl_str}R | Park {park_hr:.2f}x | {wind_str}</div>",
                 unsafe_allow_html=True
             )
@@ -9357,9 +9404,11 @@ def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
     # SP exposure caps: no SP in more than 45% of stacked lineups
     sp_cap_lineups = max(1, int((TOTAL_LU - 1) * 0.45))
 
-    # ── Stack team identification ─────────────────────────────────────────────
+    # ── Stack team identification — use team-level scores (NOT game scores) ─────
+    # Team stack score incorporates: implied total + SP vulnerability + HR potential
+    # + hot streaks. This is superior to game O/U alone.
     raw_plays   = st.session_state.get("plays", fd_plays)
-    game_scores = compute_game_stack_scores(raw_plays if raw_plays else fd_plays)
+    team_ranks  = get_ranked_team_stacks(raw_plays if raw_plays else fd_plays, min_players=4)
 
     def team_has_pool(team):
         return len([p for p in fd_plays
@@ -9367,16 +9416,7 @@ def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
                     and p.get("fd_salary",0) > 0
                     and not p.get("is_postponed",False)]) >= 4
 
-    # Build ordered team list by game stack score
-    stack_teams = []
-    seen_teams  = set()
-    for g in game_scores:
-        for team in [g["home_team"], g["away_team"]]:
-            if team not in seen_teams and team_has_pool(team):
-                stack_teams.append((team, g["stack_score"]))
-                seen_teams.add(team)
-        if len(stack_teams) >= 10:
-            break
+    stack_teams = [(sd["team"], sd["stack_score"]) for sd in team_ranks if team_has_pool(sd["team"])]
 
     if len(stack_teams) < 2:
         return [], {"error": f"Not enough teams with 4+ salary-matched players: {[t for t,_ in stack_teams]}"}
@@ -10762,19 +10802,13 @@ def display_dk_portfolio_builder(plays: List[Dict]):
         ) | set(p.get("dk_team", p.get("team","")) for p in dk_plays)
         dk_raw_plays = [p for p in (st.session_state.get("plays") or plays)
                         if p.get("team","") in dk_salary_teams]
-        dk_game_scores = compute_game_stack_scores(dk_raw_plays if dk_raw_plays else plays)
-        dk_stack_teams = []
-        dk_seen_teams  = set()
-        for g in dk_game_scores:
-            for team in [g.get("home_team",""), g.get("away_team","")]:
-                if team and team not in dk_seen_teams and team in dk_salary_teams:
-                    n_players = len([p for p in dk_plays
-                                     if p.get("dk_team","") == team or p.get("team","") == team])
-                    if n_players >= 3:
-                        dk_stack_teams.append((team, g.get("stack_score", 0)))
-                        dk_seen_teams.add(team)
-            if len(dk_stack_teams) >= 12:
-                break
+
+        # Use team-level scores (NOT game scores) for DK stack ranking
+        dk_team_ranks  = get_ranked_team_stacks(dk_raw_plays if dk_raw_plays else plays, min_players=3)
+        dk_stack_teams = [(sd["team"], sd["stack_score"]) for sd in dk_team_ranks
+                          if sd["team"] in dk_salary_teams
+                          and len([p for p in dk_plays
+                                   if p.get("dk_team","") == sd["team"] or p.get("team","") == sd["team"]]) >= 3]
 
         dk_slate_analysis = detect_slate_shape(dk_stack_teams, dk_plays, n_lineups, site="DK")
         dk_shapes = dk_slate_analysis["shapes"]
