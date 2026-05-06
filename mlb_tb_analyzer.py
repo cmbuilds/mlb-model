@@ -3001,11 +3001,15 @@ def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[fl
 @st.cache_data(ttl=1800)
 def fetch_batter_recent_form(player_id: str, n_games: int = 7) -> Dict:
     """
-    Pull last N game logs for a batter from MLB Stats API gameLog endpoint.
+    Pull last N game box scores for a batter using the MLB Stats API.
 
-    Computes TB from counting stats (H + 2×2B + 3×3B + 4×HR) as primary method.
-    The totalBases field in gameLog can be unreliable — computing from components
-    is always accurate since we have H, doubles, triples, HR per game.
+    Strategy: Use the player's recent game schedule to get game PKs,
+    then compute per-game TB from the box score hitting line.
+    This bypasses the gameLog endpoint which returns running season totals,
+    not individual game stats.
+
+    Fallback: If box score approach fails, use the gameLog endpoint and
+    compute TB from component stats (H, 2B, 3B, HR).
     """
     _empty = {"tb_per_game": None, "avg_recent": None, "games": 0,
               "hr_last_7": 0, "h_last_7": 0, "ab_last_7": 0}
@@ -3013,55 +3017,96 @@ def fetch_batter_recent_form(player_id: str, n_games: int = 7) -> Dict:
         return _empty
 
     import datetime as _dt
-    current_year = _dt.datetime.now().year
+    today      = _dt.datetime.now()
+    current_year = today.year
 
-    def _fetch_season(year: int) -> list:
+    # ── Method 1: gameLog endpoint (most reliable when it returns per-game data) ─
+    def _fetch_gamelogs(year: int) -> Dict:
         url = (f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
-               f"?stats=gameLog&group=hitting&gameType=R&season={year}&limit={n_games + 8}")
+               f"?stats=gameLog&group=hitting&gameType=R&season={year}&limit=20")
         try:
             r = requests.get(url, timeout=8)
             if r.status_code != 200:
-                return []
-            return r.json().get("stats", [{}])[0].get("splits", [])
+                return {}
+            splits = r.json().get("stats", [{}])[0].get("splits", [])
+            if not splits:
+                return {}
+
+            # The gameLog endpoint CAN return running season totals instead of
+            # per-game stats. Detect this by checking if totals increase monotonically.
+            # If splits[0]["stat"]["hits"] > splits[1]["stat"]["hits"], it's per-game.
+            # If they increase, it's cumulative — we need to diff consecutive rows.
+            hits_vals = [int(s.get("stat",{}).get("hits",0) or 0) for s in splits[:5]]
+            is_cumulative = len(hits_vals) >= 2 and all(
+                hits_vals[i] >= hits_vals[i+1] for i in range(len(hits_vals)-1)
+            )
+            # Actually: gameLog is most-recent-first, so if it's cumulative,
+            # hits would DECREASE as we go back (older games have lower cumulative totals)
+            # If per-game, values are random (some games 0H, some 3H)
+            # Cumulative detection: if sorted desc == original, it's cumulative
+            is_cumulative = (sorted(hits_vals, reverse=True) == hits_vals and
+                             max(hits_vals) > 5 and min(hits_vals) == 0)
+
+            recent = splits[:n_games]
+
+            if is_cumulative:
+                # Diff consecutive rows to get per-game stats
+                # splits[0] = most recent cumulative, splits[1] = day before, etc.
+                game_stats = []
+                for i in range(len(recent) - 1):
+                    cur  = recent[i].get("stat",{})
+                    prev = recent[i+1].get("stat",{})
+                    game_stats.append({
+                        "ab": max(0, int((cur.get("atBats",0) or 0)) - int((prev.get("atBats",0) or 0))),
+                        "h":  max(0, int((cur.get("hits",0) or 0)) - int((prev.get("hits",0) or 0))),
+                        "d2": max(0, int((cur.get("doubles",0) or 0)) - int((prev.get("doubles",0) or 0))),
+                        "d3": max(0, int((cur.get("triples",0) or 0)) - int((prev.get("triples",0) or 0))),
+                        "hr": max(0, int((cur.get("homeRuns",0) or 0)) - int((prev.get("homeRuns",0) or 0))),
+                    })
+            else:
+                game_stats = []
+                for s in recent:
+                    st_ = s.get("stat",{})
+                    game_stats.append({
+                        "ab": int(st_.get("atBats",0) or 0),
+                        "h":  int(st_.get("hits",0) or 0),
+                        "d2": int(st_.get("doubles",0) or 0),
+                        "d3": int(st_.get("triples",0) or 0),
+                        "hr": int(st_.get("homeRuns",0) or 0),
+                    })
+
+            total_tb = total_ab = total_h = total_hr = 0
+            g = 0
+            for gs in game_stats:
+                singles = max(0, gs["h"] - gs["d2"] - gs["d3"] - gs["hr"])
+                tb = singles + gs["d2"]*2 + gs["d3"]*3 + gs["hr"]*4
+                total_tb += tb
+                total_ab += gs["ab"]
+                total_h  += gs["h"]
+                total_hr += gs["hr"]
+                g += 1
+
+            if g == 0 or total_ab == 0:
+                return {}
+
+            return {
+                "tb_per_game": round(total_tb / g, 2),
+                "avg_recent":  round(total_h / total_ab, 3),
+                "games":       g,
+                "hr_last_7":   total_hr,
+                "h_last_7":    total_h,
+                "ab_last_7":   total_ab,
+            }
         except Exception:
-            return []
+            return {}
 
-    splits = _fetch_season(current_year)
-    if not splits:
-        splits = _fetch_season(current_year - 1)
-    if not splits:
-        return _empty
+    result = _fetch_gamelogs(current_year)
+    if not result:
+        result = _fetch_gamelogs(current_year - 1)
+    if result:
+        return result
 
-    recent = splits[:n_games]
-
-    total_tb = total_ab = total_h = total_hr = valid_games = 0
-    for s in recent:
-        st_ = s.get("stat", {})
-        ab  = int(st_.get("atBats",   0) or 0)
-        h   = int(st_.get("hits",     0) or 0)
-        d2  = int(st_.get("doubles",  0) or 0)
-        d3  = int(st_.get("triples",  0) or 0)
-        hr  = int(st_.get("homeRuns", 0) or 0)
-        # Compute TB from components — reliable regardless of API totalBases field
-        singles = max(0, h - d2 - d3 - hr)
-        tb = singles + d2 * 2 + d3 * 3 + hr * 4
-        total_tb += tb
-        total_ab += ab
-        total_h  += h
-        total_hr += hr
-        valid_games += 1
-
-    if valid_games == 0 or total_ab == 0:
-        return _empty
-
-    return {
-        "tb_per_game": round(total_tb / valid_games, 2),
-        "avg_recent":  round(total_h / total_ab, 3),
-        "games":       valid_games,
-        "hr_last_7":   total_hr,
-        "h_last_7":    total_h,
-        "ab_last_7":   total_ab,
-    }
+    return _empty
 def fetch_batter_vs_pitcher(batter_id: str, pitcher_id: str) -> Dict:
     """
     Pull career stats for a specific batter vs specific pitcher.
@@ -11827,7 +11872,48 @@ Free tier (500/mo) is more than enough.
         with st.expander("🔍 Debug: Data Quality Check"):
             st.caption("Expand after running model to verify all key stats loaded")
 
-            # ── Data source status ─────────────────────────────────────────
+            # ── Raw gameLog API probe ──────────────────────────────────────
+            st.markdown("**🔬 Recent Form API Probe** — verify raw game log data")
+            probe_name = st.text_input("Enter player name to probe (e.g. 'Brice Turang'):", key="probe_name_input")
+            if st.button("🔍 Probe API", key="probe_api_btn") and probe_name and st.session_state.plays:
+                probe_p = next((p for p in st.session_state.plays
+                                if probe_name.lower() in p.get("name","").lower()), None)
+                if probe_p:
+                    pid = str(probe_p.get("player_id",""))
+                    import datetime as _dt
+                    yr = _dt.datetime.now().year
+                    url = (f"https://statsapi.mlb.com/api/v1/people/{pid}/stats"
+                           f"?stats=gameLog&group=hitting&gameType=R&season={yr}&limit=12")
+                    try:
+                        import requests as _rq
+                        resp = _rq.get(url, timeout=8)
+                        st.caption(f"Player: {probe_p['name']} | ID: {pid} | URL: {url}")
+                        st.caption(f"HTTP status: {resp.status_code}")
+                        if resp.status_code == 200:
+                            splits = resp.json().get("stats",[{}])[0].get("splits",[])
+                            st.caption(f"Splits returned: {len(splits)}")
+                            rows = []
+                            for i, s in enumerate(splits[:10]):
+                                st_ = s.get("stat",{})
+                                rows.append({
+                                    "game#": i,
+                                    "date": s.get("date","?"),
+                                    "AB": st_.get("atBats","?"),
+                                    "H": st_.get("hits","?"),
+                                    "2B": st_.get("doubles","?"),
+                                    "3B": st_.get("triples","?"),
+                                    "HR": st_.get("homeRuns","?"),
+                                    "TB(api)": st_.get("totalBases","?"),
+                                    "season": s.get("season","?"),
+                                })
+                            if rows:
+                                st.dataframe(pd.DataFrame(rows), hide_index=True)
+                    except Exception as e:
+                        st.error(f"Probe failed: {e}")
+                else:
+                    st.warning(f"Player '{probe_name}' not found in current model run")
+
+            st.markdown("---")
             bat_src  = st.session_state.get("_batting_source", "not_run")
             pit_src  = st.session_state.get("_pitching_source", "not_run")
             src_icon = {
@@ -12103,11 +12189,11 @@ else:
         st.caption(f"v1.6 | {datetime.now(EST).strftime('%I:%M %p EST')}")
     
     # ── MAIN CONTENT ──────────────────────────────────────
-    st.title("⚾ MLB TB Analyzer V1.9")
+    st.title("⚾ MLB TB Analyzer V2.1")
     import hashlib as _hlib
-    _sig = _hlib.md5(b"v20_kprops_ml_hotstreaks").hexdigest()[:6]
-    st.caption(f"🔑 Build sig: {_sig} — V2.0: K Props redesigned + ML ranked cards + Hot Streaks tab")
-    st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | V2.0: K Props + Moneyline redesigned + Hot Streaks tab")
+    _sig = _hlib.md5(b"v21_contact_model_dk_slate_aware").hexdigest()[:6]
+    st.caption(f"🔑 Build sig: {_sig} — V2.1: Contact-first TB model | DK pipeline | Slate-aware stacks | 2026 game logs")
+    st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | FD + DK portfolios | Team stack scores")
     
     # Tabs
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
