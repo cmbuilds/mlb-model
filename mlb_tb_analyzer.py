@@ -3002,11 +3002,10 @@ def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[fl
 def fetch_batter_recent_form(player_id: str, n_games: int = 7) -> Dict:
     """
     Pull last N game logs for a batter from MLB Stats API gameLog endpoint.
-    Returns dict with recent TB/game, hit rate, and momentum vs season avg.
 
-    CRITICAL: Must include season=YYYY to get current season games.
-    Without season param, API may return prior season or mixed data.
-    Each split = one game individual stats (not cumulative).
+    Computes TB from counting stats (H + 2×2B + 3×3B + 4×HR) as primary method.
+    The totalBases field in gameLog can be unreliable — computing from components
+    is always accurate since we have H, doubles, triples, HR per game.
     """
     _empty = {"tb_per_game": None, "avg_recent": None, "games": 0,
               "hr_last_7": 0, "h_last_7": 0, "ab_last_7": 0}
@@ -3027,23 +3026,29 @@ def fetch_batter_recent_form(player_id: str, n_games: int = 7) -> Dict:
         except Exception:
             return []
 
-    # Try current year first, fall back to previous year if empty
     splits = _fetch_season(current_year)
     if not splits:
         splits = _fetch_season(current_year - 1)
     if not splits:
         return _empty
 
-    # gameLog returns most-recent-first; take last N games
     recent = splits[:n_games]
 
     total_tb = total_ab = total_h = total_hr = valid_games = 0
     for s in recent:
-        st_   = s.get("stat", {})
-        total_tb += int(st_.get("totalBases", 0) or 0)
-        total_ab += int(st_.get("atBats", 0) or 0)
-        total_h  += int(st_.get("hits", 0) or 0)
-        total_hr += int(st_.get("homeRuns", 0) or 0)
+        st_ = s.get("stat", {})
+        ab  = int(st_.get("atBats",   0) or 0)
+        h   = int(st_.get("hits",     0) or 0)
+        d2  = int(st_.get("doubles",  0) or 0)
+        d3  = int(st_.get("triples",  0) or 0)
+        hr  = int(st_.get("homeRuns", 0) or 0)
+        # Compute TB from components — reliable regardless of API totalBases field
+        singles = max(0, h - d2 - d3 - hr)
+        tb = singles + d2 * 2 + d3 * 3 + hr * 4
+        total_tb += tb
+        total_ab += ab
+        total_h  += h
+        total_hr += hr
         valid_games += 1
 
     if valid_games == 0 or total_ab == 0:
