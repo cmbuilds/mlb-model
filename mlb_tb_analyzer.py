@@ -8186,7 +8186,7 @@ def display_fd_command_center(plays: List[Dict]):
                     )
 
                 # Bring-back note
-                opp_stack = next((s for s in all_team_stacks if s["team"] == opp), None)
+                opp_stack = next((s for s in team_ranks if s["team"] == opp), None)
                 if opp_stack:
                     opp_top = sorted(opp_stack["players"],
                                      key=lambda x: x.get("score",0), reverse=True)[:3]
