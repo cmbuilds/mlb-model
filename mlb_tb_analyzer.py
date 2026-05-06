@@ -2998,50 +2998,65 @@ def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[fl
 # V1.7: Hot/cold streak signal. Cached per-player with short TTL.
 # ============================================================================
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800)
 def fetch_batter_recent_form(player_id: str, n_games: int = 7) -> Dict:
     """
     Pull last N game logs for a batter from MLB Stats API gameLog endpoint.
     Returns dict with recent TB/game, hit rate, and momentum vs season avg.
-    Free endpoint, no key required, accessible on Streamlit Cloud.
+
+    CRITICAL: Must include season=YYYY to get current season games.
+    Without season param, API may return prior season or mixed data.
+    Each split = one game individual stats (not cumulative).
     """
     _empty = {"tb_per_game": None, "avg_recent": None, "games": 0,
               "hr_last_7": 0, "h_last_7": 0, "ab_last_7": 0}
     if not player_id or str(player_id) in ("", "0", "nan"):
         return _empty
-    try:
+
+    import datetime as _dt
+    current_year = _dt.datetime.now().year
+
+    def _fetch_season(year: int) -> list:
         url = (f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
-               f"?stats=gameLog&group=hitting&gameType=R&limit={n_games + 5}")
-        r = requests.get(url, timeout=8)
-        if r.status_code != 200:
-            return _empty
-        splits = r.json().get("stats", [{}])[0].get("splits", [])
-        if not splits:
-            return _empty
-        # Take most recent N games
-        recent = splits[:n_games]
-        total_tb = total_ab = total_h = total_hr = 0
-        for s in recent:
-            st_ = s.get("stat", {})
-            total_tb += int(st_.get("totalBases", 0) or 0)
-            total_ab += int(st_.get("atBats", 0) or 0)
-            total_h  += int(st_.get("hits", 0) or 0)
-            total_hr += int(st_.get("homeRuns", 0) or 0)
-        g = len(recent)
-        if g == 0 or total_ab == 0:
-            return _empty
-        return {
-            "tb_per_game": round(total_tb / g, 2),
-            "avg_recent":  round(total_h / total_ab, 3),
-            "games":       g,
-            "hr_last_7":   total_hr,
-            "h_last_7":    total_h,
-            "ab_last_7":   total_ab,
-        }
-    except Exception:
+               f"?stats=gameLog&group=hitting&gameType=R&season={year}&limit={n_games + 8}")
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code != 200:
+                return []
+            return r.json().get("stats", [{}])[0].get("splits", [])
+        except Exception:
+            return []
+
+    # Try current year first, fall back to previous year if empty
+    splits = _fetch_season(current_year)
+    if not splits:
+        splits = _fetch_season(current_year - 1)
+    if not splits:
         return _empty
 
+    # gameLog returns most-recent-first; take last N games
+    recent = splits[:n_games]
 
-@st.cache_data(ttl=86400)
+    total_tb = total_ab = total_h = total_hr = valid_games = 0
+    for s in recent:
+        st_   = s.get("stat", {})
+        total_tb += int(st_.get("totalBases", 0) or 0)
+        total_ab += int(st_.get("atBats", 0) or 0)
+        total_h  += int(st_.get("hits", 0) or 0)
+        total_hr += int(st_.get("homeRuns", 0) or 0)
+        valid_games += 1
+
+    if valid_games == 0 or total_ab == 0:
+        return _empty
+
+    return {
+        "tb_per_game": round(total_tb / valid_games, 2),
+        "avg_recent":  round(total_h / total_ab, 3),
+        "games":       valid_games,
+        "hr_last_7":   total_hr,
+        "h_last_7":    total_h,
+        "ab_last_7":   total_ab,
+    }
 def fetch_batter_vs_pitcher(batter_id: str, pitcher_id: str) -> Dict:
     """
     Pull career stats for a specific batter vs specific pitcher.
