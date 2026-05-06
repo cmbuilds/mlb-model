@@ -7760,7 +7760,35 @@ def display_fd_command_center(plays: List[Dict]):
                     "Opp SP":   p.get("sp_name","")[:16],
                     "O1.5 Sc":  f"{p.get('score',0):.0f}",
                 })
-            st.dataframe(pd.DataFrame(dk_proj_rows), use_container_width=True, hide_index=True)
+            def _dkp_proj(v):
+                try:
+                    f = float(v)
+                    if f >= 18: return "color:#00ff88;font-weight:bold"
+                    if f >= 13: return "color:#ffdd00"
+                    return ""
+                except: return ""
+            def _dkp_val(v):
+                try:
+                    f = float(str(v).replace("x",""))
+                    if f >= 4.0: return "color:#00ffcc;font-weight:bold"
+                    if f >= 3.0: return "color:#66dd88"
+                    return ""
+                except: return ""
+            def _dkp_own(v):
+                try:
+                    f = float(str(v).replace("%",""))
+                    if f >= 35: return "color:#ff4444"
+                    if f <= 12: return "color:#00ff88"
+                    return ""
+                except: return ""
+            df_dkp = pd.DataFrame(dk_proj_rows)
+            if not df_dkp.empty:
+                st.dataframe(
+                    df_dkp.style.map(_dkp_proj, subset=["DK Proj","Ceiling"]).map(_dkp_val, subset=["Value"]).map(_dkp_own, subset=["Own%"]),
+                    use_container_width=True, hide_index=True
+                )
+            else:
+                st.dataframe(df_dkp, use_container_width=True, hide_index=True)
 
         # ── DK Value Plays ────────────────────────────────────────────────
         st.markdown("---")
@@ -8606,15 +8634,21 @@ def display_fd_hand_builder(plays: List[Dict]):
                 with col:
                     st.markdown(
                         f"<div style='color:{clr};font-size:0.7rem;font-weight:700'>{lbl}</div>"
-                        f"<div style='color:#00ff88;font-size:1.4rem;font-weight:800'>{gs.get('team','')}</div>"
-                        f"<div style='color:#9090a8;font-size:0.75rem'>{gs.get('game','')} | O/U {gs.get('game_total',0):.1f}</div>",
+                        f"<div style='color:#00ff88;font-size:1.4rem;font-weight:800'>{best_team}</div>"
+                        f"<div style='color:#9090a8;font-size:0.75rem'>{away_t}@{home_t} | O/U {gs.get('game_total',0):.1f} | Impl {max(home_imp,away_imp):.1f}R</div>",
                         unsafe_allow_html=True
                     )
-                    top_team_plays = [p for p in dk_plays
-                                      if p.get("dk_team","") == gs.get("team","")
-                                      or p.get("team","") == gs.get("team","")][:4]
-                    for p in top_team_plays:
-                        st.write(f"**{p['name']}** #{p.get('lineup_slot','?')} · ${p['dk_salary']:,} · {p['dk_proj']:.1f}pts · {p.get('dk_ownership',15):.0f}% own")
+                    # game_stacks has home_team/away_team, find which team in this game has best implied
+                home_t = gs.get("home_team","")
+                away_t = gs.get("away_team","")
+                home_imp = gs.get("home_implied", 0)
+                away_imp = gs.get("away_implied", 0)
+                best_team = home_t if home_imp >= away_imp else away_t
+                top_team_plays = [p for p in dk_plays
+                                  if p.get("dk_team","") == best_team
+                                  or p.get("team","") == best_team][:4]
+                for p in top_team_plays:
+                    st.write(f"**{p['name']}** #{p.get('lineup_slot','?')} · ${p['dk_salary']:,} · {p['dk_proj']:.1f}pts · {p.get('dk_ownership',15):.0f}% own")
 
         st.markdown("---")
 
@@ -8640,29 +8674,63 @@ def display_fd_hand_builder(plays: List[Dict]):
         st.markdown("### 🏆 Top Plays by Position")
         DK_POSITIONS = [("C", "⚡ Catcher"), ("1B", "💠 First Base"), ("2B", "♦ Second Base"),
                         ("3B", "🔷 Third Base"), ("SS", "⚡ Shortstop"), ("OF", "🌿 Outfield")]
+
+        # Shared color functions — matches FD formatting exactly
+        def _dk_cproj(v):
+            try:
+                f = float(str(v))
+                if f >= 16: return "color:#00ff88;font-weight:bold"
+                if f >= 12: return "color:#ffdd00"
+                if f >= 9:  return "color:#ff8800"
+                return ""
+            except: return ""
+        def _dk_cown(v):
+            try:
+                f = float(str(v).replace("%",""))
+                if f >= 35: return "color:#ff4444"
+                if f <= 12: return "color:#00ff88"
+                return ""
+            except: return ""
+        def _dk_cval(v):
+            try:
+                f = float(str(v).replace("x",""))
+                if f >= 4.0: return "color:#00ffcc;font-weight:bold"
+                if f >= 3.0: return "color:#66dd88"
+                return ""
+            except: return ""
+
         for slot, header in DK_POSITIONS:
             eligible_pos = [p for p in dk_plays if _dk_pos_eligible(str(p.get("dk_position","")), slot)]
-            eligible_pos = sorted(eligible_pos, key=lambda x: x["dk_proj"], reverse=True)[:6]
+            eligible_pos = sorted(eligible_pos, key=lambda x: x["dk_proj"], reverse=True)[:8]
             if not eligible_pos:
                 continue
             st.markdown(f"<div class='pos-header'>{header}</div>", unsafe_allow_html=True)
             pos_rows = []
             for p in eligible_pos:
                 angles = []
-                if p.get("score",0) >= 65:  angles.append(f"TB score {p.get('score',0):.0f}")
-                if p.get("dk_value",0) >= 3.0: angles.append(f"{p['dk_value']:.2f}x value")
+                if p.get("score",0) >= 65:     angles.append(f"TB score {p.get('score',0):.0f}")
+                if p.get("dk_value",0) >= 3.0:  angles.append(f"{p['dk_value']:.2f}x value")
                 if p.get("dk_ownership",50) <= 15: angles.append("contrarian")
+                if p.get("sub_streak",0) >= 65: angles.append("🔥 hot streak")
                 pos_rows.append({
-                    "Hot": "🔥" if p.get("sub_streak",0) >= 65 else "—",
-                    "Player": p["name"], "Team": p.get("dk_team",""),
-                    "Slot": f"#{p.get('lineup_slot','?')}",
-                    "Salary": f"${p['dk_salary']:,}", "Proj": f"{p['dk_proj']:.1f}",
-                    "Ceil": f"{p['dk_ceiling']:.1f}", "Value": f"{p['dk_value']:.2f}x",
-                    "Own%": f"{p.get('dk_ownership',15):.0f}%",
+                    "Hot":    "🔥" if p.get("sub_streak",0) >= 65 else "—",
+                    "Player": p["name"],
+                    "Team":   p.get("dk_team", p.get("team","")),
+                    "Slot":   f"#{p.get('lineup_slot','?')}",
+                    "Salary": f"${p['dk_salary']:,}",
+                    "Proj":   f"{p['dk_proj']:.1f}",
+                    "Ceil":   f"{p['dk_ceiling']:.1f}",
+                    "Value":  f"{p['dk_value']:.2f}x",
+                    "Own%":   f"{p.get('dk_ownership',15):.0f}%",
                     "Opp SP": p.get("sp_name","")[:14],
                     "💡 Why": ", ".join(angles) if angles else "solid floor",
                 })
-            st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+            df_pos = pd.DataFrame(pos_rows)
+            if not df_pos.empty:
+                styled = df_pos.style.map(_dk_cproj, subset=["Proj","Ceil"]).map(_dk_cown, subset=["Own%"]).map(_dk_cval, subset=["Value"])
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(df_pos, use_container_width=True, hide_index=True)
 
         return   # ── End DK Hand Builder ──────────────────────────────────
 
@@ -9374,10 +9442,43 @@ def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
 
         if lu is None:
             continue
-        # Relax salary floor by $500 on non-primary-stack lineups
-        effective_min = min_salary - 500 if len(lineups) >= alloc_44 else min_salary
+
+        # Salary floor: require near-cap spending (within $1,500 of cap)
+        # Relax by $1000 for later lineups to maximise count on small slates
+        if len(lineups) < alloc_44:
+            effective_min = min_salary
+        else:
+            effective_min = min_salary - 1000
         if lu["total_salary"] < effective_min:
             continue
+
+        # ── Exposure cap enforcement ─────────────────────────────────────────
+        # Before accepting lineup, check if any player exceeds max_exposure
+        # This is the HARD cap — not just a reporting flag
+        n_lu_so_far = max(1, len(lineups))
+        over_exposed = []
+        for p in lu["players"]:
+            nm = p.get("name","")
+            if not nm or p.get("slot","") == "P":
+                continue
+            current_count = player_exposure.get(nm, 0)
+            projected_pct = (current_count + 1) / (n_lu_so_far + 1)
+            if projected_pct > max_exposure + 0.05:   # 5% tolerance buffer
+                over_exposed.append(nm)
+        if len(over_exposed) > 2:   # allow up to 2 players at cap — small slates need flexibility
+            # Try a different lineup_num to vary player selection
+            if sched_idx % 6 < 5:
+                alt_lu = _build_fd_gpp_lineup(
+                    fd_plays=fd_plays,
+                    primary_team=primary_team,
+                    secondary_team=secondary_team,
+                    sp_name=sp_name,
+                    sp_salary_data=sp_salary_data,
+                    lineup_num=(sched_idx % 6) + 1,
+                    ace_sp_name="",
+                )
+                if alt_lu and alt_lu["total_salary"] >= effective_min:
+                    lu = alt_lu
 
         # Track names already in this lineup (for singleton dedup)
         names_in_lu = set(p.get("name","") for p in lu["players"])
@@ -9891,11 +9992,13 @@ def _dk_pos_eligible(roster_pos_str: str, slot: str) -> bool:
     Check if a hitter's DK roster_pos is eligible for a given lineup slot.
     DK slots: C, 1B, 2B, 3B, SS, OF
     Multi-position strings: "1B/OF", "2B/SS", "3B/OF", "2B/3B", "OF/SS", etc.
+    Empty/nan: treated as OF-eligible (safest fallback for unknown positions).
     """
-    if not roster_pos_str or roster_pos_str == "nan":
-        return False
-    eligible = [p.strip() for p in roster_pos_str.split("/")]
-    return slot in eligible
+    if not roster_pos_str or roster_pos_str in ("nan", "P", "SP", "RP"):
+        # Unknown hitter position — allow OF slot as fallback
+        return slot == "OF"
+    eligible = [p.strip().upper() for p in str(roster_pos_str).split("/")]
+    return slot.upper() in eligible
 
 
 def _dk_name_match(name: str, salary_data: Dict) -> Dict:
@@ -10109,10 +10212,20 @@ def _build_dk_gpp_lineup(
     sp2_sal = sp2_entry["salary"]
 
     # ── Filter hitter pool: primary (4) + secondary (2-3) + singletons ───────
-    primary_pool   = [p for p in dk_plays if p.get("dk_team") == primary_team or p.get("team") == primary_team]
-    secondary_pool = [p for p in dk_plays if p.get("dk_team") == secondary_team or p.get("team") == secondary_team]
+    def _team_match(p, team):
+        return (p.get("dk_team","") == team or p.get("team","") == team)
+
+    primary_pool   = [p for p in dk_plays if _team_match(p, primary_team)]
+    secondary_pool = [p for p in dk_plays if _team_match(p, secondary_team)]
+    # Other pool: everyone not on primary or secondary (for singleton slot)
     other_pool     = [p for p in dk_plays if
-                      p.get("dk_team", p.get("team")) not in (primary_team, secondary_team)]
+                      not _team_match(p, primary_team) and not _team_match(p, secondary_team)]
+
+    # If pools too small, supplement primary from entire dk_plays pool
+    if len(primary_pool) < 3:
+        primary_pool = sorted(dk_plays, key=lambda x: x["dk_proj"], reverse=True)
+    if len(secondary_pool) < 2:
+        secondary_pool = [p for p in dk_plays if not _team_match(p, primary_team)]
 
     # Sort by DK proj descending
     primary_pool.sort(key=lambda x: x["dk_proj"], reverse=True)
@@ -10307,40 +10420,37 @@ def display_dk_portfolio_builder(plays: List[Dict]):
         return
 
     # ── SALARY UPLOAD ─────────────────────────────────────────────────────────
-    st.subheader("📥 Load DraftKings Slate")
-    col_up, col_info = st.columns([2, 3])
-    with col_up:
-        dk_csv_file = st.file_uploader(
-            "Upload DraftKings CSV (from contest lobby)",
-            type=["csv"],
-            key="dk_portfolio_csv",
-            help="DraftKings → MLB → Contest → Export Player List"
-        )
-    with col_info:
-        if not dk_csv_file:
-            st.info(
-                "📋 **How to get the CSV:** DraftKings → MLB → click any contest → "
-                "'Export to CSV' button → upload here. "
-                "SP and high-salary RP (≥$7,500) are usable pitchers. "
-                "True relievers auto-excluded."
-            )
-
-    if dk_csv_file:
-        parsed = _parse_dk_csv(dk_csv_file)
-        if "error" in parsed:
-            st.error(f"CSV parse error: {parsed['error']}")
-            return
-        st.session_state.dk_slate_data = parsed
-        st.success(
-            f"✅ Loaded: {parsed['n_hitters']} hitters · "
-            f"{parsed['n_pitchers']} pitchers · "
-            f"{len(parsed['slate_games'])} games"
-        )
-
+    # Use salary data already loaded in Command Center (same session key)
     dk_slate = st.session_state.get("dk_slate_data")
-    if not dk_slate:
-        st.info("Upload DraftKings CSV above to begin.")
-        return
+
+    st.subheader("📥 DraftKings Slate")
+    if dk_slate:
+        n_h = dk_slate.get("n_hitters", 0)
+        n_p = dk_slate.get("n_pitchers", 0)
+        n_g = len(dk_slate.get("slate_games", []))
+        st.success(f"✅ Slate loaded from Command Center: {n_h} hitters · {n_p} pitchers · {n_g} games")
+        st.caption("To reload, upload a new CSV in the Command Center tab → DraftKings mode.")
+    else:
+        col_up, col_info = st.columns([2, 3])
+        with col_up:
+            dk_csv_file = st.file_uploader(
+                "Upload DraftKings CSV",
+                type=["csv"], key="dk_portfolio_csv",
+                help="Or upload in Command Center → DraftKings mode first."
+            )
+        with col_info:
+            st.info("Upload DraftKings CSV here, or switch to the Command Center tab → DraftKings to load it there first.")
+        if dk_csv_file:
+            parsed = _parse_dk_csv(dk_csv_file)
+            if "error" in parsed:
+                st.error(f"CSV parse error: {parsed['error']}")
+                return
+            st.session_state.dk_slate_data = parsed
+            dk_slate = parsed
+            st.success(f"✅ Loaded: {parsed['n_hitters']} hitters · {parsed['n_pitchers']} pitchers")
+        else:
+            st.info("📥 Upload DraftKings CSV above, or load it in Command Center → DraftKings.")
+            return
 
     salary_data    = dk_slate["salary_data"]
     sp_salary_data = dk_slate["sp_salary_data"]
@@ -10406,49 +10516,82 @@ def display_dk_portfolio_builder(plays: List[Dict]):
     sp2_name = auto_value
 
 
-    # ── STACK SELECTION ────────────────────────────────────────────────────────
+    # ── STACK CONFIGURATION — Auto-optimized ───────────────────────────────────
     st.markdown("---")
     st.subheader("🔗 Stack Configuration")
-    st.caption("Stack teams from high-run-environment games. Avoid pitching against your stack.")
+    st.caption("Auto-selected from game stack scores. Override if desired.")
 
-    # Compute stack scores using existing model logic
+    # Auto-select stacks from game scores — avoid teams opposing our SPs
     game_stacks = compute_game_stack_scores(plays)
-    if game_stacks:
-        # game_stacks has home_team/away_team, not "team" — extract both
-        team_options_set = []
-        seen_t = set()
-        for g in game_stacks:
-            for t in [g.get("home_team",""), g.get("away_team","")]:
-                if t and t not in seen_t:
-                    team_options_set.append(t)
-                    seen_t.add(t)
-        team_options = team_options_set
-    else:
-        teams_in_slate = list(set(p.get("team","") for p in dk_plays if p.get("team")))
-        team_options   = sorted(teams_in_slate)
-
     sp1_team = sp_salary_data.get(sp1_name.lower(), {}).get("team", "")
     sp2_team = sp_salary_data.get(sp2_name.lower(), {}).get("team", "")
+    sp_opp_teams = set()  # teams OPPOSING our SPs (don't want to stack against our pitcher)
+    for sp_t in [sp1_team, sp2_team]:
+        if sp_t:
+            for g in game_stacks:
+                if g.get("home_team") == sp_t:
+                    sp_opp_teams.add(g.get("away_team",""))
+                elif g.get("away_team") == sp_t:
+                    sp_opp_teams.add(g.get("home_team",""))
 
-    col_s1, col_s2, col_s3 = st.columns(3)
-    with col_s1:
-        default_stack_a = next((t for t in team_options if t not in (sp1_team, sp2_team)), team_options[0] if team_options else "")
-        stack_a_idx = team_options.index(default_stack_a) if default_stack_a in team_options else 0
-        stack_a = st.selectbox("🥇 Stack A (Primary)", team_options, index=stack_a_idx, key="dk_stack_a")
-    with col_s2:
-        remaining_b = [t for t in team_options if t != stack_a]
-        default_b   = next((t for t in remaining_b if t not in (sp1_team, sp2_team, stack_a)), remaining_b[0] if remaining_b else "")
-        stack_b_idx = remaining_b.index(default_b) if default_b in remaining_b else 0
-        stack_b = st.selectbox("🥈 Stack B (Secondary)", remaining_b, index=stack_b_idx, key="dk_stack_b")
-    with col_s3:
-        remaining_c = [t for t in team_options if t not in (stack_a, stack_b)]
-        stack_c_idx = 0
-        stack_c = st.selectbox("🥉 Stack C (Coverage)", remaining_c, index=stack_c_idx, key="dk_stack_c") if remaining_c else stack_b
+    # Build ranked team list with player count filter
+    ranked_teams = []
+    seen_t = set()
+    for g in game_stacks:
+        for t in [g.get("home_team",""), g.get("away_team","")]:
+            if not t or t in seen_t:
+                continue
+            n_players = len([p for p in dk_plays
+                             if p.get("dk_team","") == t or p.get("team","") == t])
+            if n_players >= 3:
+                ranked_teams.append((t, g["stack_score"], n_players, t in sp_opp_teams))
+                seen_t.add(t)
 
-    if sp1_team and sp1_team in (stack_a, stack_b, stack_c):
-        st.warning(f"⚠️ {sp1_name} ({sp1_team}) pitches against your stack — consider a different SP or stack.")
-    if sp2_team and sp2_team in (stack_a, stack_b, stack_c):
-        st.warning(f"⚠️ {sp2_name} ({sp2_team}) pitches against your stack — consider a different SP or stack.")
+    # Default: top 3 non-opposing teams
+    safe_teams  = [t for t, sc, n, is_opp in ranked_teams if not is_opp]
+    risky_teams = [t for t, sc, n, is_opp in ranked_teams if is_opp]
+    all_sorted  = safe_teams + risky_teams  # safe first
+
+    auto_a = all_sorted[0] if len(all_sorted) > 0 else ""
+    auto_b = all_sorted[1] if len(all_sorted) > 1 else auto_a
+    auto_c = all_sorted[2] if len(all_sorted) > 2 else auto_b
+
+    team_options = [t for t, *_ in ranked_teams] if ranked_teams else                    sorted(set(p.get("team","") for p in dk_plays if p.get("team","")))
+
+    # Show auto-selected stacks with override option
+    with st.expander("🔧 Override Stack Selection (auto-selected below)", expanded=False):
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            stack_a_idx = team_options.index(auto_a) if auto_a in team_options else 0
+            stack_a = st.selectbox("🥇 Stack A (Primary)", team_options, index=stack_a_idx, key="dk_stack_a")
+        with col_s2:
+            rem_b = [t for t in team_options if t != stack_a]
+            stack_b_idx = rem_b.index(auto_b) if auto_b in rem_b else 0
+            stack_b = st.selectbox("🥈 Stack B (Secondary)", rem_b, index=stack_b_idx, key="dk_stack_b")
+        with col_s3:
+            rem_c = [t for t in team_options if t not in (stack_a, stack_b)]
+            stack_c_idx = rem_c.index(auto_c) if auto_c in rem_c else 0
+            stack_c = st.selectbox("🥉 Stack C (Coverage)", rem_c if rem_c else team_options, index=min(stack_c_idx, len(rem_c or team_options)-1), key="dk_stack_c")
+    # Use auto values if expander not expanded (default)
+    if "dk_stack_a" not in st.session_state:
+        stack_a, stack_b, stack_c = auto_a, auto_b, auto_c
+    else:
+        stack_a = st.session_state.get("dk_stack_a", auto_a)
+        stack_b = st.session_state.get("dk_stack_b", auto_b)
+        stack_c = st.session_state.get("dk_stack_c", auto_c)
+
+    # Show auto-selection summary
+    stack_info_rows = []
+    for t, sc, n, is_opp in ranked_teams[:6]:
+        tag = "🥇" if t == stack_a else ("🥈" if t == stack_b else ("🥉" if t == stack_c else ""))
+        warn = " ⚠️ opp SP" if is_opp else ""
+        stack_info_rows.append({"": tag, "Team": t, "Stack Score": f"{sc:.1f}", "Players": n, "Note": warn})
+    if stack_info_rows:
+        st.dataframe(pd.DataFrame(stack_info_rows), use_container_width=True, hide_index=True)
+
+    for sp_t, sp_n in [(sp1_team, sp1_name), (sp2_team, sp2_name)]:
+        if sp_t and sp_t in sp_opp_teams and sp_t in (stack_a, stack_b, stack_c):
+            st.warning(f"⚠️ {sp_n} ({sp_t}) pitches against your stack team — scoring may be suppressed.")
 
     # ── BUILD CONTROLS ─────────────────────────────────────────────────────────
     st.markdown("---")
@@ -10519,7 +10662,7 @@ def display_dk_portfolio_builder(plays: List[Dict]):
             opts = [t for t, _ in dk_stack_teams if t != primary]
             return opts[idx % len(opts)] if opts else secondary_team_default
 
-        secondary_team_default = stack_b if stack_b != stack_a else stack_c
+        secondary_team_default = stack_b if stack_b and stack_b != stack_a else (stack_c or stack_a)
 
         dk_schedule = []
         sec_idx = 0
@@ -10583,7 +10726,7 @@ def display_dk_portfolio_builder(plays: List[Dict]):
                         break
             if lu is None:
                 continue
-            effective_min = min_salary - 500 if len(lineups) >= alloc_53 else min_salary
+            effective_min = min_salary - 1000   # relax floor to maximise lineup count
             if lu["total_salary"] < effective_min:
                 continue
             # Exposure check
