@@ -7433,7 +7433,7 @@ def _build_fd_gpp_lineup(fd_plays: List[Dict], primary_team: str,
     """
     SAL_CAP         = 35000
     SAL_MIN         = 2000
-    SAL_SOFT_TARGET = 33500   # try to spend at least this
+    SAL_SOFT_TARGET = 34200   # target within $800 of cap — leaving $1800+ is a waste
     MIN_SINGLETON_SAL = 2000  # singleton must have at least this salary
 
     # ── SP SETUP ─────────────────────────────────────────────────────────
@@ -7562,14 +7562,19 @@ def _build_fd_gpp_lineup(fd_plays: List[Dict], primary_team: str,
             g = p.get("fd_game","")
             if g: stack_games.add(g)
 
+        # On small slates, "third game" restriction is too tight — relax to just
+        # "not from primary or secondary team" so singletons are always available
         singleton_pool = [
             p for p in fd_plays
             if eligible(p)
             and p.get("team","") not in stack_teams
-            and p.get("fd_game","") not in stack_games
-            and p.get("fd_game","") != sp_game_str
             and p not in hitters
         ]
+        # Prefer third-game players when available (deeper slate differentiation)
+        third_game_sings = [p for p in singleton_pool
+                            if p.get("fd_game","") not in stack_games]
+        if third_game_sings:
+            singleton_pool = third_game_sings + [p for p in singleton_pool if p not in third_game_sings]
 
         if singleton_pool:
             singleton_pool.sort(key=_singleton_score, reverse=True)
@@ -7607,7 +7612,22 @@ def _build_fd_gpp_lineup(fd_plays: List[Dict], primary_team: str,
             hitters = [best if p is cheapest else p for p in hitters]
             current_sal = total_sal(hitters, active_sp_sal)
         else:
-            break
+            # Try upgrading from the full eligible pool (includes singleton position)
+            all_upgrades = sorted(
+                [p for p in fd_plays
+                 if eligible(p)
+                 and p not in hitters
+                 and p.get("fd_salary",0) > cheapest.get("fd_salary",0)
+                 and p.get("fd_salary",0) - cheapest.get("fd_salary",0) <= budget_left
+                 and p.get("fd_proj",0) > cheapest.get("fd_proj",0) * 0.85],
+                key=lambda x: x.get("fd_proj",0), reverse=True
+            )
+            if all_upgrades:
+                best = all_upgrades[0]
+                hitters = [best if p is cheapest else p for p in hitters]
+                current_sal = total_sal(hitters, active_sp_sal)
+            else:
+                break
 
     # ── SLOT ASSIGNMENT ──────────────────────────────────────────────────
     assigned = _assign_fd_slots(hitters)
@@ -7712,16 +7732,35 @@ def display_fd_command_center(plays: List[Dict]):
         st.markdown("---")
         st.subheader("🏟️ Game Stack Ranker")
         st.caption("Games ranked by run environment — O/U + park factor + wind. Stack the #1 or #2 game.")
-        game_stacks = compute_game_stack_scores(plays)
+        # Filter to DK slate teams only
+        dk_slate_teams = set(p.get("team","") for p in dk_plays if p.get("dk_salary",0) > 0)
+        dk_slate_raw   = [p for p in (st.session_state.get("plays") or plays)
+                          if p.get("team","") in dk_slate_teams]
+        game_stacks = compute_game_stack_scores(dk_slate_raw if dk_slate_raw else plays)
         if game_stacks:
             gs_rows = []
-            for i, gs in enumerate(game_stacks[:8]):
-                label = "🥇 PRIMARY" if i == 0 else ("🥈 SECONDARY" if i == 1 else ("🥉 CONSIDER" if i == 2 else "❌ FADE"))
+            for i, gs in enumerate(game_stacks[:12]):
+                label    = "🥇 PRIMARY" if i == 0 else ("🥈 SECONDARY" if i == 1 else ("🥉 CONSIDER" if i == 2 else "❌ FADE"))
+                home_t   = gs.get("home_team","")
+                away_t   = gs.get("away_team","")
+                game_str = f"{away_t}@{home_t}" if home_t and away_t else "—"
+                home_imp = gs.get("home_implied", 0)
+                away_imp = gs.get("away_implied", 0)
+                park_hr  = gs.get("park_hr", gs.get("park_factor", 1.0))
+                park_str = f"+{(park_hr-1)*100:.0f}%" if park_hr > 1.0 else f"{(park_hr-1)*100:.0f}%"
+                wind_eff = gs.get("wind_effect","neutral")
+                wind_str = "🏟️ Dome" if gs.get("is_dome") else {
+                    "out_strong":"💨 Out (+)","out":"💨 Out","in_strong":"💨 In (-)","in":"💨 In"
+                }.get(wind_eff,"→ Neutral")
                 gs_rows.append({
-                    "": label, "Game": gs.get("game",""), "O/U": f"{gs.get('game_total',0):.1f}",
-                    "Park": f"+{gs.get('park_factor',1.0)*10-10:.1f}" if gs.get("park_factor",1.0) > 1 else f"{gs.get('park_factor',1.0)*10-10:.1f}",
-                    "Wind": gs.get("wind_str","→ Neutral"),
-                    "Stack Score": f"{gs.get('stack_score',0):.1f}",
+                    "":          label,
+                    "Game":      game_str,
+                    "O/U":       f"{gs.get('game_total',0):.1f}",
+                    "Home Impl": f"{home_imp:.1f}R",
+                    "Away Impl": f"{away_imp:.1f}R",
+                    "Park":      park_str,
+                    "Wind":      wind_str,
+                    "Score":     f"{gs.get('stack_score',0):.1f}",
                 })
             st.dataframe(pd.DataFrame(gs_rows), use_container_width=True, hide_index=True)
 
@@ -8621,10 +8660,13 @@ def display_fd_hand_builder(plays: List[Dict]):
             st.info("No DK salary-matched players found.")
             return
 
-        # Top Stacks
+        # Top Stacks — filter to DK slate teams only
         st.markdown("### 🔗 Top Stacks — Where to Build Your Core")
-        st.caption("Ranked by implied total + park factor + wind. Stack 4-5 batters from your #1 game.")
-        game_stacks = compute_game_stack_scores(plays)
+        st.caption("Ranked by implied total + park factor + wind. Stack 5 batters from your #1 game.")
+        dk_slate_tms   = set(p.get("dk_team", p.get("team","")) for p in dk_plays if p.get("dk_salary",0) > 0)
+        dk_slate_raws  = [p for p in (st.session_state.get("plays") or plays)
+                          if p.get("team","") in dk_slate_tms]
+        game_stacks = compute_game_stack_scores(dk_slate_raws if dk_slate_raws else plays)
         top3_games  = game_stacks[:3] if game_stacks else []
         if top3_games:
             gcols = st.columns(3)
@@ -8757,8 +8799,11 @@ def display_fd_hand_builder(plays: List[Dict]):
                 unsafe_allow_html=True)
     st.caption("Ranked by implied total + park factor + wind. Stack 4-5 batters from your #1 game.")
 
-    raw_plays  = st.session_state.get("plays", fd_plays)
-    game_scores = compute_game_stack_scores(raw_plays if raw_plays else fd_plays)
+    # Filter to slate games only (teams present in uploaded salary CSV)
+    raw_plays   = st.session_state.get("plays", fd_plays)
+    slate_teams = set(p.get("team","") for p in fd_plays if p.get("fd_salary",0) > 0)
+    slate_plays = [p for p in (raw_plays or fd_plays) if p.get("team","") in slate_teams]
+    game_scores = compute_game_stack_scores(slate_plays if slate_plays else fd_plays)
 
     col_s1, col_s2, col_s3 = st.columns(3)
     for i, (col, g) in enumerate(zip([col_s1, col_s2, col_s3], game_scores[:3])):
@@ -9452,32 +9497,27 @@ def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
         if lu["total_salary"] < effective_min:
             continue
 
-        # ── Exposure cap enforcement ─────────────────────────────────────────
-        # Before accepting lineup, check if any player exceeds max_exposure
-        # This is the HARD cap — not just a reporting flag
-        n_lu_so_far = max(1, len(lineups))
-        over_exposed = []
-        for p in lu["players"]:
-            nm = p.get("name","")
-            if not nm or p.get("slot","") == "P":
-                continue
-            current_count = player_exposure.get(nm, 0)
-            projected_pct = (current_count + 1) / (n_lu_so_far + 1)
-            if projected_pct > max_exposure + 0.05:   # 5% tolerance buffer
-                over_exposed.append(nm)
-        if len(over_exposed) > 2:   # allow up to 2 players at cap — small slates need flexibility
-            # Try a different lineup_num to vary player selection
-            if sched_idx % 6 < 5:
-                alt_lu = _build_fd_gpp_lineup(
-                    fd_plays=fd_plays,
-                    primary_team=primary_team,
-                    secondary_team=secondary_team,
-                    sp_name=sp_name,
-                    sp_salary_data=sp_salary_data,
-                    lineup_num=(sched_idx % 6) + 1,
-                    ace_sp_name="",
-                )
-                if alt_lu and alt_lu["total_salary"] >= effective_min:
+        # ── Exposure: soft guidance, never block lineups ─────────────────────
+        # On small slates (3-6 games), hard exposure caps prevent reaching
+        # the target lineup count. Let the portfolio build and report exposure —
+        # the user can decide if they want to rebalance manually.
+        # We still try lineup variation to diversify where possible.
+        if sched_idx % 3 == 2 and sched_idx % 6 < 5:
+            # Every 3rd lineup: try alternate variation for diversity
+            alt_lu = _build_fd_gpp_lineup(
+                fd_plays=fd_plays,
+                primary_team=primary_team,
+                secondary_team=secondary_team,
+                sp_name=sp_name,
+                sp_salary_data=sp_salary_data,
+                lineup_num=(sched_idx % 6) + 1,
+                ace_sp_name="",
+            )
+            if alt_lu and alt_lu["total_salary"] >= effective_min:
+                # Only use alt if it produces different players
+                orig_names = {p.get("name","") for p in lu["players"]}
+                alt_names  = {p.get("name","") for p in alt_lu["players"]}
+                if len(orig_names - alt_names) >= 2:   # at least 2 different players
                     lu = alt_lu
 
         # Track names already in this lineup (for singleton dedup)
@@ -10319,7 +10359,37 @@ def _build_dk_gpp_lineup(
         return None
 
     total_salary = sp1_sal + sp2_sal + sum(p["dk_salary"] for p in all_hitters)
-    if total_salary > DK_SALARY_CAP or total_salary < DK_MIN_SALARY:
+    if total_salary > DK_SALARY_CAP:
+        return None
+
+    # ── Salary upgrade loop — target within $2000 of $50K cap ────────────
+    SAL_TARGET = DK_SALARY_CAP - 2000   # $48,000 target
+    for _ in range(8):
+        if total_salary >= SAL_TARGET:
+            break
+        budget_left = DK_SALARY_CAP - total_salary
+        cheapest    = min(all_hitters, key=lambda x: x.get("dk_salary",0))
+        c_sal       = cheapest.get("dk_salary", 0)
+        c_slot      = cheapest.get("_slot","OF")
+        # Find upgrade: same slot eligibility, higher salary within budget, better proj
+        upgrades = sorted(
+            [p for p in dk_plays
+             if p not in all_hitters
+             and _dk_pos_eligible(str(p.get("dk_position","")), c_slot)
+             and p["dk_salary"] > c_sal
+             and p["dk_salary"] - c_sal <= budget_left
+             and p.get("dk_proj",0) > cheapest.get("dk_proj",0) * 0.80],
+            key=lambda x: x.get("dk_proj",0), reverse=True
+        )
+        if upgrades:
+            best = upgrades[0]
+            all_hitters = [{**best, "_slot": c_slot} if p is cheapest else p
+                           for p in all_hitters]
+            total_salary = sp1_sal + sp2_sal + sum(p["dk_salary"] for p in all_hitters)
+        else:
+            break
+
+    if total_salary < DK_MIN_SALARY:
         return None
 
     total_proj    = sum(p["dk_proj"] for p in all_hitters)
@@ -10471,7 +10541,17 @@ def display_dk_portfolio_builder(plays: List[Dict]):
     st.subheader("⚾ Starting Pitcher Board")
     st.caption("Portfolio auto-selects and rotates SPs. Ace + Value default pairing. SP cap: 45% per pitcher across lineup set.")
 
-    sp_options_all = sorted(sp_salary_data.values(), key=lambda x: -x["salary"])
+    # Filter SP pool to ONLY pitchers whose team is in today's model plays
+    # This prevents pitchers from other slates or non-playing pitchers
+    playing_teams = set(p.get("team","") for p in plays if p.get("team",""))
+    sp_options_all = sorted(
+        [s for s in sp_salary_data.values()
+         if s.get("team","") in playing_teams],
+        key=lambda x: -x["salary"]
+    )
+    if not sp_options_all:
+        # Fallback: use all if team filter is too strict
+        sp_options_all = sorted(sp_salary_data.values(), key=lambda x: -x["salary"])
 
     def _dk_sp_score(s):
         proj = _compute_dk_sp_proj(s)
@@ -10480,7 +10560,13 @@ def display_dk_portfolio_builder(plays: List[Dict]):
         value_norm = min(100, (proj["dk_sp_value"] / 2.5) * 100)
         return fppg_norm * 0.50 + proj_norm * 0.30 + value_norm * 0.20
 
-    sp_options_scored = sorted(sp_options_all, key=_dk_sp_score, reverse=True)
+    # Additional filter: only use pitchers confirmed in today's model
+    playing_teams_port = set(p.get("team","") for p in plays if p.get("team",""))
+    sp_options_all_filtered = [s for s in sp_options_all
+                                if s.get("team","") in playing_teams_port]
+    if not sp_options_all_filtered:
+        sp_options_all_filtered = sp_options_all  # fallback
+    sp_options_scored = sorted(sp_options_all_filtered, key=_dk_sp_score, reverse=True)
     sp_pool_for_portfolio = [s["name"] for s in sp_options_scored[:6]]
 
     auto_ace   = sp_options_scored[0]["name"] if sp_options_scored else ""
@@ -10612,18 +10698,25 @@ def display_dk_portfolio_builder(plays: List[Dict]):
 
         # ── Slate-aware shape allocation ──────────────────────────────────────
         # Build stack_teams list from current game scores for detect_slate_shape
-        dk_game_scores = compute_game_stack_scores(plays)
+        # Only rank teams from the DK salary import (not all model teams)
+        dk_salary_teams = set(
+            v.get("team","") for v in sp_salary_data.values()
+            if v.get("team","")
+        ) | set(p.get("dk_team", p.get("team","")) for p in dk_plays)
+        dk_raw_plays = [p for p in (st.session_state.get("plays") or plays)
+                        if p.get("team","") in dk_salary_teams]
+        dk_game_scores = compute_game_stack_scores(dk_raw_plays if dk_raw_plays else plays)
         dk_stack_teams = []
         dk_seen_teams  = set()
         for g in dk_game_scores:
             for team in [g.get("home_team",""), g.get("away_team","")]:
-                if team and team not in dk_seen_teams:
+                if team and team not in dk_seen_teams and team in dk_salary_teams:
                     n_players = len([p for p in dk_plays
                                      if p.get("dk_team","") == team or p.get("team","") == team])
                     if n_players >= 3:
                         dk_stack_teams.append((team, g.get("stack_score", 0)))
                         dk_seen_teams.add(team)
-            if len(dk_stack_teams) >= 10:
+            if len(dk_stack_teams) >= 12:
                 break
 
         dk_slate_analysis = detect_slate_shape(dk_stack_teams, dk_plays, n_lineups, site="DK")
@@ -10729,12 +10822,15 @@ def display_dk_portfolio_builder(plays: List[Dict]):
             effective_min = min_salary - 1000   # relax floor to maximise lineup count
             if lu["total_salary"] < effective_min:
                 continue
-            # Exposure check
-            over_exposed = any(
-                exp_tracker.get(p.get("name",""), 0) >= max_count
-                for p in lu["hitters"]
-            )
-            if over_exposed:
+            # Exposure: soft guidance only — never block on small slates
+            # Count how many players are over the soft cap for logging
+            # but never prevent lineup from being added
+            _over = [p.get("name","") for p in lu["hitters"]
+                     if exp_tracker.get(p.get("name",""), 0) >= max_count]
+            # Only skip if ALL core players are severely over-exposed (>2x cap)
+            hard_over = [p.get("name","") for p in lu["hitters"]
+                         if exp_tracker.get(p.get("name",""), 0) >= max_count * 2]
+            if len(hard_over) >= 5:   # 5+ players at 2x cap = truly unacceptable
                 continue
             for p in lu["hitters"]:
                 nm = p.get("name","")
