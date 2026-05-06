@@ -7876,6 +7876,10 @@ def display_fd_command_center(plays: List[Dict]):
 
     st.markdown("---")
 
+    if not has_salaries:
+        st.info("📥 Upload the FanDuel CSV above to unlock stack rankings, SP board, projections, and value plays.")
+        return
+
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION 1 — GAME STACK RANKER
     # ═══════════════════════════════════════════════════════════════════════
@@ -8379,6 +8383,81 @@ def display_fd_command_center(plays: List[Dict]):
                 for p in bring_backs:
                     sal_str = f"${p['fd_salary']:,}" if p["fd_salary"] > 0 else "no sal"
                     st.write(f"• {p['name']} — {p['fd_proj']:.1f} proj | {sal_str}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION 5b — VALUE STACKS
+    # 3 best value stacks: strong implied total but lower ownership/salary
+    # Ideal as secondary stacks when pairing with an ACE pitcher
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("💰 Value Stacks")
+    st.caption("High-value secondary stack targets — lower salary, lower ownership, solid implied. Best paired as secondary stack when rostering an ACE SP.")
+
+    # Get team stack scores for all slate teams
+    all_team_stack_data = []
+    for g in game_scores:
+        for team in [g.get("home_team",""), g.get("away_team","")]:
+            if not team:
+                continue
+            team_plays = [p for p in fd_plays if p.get("team") == team and p.get("fd_salary",0) > 0]
+            if len(team_plays) < 3:
+                continue
+            avg_proj    = sum(p.get("fd_proj",0) for p in team_plays[:4]) / min(4, len(team_plays))
+            avg_sal     = sum(p.get("fd_salary",0) for p in team_plays[:4]) / min(4, len(team_plays))
+            avg_own     = sum(p.get("ownership",20) for p in team_plays[:4]) / min(4, len(team_plays))
+            implied     = team_plays[0].get("implied_total", 4.5) if team_plays else 4.5
+            # Value score: good proj + low salary + low ownership + decent implied
+            value_score = (
+                min(100, avg_proj / 18.0 * 40) +       # proj quality (40 pts)
+                min(100, (5000 - avg_sal) / 3000 * 30) + # salary efficiency (30 pts)
+                min(100, (35 - avg_own) / 30 * 20) +    # ownership leverage (20 pts)
+                min(100, implied / 6.0 * 10)             # run environment (10 pts)
+            )
+            all_team_stack_data.append({
+                "team": team,
+                "game": f"{g.get('away_team','')}@{g.get('home_team','')}",
+                "implied": implied,
+                "avg_proj": avg_proj,
+                "avg_sal": avg_sal,
+                "avg_own": avg_own,
+                "value_score": value_score,
+                "players": team_plays[:4],
+                "game_total": g.get("game_total", 8.5),
+            })
+
+    # Sort by value score, exclude the top 2 primary stacks (those are in Top Game Stacks)
+    primary_teams = set()
+    for gs in sorted(game_scores, key=lambda x: -x["stack_score"])[:2]:
+        primary_teams.add(gs.get("home_team",""))
+        primary_teams.add(gs.get("away_team",""))
+
+    value_stacks = sorted(
+        [s for s in all_team_stack_data if s["team"] not in primary_teams],
+        key=lambda x: -x["value_score"]
+    )[:3]
+
+    if value_stacks:
+        vcols = st.columns(3)
+        for vcol, vs in zip(vcols, value_stacks):
+            with vcol:
+                st.markdown(
+                    f"<div style='background:#0d1a0d;border:1px solid #00cc66;"
+                    f"border-radius:10px;padding:12px 14px;margin-bottom:8px'>"
+                    f"<div style='color:#00cc66;font-size:0.7rem;font-weight:700'>💰 VALUE STACK</div>"
+                    f"<div style='color:#00ff88;font-size:1.3rem;font-weight:800'>{vs['team']}</div>"
+                    f"<div style='color:#9090a8;font-size:0.75rem'>{vs['game']} | O/U {vs['game_total']:.1f} | "
+                    f"Impl {vs['implied']:.1f}R</div>"
+                    f"<div style='color:#aaa;font-size:0.72rem;margin-top:6px'>"
+                    f"Avg proj {vs['avg_proj']:.1f}pts · Avg sal ${vs['avg_sal']:,.0f} · "
+                    f"Avg own {vs['avg_own']:.0f}%</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+                for p in vs["players"]:
+                    sal_str = f"${p['fd_salary']:,}" if p.get("fd_salary",0) > 0 else "no sal"
+                    st.write(f"• **{p['name']}** #{p.get('lineup_slot','?')} · {p.get('fd_proj',0):.1f}pts · {sal_str}")
+    else:
+        st.info("Stack data available after model run + CSV upload.")
 
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION 6 — VALUE PLAYS
@@ -9354,19 +9433,20 @@ def _build_fd_portfolio(fd_plays: List[Dict], sp_salary_data: Dict,
 
     # ── Exposure report ───────────────────────────────────────────────────────
     n_built = len(lineups)
+    sa = st.session_state.get("fd_slate_analysis", {})
+    shapes_summary = " · ".join(f"{k}:{v}" for k, v in sa.get("shapes", {}).items()) if sa else "—"
     exposure_report = {
         "_stack_plan": {
-            "A": f"{stack_a} ({alloc_a} lineups)",
-            "B": f"{stack_b} ({alloc_b} lineups)",
-            "C": f"{stack_c} ({alloc_c} lineups)",
-            "D": f"{stack_d} ({alloc_d} lineups)" if stack_d else "not included",
+            "A": f"{stack_a} (primary)",
+            "B": f"{stack_b} (secondary)",
+            "C": f"{stack_c} (coverage)",
+            "D": f"{stack_d} (coverage)" if stack_d else "not included",
             "benchmark": "1 all-singleton lineup",
             "stack_d_reason": (
-                f"Stack D included — score gap {abs(stack_teams[3][1]-top_score):.1f} ≤ 1.0"
-                if stack_d else
-                f"Stack D skipped — score gap {abs(stack_teams[3][1]-top_score):.1f} > 1.0"
-                if len(stack_teams) >= 4 else "Stack D unavailable"
+                f"Stack D ({stack_d}) included" if stack_d else "Stack D not included"
             ),
+            "shapes": shapes_summary,
+            "mode": sa.get("mode", "balanced"),
         }
     }
     for name, count in sorted(player_exposure.items(), key=lambda x: -x[1]):
@@ -10276,59 +10356,55 @@ def display_dk_portfolio_builder(plays: List[Dict]):
 
     st.markdown("---")
 
-    # ── SP PAIRING SELECTOR ───────────────────────────────────────────────────
-    st.subheader("⚾ Starting Pitcher Selection")
-    st.caption("DK uses 2 SP slots. Pick your ace + value pair. Avoid pitching against your stack.")
+    # ── SP BOARD — Auto-optimized, no manual picker ───────────────────────────
+    st.markdown("---")
+    st.subheader("⚾ Starting Pitcher Board")
+    st.caption("Portfolio auto-selects and rotates SPs. Ace + Value default pairing. SP cap: 45% per pitcher across lineup set.")
 
-    sp_options = sorted(sp_salary_data.values(), key=lambda x: -x["salary"])
-    sp_names   = [f"{s['name']} (${s['salary']:,} | FPPG {s['fppg']:.1f} | {s['team']})" for s in sp_options]
-    sp_name_map = {f"{s['name']} (${s['salary']:,} | FPPG {s['fppg']:.1f} | {s['team']})": s["name"] for s in sp_options}
+    sp_options_all = sorted(sp_salary_data.values(), key=lambda x: -x["salary"])
 
-    # SP score cards
+    def _dk_sp_score(s):
+        proj = _compute_dk_sp_proj(s)
+        fppg_norm  = min(100, (s.get("fppg", 0) / 30.0) * 100)
+        proj_norm  = min(100, (proj["dk_sp_proj"] / 25.0) * 100)
+        value_norm = min(100, (proj["dk_sp_value"] / 2.5) * 100)
+        return fppg_norm * 0.50 + proj_norm * 0.30 + value_norm * 0.20
+
+    sp_options_scored = sorted(sp_options_all, key=_dk_sp_score, reverse=True)
+    sp_pool_for_portfolio = [s["name"] for s in sp_options_scored[:6]]
+
+    auto_ace   = sp_options_scored[0]["name"] if sp_options_scored else ""
+    value_pool = sorted([s for s in sp_options_scored if s["name"] != auto_ace],
+                        key=lambda x: _compute_dk_sp_proj(x)["dk_sp_value"], reverse=True)
+    auto_value = value_pool[0]["name"] if value_pool else (sp_options_scored[1]["name"] if len(sp_options_scored) > 1 else "")
+
     sp_rows = []
-    for s in sp_options[:10]:
+    for s in sp_options_scored[:12]:
         proj_data = _compute_dk_sp_proj(s)
+        badge = "🥇 ACE" if s["name"] == auto_ace else ("💰 VALUE" if s["name"] == auto_value else "")
         sp_rows.append({
-            "Score":   f"{s.get('fppg', 0):.0f}" if s.get("fppg") else "—",
+            "Auto":    badge,
             "SP":      s["name"],
             "Type":    s.get("position", "SP"),
             "Team":    s["team"],
             "Salary":  f"${s['salary']:,}",
+            "FPPG":    f"{s.get('fppg',0):.1f}",
             "DK Proj": f"{proj_data['dk_sp_proj']:.1f}",
             "Ceiling": f"{proj_data['dk_sp_ceiling']:.1f}",
-            "Proj IP": f"{proj_data['proj_ip']:.1f}",
             "Proj K":  f"{proj_data['proj_k']:.0f}",
             "Value":   f"{proj_data['dk_sp_value']:.2f}x",
         })
-
     if sp_rows:
         st.dataframe(pd.DataFrame(sp_rows), use_container_width=True, hide_index=True)
 
-    st.caption("💡 **DK optimal:** 1 Ace (high ceiling/K upside) + 1 Value SP (strong proj/salary ratio). Avoid pitching against your hitting stack.")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        sp1_label = st.selectbox("🥇 Primary SP — Ace", sp_names, index=0, key="dk_sp1_sel")
-
-    # Default SP2 = best value (proj/salary ratio) among non-ace options
-    sp1_selected_name = sp_name_map.get(sp1_label, sp_options[0]["name"] if sp_options else "")
-    value_ranked = sorted(
-        [s for s in sp_options if s["name"] != sp1_selected_name],
-        key=lambda x: _compute_dk_sp_proj(x)["dk_sp_value"], reverse=True
+    st.markdown(
+        f"**Auto-selected:** 🥇 **{auto_ace}** (Ace) + 💰 **{auto_value}** (Value)  "
+        f"— portfolio rotates through top {len(sp_pool_for_portfolio)} SPs with 45% cap per pitcher."
     )
-    default_sp2_name = value_ranked[0]["name"] if value_ranked else (sp_options[1]["name"] if len(sp_options) > 1 else "")
-    default_2_idx = next((i for i, n in enumerate(sp_names) if sp_name_map.get(n) == default_sp2_name), 1)
-    default_2_idx = min(default_2_idx, len(sp_names) - 1)
 
-    with c2:
-        sp2_label = st.selectbox("🥈 Secondary SP — Value", sp_names, index=default_2_idx, key="dk_sp2_sel")
+    sp1_name = auto_ace
+    sp2_name = auto_value
 
-    sp1_name = sp_name_map.get(sp1_label, sp_options[0]["name"] if sp_options else "")
-    sp2_name = sp_name_map.get(sp2_label, sp_options[min(1, len(sp_options)-1)]["name"] if sp_options else "")
-
-    if sp1_name == sp2_name:
-        st.warning("⚠️ SP1 and SP2 are the same pitcher — select two different pitchers.")
-        return
 
     # ── STACK SELECTION ────────────────────────────────────────────────────────
     st.markdown("---")
@@ -10338,7 +10414,15 @@ def display_dk_portfolio_builder(plays: List[Dict]):
     # Compute stack scores using existing model logic
     game_stacks = compute_game_stack_scores(plays)
     if game_stacks:
-        team_options = [s["team"] for s in sorted(game_stacks, key=lambda x: -x["stack_score"])]
+        # game_stacks has home_team/away_team, not "team" — extract both
+        team_options_set = []
+        seen_t = set()
+        for g in game_stacks:
+            for t in [g.get("home_team",""), g.get("away_team","")]:
+                if t and t not in seen_t:
+                    team_options_set.append(t)
+                    seen_t.add(t)
+        team_options = team_options_set
     else:
         teams_in_slate = list(set(p.get("team","") for p in dk_plays if p.get("team")))
         team_options   = sorted(teams_in_slate)
