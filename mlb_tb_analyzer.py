@@ -7851,14 +7851,21 @@ def display_fd_command_center(plays: List[Dict]):
             impl_str = f"{impl:.1f}R" if impl > 0.5 else "— R"
             hot_flag = "🔥 " if sd["streaking_count"] >= 2 else ""
 
-            label = (
-                f"{hot_flag}**{team}** vs {opp} &nbsp;|&nbsp; "
-                f"<span style='color:{badge_color}'>{badge} · Score {score:.0f}</span> &nbsp;|&nbsp; "
+            # st.expander does not render HTML — use plain text only
+            label_plain = (
+                f"{hot_flag}{team} vs {opp}  |  "
+                f"{badge} · Score {score:.0f}  |  "
                 f"Impl {impl_str} · O/U {sd['game_total']:.1f} · "
                 f"Park {park_hr:.2f}x · {wind_str}"
             )
 
-            with st.expander(label, expanded=(rank <= 2)):
+            with st.expander(label_plain, expanded=(rank <= 2)):
+                # Color badge shown inside expander via markdown
+                st.markdown(
+                    f"<span style='color:{badge_color};font-weight:700;font-size:14px'>"
+                    f"{badge}</span> &nbsp; Score <b>{score:.0f}</b>",
+                    unsafe_allow_html=True
+                )
                 # Stack score breakdown in one line
                 st.caption(
                     f"Implied {comp['implied_score']:.0f}/40 · "
@@ -8043,7 +8050,7 @@ def display_fd_command_center(plays: List[Dict]):
         sp_rows = []
         for s in sp_projections:
             sp_rows.append({
-                "Grade":    s["grade"],
+                "Score":    s["grade"],  # numeric 0-100 SP DFS score
                 "SP":       s["name"],
                 "H":        s["hand"],
                 "Opp":      s["opp"],
@@ -8083,10 +8090,13 @@ def display_fd_command_center(plays: List[Dict]):
                 return ""
             except: return ""
 
-        st.dataframe(
-            sp_df.style.map(_cg, subset=["Score"]).map(_cp, subset=["FD Proj","Ceiling"]),
-            use_container_width=True, hide_index=True
-        )
+        if sp_df.empty or "Score" not in sp_df.columns:
+            st.info("SP projections unavailable — run the model first.")
+        else:
+            st.dataframe(
+                sp_df.style.map(_cg, subset=["Score"]).map(_cp, subset=["FD Proj","Ceiling"]),
+                use_container_width=True, hide_index=True
+            )
     else:
         st.info("Run model first to see SP projections.")
 
