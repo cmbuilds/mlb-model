@@ -331,6 +331,7 @@ def fetch_mlb_pitching(season: int) -> pd.DataFrame:
             h   = int(st_.get("hits", 0) or 0)
             er  = int(st_.get("earnedRuns", 0) or 0)
             gs  = int(st_.get("gamesStarted", 0) or 0)
+            g   = int(st_.get("gamesPlayed", 0) or 0)
             hr_a = int(st_.get("homeRuns", 0) or 0)
             era  = round(er / ip * 9, 2) if ip > 0 else 4.50
             whip = round((h + bb) / ip, 3) if ip > 0 else 1.35
@@ -349,6 +350,7 @@ def fetch_mlb_pitching(season: int) -> pd.DataFrame:
                 "K%":             k_pct,
                 "BB%":            bb_pct,
                 "GS":             gs,
+                "G":              g,
                 "IP":             ip,
                 "HR_allowed":     hr_a,
                 "H_per_9":        round(h9, 2),
@@ -362,6 +364,41 @@ def fetch_mlb_pitching(season: int) -> pd.DataFrame:
     except Exception as e:
         log.warning(f"  MLB pitching API {season}: {e}")
         return pd.DataFrame()
+
+
+def fetch_fangraphs_pitching(season: int) -> pd.DataFrame:
+    """FanGraphs pitching type=8 — FIP, xFIP, SIERA, SwStr%. Skip cleanly on 403."""
+    url = "https://www.fangraphs.com/api/leaders/major-league/data"
+    params = {
+        "pos": "all", "stats": "pit", "lg": "all", "qual": "0",
+        "type": "8", "season": season, "season1": season,
+        "ind": "0", "team": "0", "pageitems": "1000", "pagenum": "1", "minip": "0",
+    }
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        if r.status_code == 403:
+            log.info(f"  FanGraphs pitching {season}: 403 (skipping)")
+            return pd.DataFrame()
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data:
+                df = pd.DataFrame(data)
+                for id_col in ("xMLBAMID", "MLBAMID", "IDfg", "playerid", "PlayerID"):
+                    if id_col in df.columns:
+                        df["mlbam_id"] = df[id_col].apply(
+                            lambda x: str(int(float(x))) if pd.notna(x) and str(x) not in ("", "nan") else ""
+                        )
+                        break
+                if "mlbam_id" not in df.columns:
+                    log.warning(f"  FanGraphs pitching {season}: no ID column")
+                    return pd.DataFrame()
+                df = _normalize_mlbam_id(df)
+                log.info(f"  FanGraphs pitching {season}: {len(df)} rows")
+                return df
+        log.warning(f"  FanGraphs pitching {season}: HTTP {r.status_code}")
+    except Exception as e:
+        log.warning(f"  FanGraphs pitching {season}: {e}")
+    return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,6 +556,7 @@ def build_pitcher_frame(cur: int, pri: int) -> pd.DataFrame:
     sw_p    = fetch_savant_pitcher_swstr(pri)
     mlb_c   = fetch_mlb_pitching(cur)
     mlb_p   = fetch_mlb_pitching(pri)
+    fg_c    = fetch_fangraphs_pitching(cur)
 
     sc    = sc_c  if not sc_c.empty  else sc_p
     sw    = sw_c  if not sw_c.empty  else sw_p
@@ -532,11 +570,13 @@ def build_pitcher_frame(cur: int, pri: int) -> pd.DataFrame:
     result = max(candidates, key=lambda x: x[0])[1].copy()
     result = _merge_on_id(result, sc,  ["barrel_batted_rate", "hard_hit_percent",
                                          "avg_exit_velocity", "sweet_spot_percent"])
-    result = _merge_on_id(result, sw,  ["swstr_pct"])   # aggregate SwStr% from pitch-arsenal
-    result = _merge_on_id(result, mlb, ["ERA", "WHIP", "K%", "BB%", "GS", "IP",
+    result = _merge_on_id(result, sw,  ["swstr_pct"])
+    result = _merge_on_id(result, mlb, ["Team", "ERA", "WHIP", "K%", "BB%", "GS", "G", "IP",
                                          "HR_allowed", "H_per_9", "barrel_proxy", "hard_proxy_pit"])
     if not sc_c.empty and sc is not sc_c:
         result = _merge_on_id(result, sc_c, ["barrel_batted_rate", "hard_hit_percent", "avg_exit_velocity"])
+    if not fg_c.empty:
+        result = _merge_on_id(result, fg_c, ["FIP", "xFIP", "SIERA"])
 
     result = assign_pitcher_provenance(result)
     result["fetch_season"] = cur
