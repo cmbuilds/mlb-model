@@ -31,6 +31,7 @@ import time
 import math
 import os
 import sqlite3
+import logging
 from datetime import datetime, timedelta, date
 from itertools import combinations
 from typing import Optional, List, Dict, Tuple, Any
@@ -87,12 +88,28 @@ EST = pytz.timezone('US/Eastern')
 DB_PATH = "mlb_tb_data.db"
 
 # Tier thresholds (calibrated for ~47% base rate)
-TIERS = {
-    "🔒 TIER 1": 80,
-    "✅ TIER 2": 70,
-    "📊 TIER 3": 60,
-    "❌ NO PLAY": 0,
-}
+# Pure scoring functions and utilities now live in their own modules.
+# Imported here so this file stays as the Streamlit runner while tests
+# import from the modules directly (no Streamlit dependency in modules).
+from lib.constants import (
+    TIERS, STADIUM_COORDS, PARK_TB_FACTORS, PARK_HR_FACTORS,
+    PLATOON_ADJ, TEAM_ABB_MAP, MLBAM_BATTER_HAND,
+)
+from lib.utils import _norm, clean_fangraphs_df
+from lib.name_match import safe_get, prepare_lookup_df, find_player_row
+from data.provenance import compute_data_quality_score, check_bettable_tb
+from scoring.park import (
+    compute_park_score, compute_platoon_score,
+    compute_lineup_score, compute_pitch_matchup_score,
+)
+from scoring.weather import classify_wind, compute_weather_score
+from scoring.vegas import compute_vegas_score, score_to_prob, get_tier
+from scoring.streak import compute_streak_score, compute_bvp_score, compute_tto_bonus
+from scoring.batter import compute_batter_score
+from scoring.pitcher import compute_pitcher_score, compute_team_bullpen_scores
+from scoring.hr import compute_hr_score
+from scoring.final import compute_final_score as _compute_final_score_pure
+from markets.tb_o15 import score_one_batter as _score_one_batter_pure, build_parlays as _build_parlays_pure, tb_market_edge
 
 # MLB Stadium coordinates for weather
 STADIUM_COORDS = {
@@ -537,7 +554,8 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
             "name": person.get("fullName", "Unknown"),
             "hand": person.get("pitchHand", {}).get("code", "R"),
         }
-    except:
+    except Exception as e:
+        logging.warning(f"[fetch_pitcher_info pid={pitcher_id}] {e}")
         return {"id": pitcher_id, "name": "Unknown", "hand": "R"}
 
 # ============================================================================
@@ -551,6 +569,8 @@ def fetch_pitcher_info(pitcher_id: int) -> Dict:
 # Use a path relative to the app file so cache survives redeployments when
 # committed to git (stat_cache/ is in .gitignore-excluded or included deliberately).
 _DISK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stat_cache")
+_STATS_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "mlb_stats.db")
+_DB_FRESHNESS_HOURS = 8  # warn in UI if dataset older than this
 
 def _disk_cache_path(name: str) -> str:
     os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
@@ -586,6 +606,41 @@ def _load_disk_cache(name: str, max_age_hours: int = 168) -> Optional[pd.DataFra
     return None
 
 
+def _load_from_db(table: str) -> Optional[pd.DataFrame]:
+    """Read batter_stats or pitcher_stats from data/mlb_stats.db.
+    Returns None if DB is absent, stale (> _DB_FRESHNESS_HOURS), or corrupt."""
+    if not os.path.exists(_STATS_DB):
+        return None
+    try:
+        age_hours = (time.time() - os.path.getmtime(_STATS_DB)) / 3600
+        if age_hours > _DB_FRESHNESS_HOURS:
+            st.session_state["_db_freshness_warning"] = (
+                f"Dataset is {age_hours:.0f}h old (threshold {_DB_FRESHNESS_HOURS}h). "
+                f"Run: python3 data/fetch_pipeline.py"
+            )
+        else:
+            st.session_state.pop("_db_freshness_warning", None)
+        con = sqlite3.connect(_STATS_DB)
+        df = pd.read_sql(f"SELECT * FROM {table}", con)
+        con.close()
+        if df.empty:
+            return None
+        # Alias mlbam_id → xMLBAMID so find_player_row() can match by MLBAM ID
+        if "mlbam_id" in df.columns and "xMLBAMID" not in df.columns:
+            df["xMLBAMID"] = df["mlbam_id"].astype(str)
+        return df
+    except Exception as e:
+        logging.warning(f"[_load_from_db {table}] {e}")
+        return None
+
+
+def _db_age_hours() -> Optional[float]:
+    """Return age of the stats DB in hours, or None if absent."""
+    if not os.path.exists(_STATS_DB):
+        return None
+    return (time.time() - os.path.getmtime(_STATS_DB)) / 3600
+
+
 @st.cache_data(ttl=10800)
 def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     """
@@ -600,6 +655,12 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
     All frames merged on MLBAM player_id → clean, no-crosswalk join.
     """
     import io as _io
+
+    # ── 0. SQLite dataset (fetch_pipeline.py output) — primary path ───────
+    _db = _load_from_db("batter_stats")
+    if _db is not None:
+        st.session_state["_batting_source"] = "sqlite_db"
+        return _db
 
     # ── 1. Early disk cache (< 6h) ────────────────────────────────────────
     _early = _load_disk_cache("batting_stats", max_age_hours=6)
@@ -650,7 +711,8 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
                         try:
                             slg = float(st_.get("slg", 0) or 0)
                             avg = float(st_.get("avg", 0) or 0)
-                        except:
+                        except Exception as e:
+                            logging.warning(f"[mlb_stats_api slg/avg parse] {e}")
                             slg = avg = 0.0
                         hr  = int(st_.get("homeRuns", 0) or 0)
                         tb  = int(st_.get("totalBases", 0) or 0)
@@ -660,7 +722,8 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
                         try:
                             obp  = float(st_.get("obp", 0) or 0)
                             bab  = float(st_.get("babip", 0) or 0)
-                        except:
+                        except Exception as e:
+                            logging.warning(f"[mlb_stats_api obp/babip parse] {e}")
                             obp = bab = 0.0
 
                         # Derive Statcast proxies from counting stats
@@ -1207,6 +1270,12 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
     """
     import io as _io
 
+    # ── 0. SQLite dataset (fetch_pipeline.py output) — primary path ───────
+    _db = _load_from_db("pitcher_stats")
+    if _db is not None:
+        st.session_state["_pitching_source"] = "sqlite_db"
+        return _db
+
     # ── 1. Early disk cache ───────────────────────────────────────────────
     # NOTE: Cache cleared when FIP-only vulnerability fix deployed (2026-05-05)
     # Reduce TTL to 2h so fresh data always runs through FIP-only detection
@@ -1250,7 +1319,8 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                         ip_str = str(st_.get("inningsPitched", "0") or "0")
                         try:
                             ip = float(ip_str)
-                        except:
+                        except Exception as e:
+                            logging.warning(f"[mlb_stats_api ip parse] {e}")
                             ip = 0.0
                         so  = int(st_.get("strikeOuts", 0) or 0)
                         bb  = int(st_.get("baseOnBalls", 0) or 0)
@@ -1779,6 +1849,14 @@ def get_batter_stats(player_name: str, mlb_id: str,
         "data_source":      "league_avg",
     }
 
+    # Per-field provenance: 'measured' | 'proxy' | 'league_avg'
+    prov = {k: "league_avg" for k in [
+        "slg_proxy", "iso_proxy", "k_rate", "bb_rate", "wrc_plus",
+        "woba", "barrel_rate", "hard_hit_rate", "exit_velocity_avg",
+        "ev50", "sweet_spot_rate", "bat_speed", "blast_rate", "squared_up_rate",
+    ]}
+    stats["_provenance"] = prov
+
     row = find_player_row(batting_df, player_name, mlb_id)
 
     if row is not None:
@@ -1787,28 +1865,34 @@ def get_batter_stats(player_name: str, mlb_id: str,
         slg  = safe_get(row, 'SLG',  'slg',  default=None)
         if xslg and 0.050 < xslg < 1.200:
             stats["slg_proxy"] = xslg
+            prov["slg_proxy"] = "measured"
         elif slg and 0.050 < slg < 1.200:
             stats["slg_proxy"] = slg
+            prov["slg_proxy"] = "measured"
 
         # ── ISO ────────────────────────────────────────────────────────────
         iso = safe_get(row, 'ISO', 'iso', default=None)
         if iso and 0 < iso < 0.700:
             stats["iso_proxy"] = iso
+            prov["iso_proxy"] = "measured"
 
         # ── K% ────────────────────────────────────────────────────────────
         k = safe_get(row, 'K%', 'k_percent', default=None)
         if k is not None and k > 0:
             stats["k_rate"] = k if k < 1 else k / 100
+            prov["k_rate"] = "measured"
 
         # ── BB% ───────────────────────────────────────────────────────────
         bb = safe_get(row, 'BB%', 'bb_percent', default=None)
         if bb is not None and bb > 0:
             stats["bb_rate"] = bb if bb < 1 else bb / 100
+            prov["bb_rate"] = "measured"
 
         # ── wRC+ ──────────────────────────────────────────────────────────
         wrc = safe_get(row, 'wRC+', 'wRC', default=None)
         if wrc and wrc > 0:
             stats["wrc_plus"] = float(wrc)
+            prov["wrc_plus"] = "measured"
 
         # ── wRC+ proxy from OBP when FanGraphs unavailable ────────────────
         # wRC+ correlates ~0.87 with OBP. MLB API gives us OBP.
@@ -1818,28 +1902,33 @@ def get_batter_stats(player_name: str, mlb_id: str,
             if _obp_for_wrc and 0.250 < _obp_for_wrc < 0.550:
                 _wrc_proxy = 100.0 + (_obp_for_wrc - 0.316) / 0.316 * 87.0
                 stats["wrc_plus"] = round(max(50.0, min(220.0, _wrc_proxy)), 1)
+                prov["wrc_plus"] = "proxy"
 
         # ── wOBA ──────────────────────────────────────────────────────────
         woba = safe_get(row, 'xwOBA', 'wOBA', 'xwoba', 'woba', default=None)
         if woba and 0.100 < woba < 0.700:
             stats["woba"] = woba
+            prov["woba"] = "measured"
 
         # ── Barrel% ───────────────────────────────────────────────────────
         barrel = safe_get(row, 'Barrel%', 'Barrel', 'barrel_batted_rate',
                           'barrel_rate', default=None)
         if barrel is not None and barrel > 0:
             stats["barrel_rate"] = barrel if barrel < 1 else barrel / 100
+            prov["barrel_rate"] = "measured"
 
         # ── Hard Hit% ─────────────────────────────────────────────────────
         hard = safe_get(row, 'Hard%', 'HardHit%', 'hard_hit_percent',
                         'hard_hit_rate', default=None)
         if hard is not None and hard > 0:
             stats["hard_hit_rate"] = hard if hard < 1 else hard / 100
+            prov["hard_hit_rate"] = "measured"
 
         # ── Exit Velocity ─────────────────────────────────────────────────
         ev = safe_get(row, 'EV', 'avg_exit_velocity', 'exit_velocity_avg', default=None)
         if ev and ev > 50:
             stats["exit_velocity_avg"] = ev
+            prov["exit_velocity_avg"] = "measured"
 
         # ── Sweet Spot% ───────────────────────────────────────────────────
         # FanGraphs uses several column names across seasons/API versions
@@ -1848,6 +1937,7 @@ def get_batter_stats(player_name: str, mlb_id: str,
                          'sweet_spot_rate', 'SweetSpot', default=None)
         if sweet is not None and sweet > 0:
             stats["sweet_spot_rate"] = sweet if sweet < 1 else sweet / 100
+            prov["sweet_spot_rate"] = "measured"
 
         # Label source accurately based on what columns were actually found
         if any(c in row.index for c in ('xSLG','est_slg','xslg','est_woba')):
@@ -1865,6 +1955,7 @@ def get_batter_stats(player_name: str, mlb_id: str,
         ev50 = safe_get(row, 'ev50', 'EV50', 'xEV50', default=None)
         if ev50 and ev50 > 50:
             stats["ev50"] = ev50
+            prov["ev50"] = "measured"
 
         # ── MLB Stats API proxy fallback ──────────────────────────────────
         # When Savant is blocked, use counting-stat-derived proxies for
@@ -1880,17 +1971,20 @@ def get_batter_stats(player_name: str, mlb_id: str,
             barrel_proxy = min(0.25, hr_pa / 0.029 * 0.070)
             if barrel_proxy > 0.010:  # at least some HR production
                 stats["barrel_rate"] = round(barrel_proxy, 4)
+                prov["barrel_rate"] = "proxy"
 
         # Hard hit% proxy: derived from SLG-based formula in MLB API fetch
         hard_p = safe_get(row, 'hard_proxy', default=None)
         if hard_p is not None and stats["hard_hit_rate"] == 0.370:
             stats["hard_hit_rate"] = round(hard_p, 4)
+            prov["hard_hit_rate"] = "proxy"
 
         # xSLG proxy: SLG is a reasonable proxy when xSLG unavailable
         # (xSLG ~ SLG * 1.02 on average; use direct SLG if nothing better)
         slg_raw = safe_get(row, 'SLG', 'slg', default=None)
         if slg_raw and 0.100 < slg_raw < 0.900 and stats["slg_proxy"] == 0.398:
             stats["slg_proxy"] = slg_raw
+            prov["slg_proxy"] = "measured"
 
         # TB/PA proxy: direct total bases rate for power scoring
         tb_pa = safe_get(row, 'tb_per_pa', default=None)
@@ -1902,17 +1996,21 @@ def get_batter_stats(player_name: str, mlb_id: str,
         if obp and 0.200 < obp < 0.600 and stats["woba"] == 0.315:
             # wOBA ≈ OBP * 0.82 (rough linear scaling)
             stats["woba"] = round(obp * 0.82, 3)
+            prov["woba"] = "proxy"
 
         # ── Bat tracking (bat speed, blast rate) ──────────────────────────
         bs = safe_get(row, 'bat_speed', 'BatSpeed', default=None)
         if bs and bs > 30:
             stats["bat_speed"] = bs
+            prov["bat_speed"] = "measured"
         br = safe_get(row, 'blast_rate', 'BlastRate', default=None)
         if br is not None and br >= 0:
             stats["blast_rate"] = br if br < 1 else br / 100
+            prov["blast_rate"] = "measured"
         sq = safe_get(row, 'squared_up_rate', default=None)
         if sq is not None and sq >= 0:
             stats["squared_up_rate"] = sq if sq < 1 else sq / 100
+            prov["squared_up_rate"] = "measured"
 
         # ── Sprint speed (ft/sec from Savant sprint speed leaderboard) ────
         ss = safe_get(row, 'sprint_speed', 'SprintSpeed', 'hp_to_1b', default=None)
@@ -1977,36 +2075,50 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         "data_source":      "league_avg",
     }
 
+    # Per-field provenance: 'measured' | 'proxy' | 'league_avg'
+    prov = {k: "league_avg" for k in [
+        "k_rate_allowed", "bb_rate_allowed", "hard_hit_allowed",
+        "barrel_allowed", "era", "fip", "whip", "swstr_pct",
+    ]}
+    stats["_provenance"] = prov
+
     row = find_player_row(pitching_df, pitcher_name, pitcher_mlb_id)
 
     if row is not None:
         k = safe_get(row, 'K%', default=None)
         if k is not None and k > 0:
             stats["k_rate_allowed"] = k if k < 1 else k / 100
+            prov["k_rate_allowed"] = "measured"
 
         bb = safe_get(row, 'BB%', default=None)
         if bb is not None and bb > 0:
             stats["bb_rate_allowed"] = bb if bb < 1 else bb / 100
+            prov["bb_rate_allowed"] = "measured"
 
         hard = safe_get(row, 'Hard%', default=None)
         if hard is not None and hard > 0:
             stats["hard_hit_allowed"] = hard if hard < 1 else hard / 100
+            prov["hard_hit_allowed"] = "measured"
 
         barrel = safe_get(row, 'Barrel%', default=None)
         if barrel is not None and barrel > 0:
             stats["barrel_allowed"] = barrel if barrel < 1 else barrel / 100
+            prov["barrel_allowed"] = "measured"
 
         era = safe_get(row, 'ERA', default=None)
         if era and 0 < era < 20:
             stats["era"] = era
+            prov["era"] = "measured"
 
         fip = safe_get(row, 'FIP', 'xFIP', default=None)
         if fip and 0 < fip < 20:
             stats["fip"] = fip
+            prov["fip"] = "measured"
 
         whip = safe_get(row, 'WHIP', default=None)
         if whip and 0 < whip < 5:
             stats["whip"] = whip
+            prov["whip"] = "measured"
 
         # ── Pitch arsenal mix (pct_FF, pct_SL, etc.) ─────────────────────
         for _pt in ("FF", "SI", "SL", "CH", "CU", "FC"):
@@ -2019,10 +2131,12 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         barrel_p = safe_get(row, 'barrel_proxy', default=None)
         if barrel_p is not None and stats["barrel_allowed"] == 0.065:
             stats["barrel_allowed"] = round(max(0.010, barrel_p), 4)
+            prov["barrel_allowed"] = "proxy"
 
         hard_p = safe_get(row, 'hard_proxy_pit', default=None)
         if hard_p is not None and stats["hard_hit_allowed"] == 0.360:
             stats["hard_hit_allowed"] = round(hard_p, 3)
+            prov["hard_hit_allowed"] = "proxy"
 
         # ── SwStr% proxy from K% ──────────────────────────────────────────
         # FanGraphs type=8 (true SwStr%) is blocked on Streamlit Cloud.
@@ -2032,8 +2146,10 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         if stats.get("swstr_pct", 0.0) == 0.0 and stats["k_rate_allowed"] > 0:
             stats["swstr_pct"] = round(stats["k_rate_allowed"] * 0.49, 4)
             stats["swstr_pct_is_proxy"] = True
+            prov["swstr_pct"] = "proxy"
         else:
             stats["swstr_pct_is_proxy"] = False
+            prov["swstr_pct"] = "measured"
 
         # Label pitcher source based on available columns
         if any(c in row.index for c in ('barrel_proxy','hard_proxy_pit','H_per_9')):
@@ -2048,8 +2164,66 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         if stats.get("swstr_pct", 0.0) == 0.0:
             stats["swstr_pct"] = round(stats["k_rate_allowed"] * 0.49, 4)
             stats["swstr_pct_is_proxy"] = True
+            prov["swstr_pct"] = "proxy"
 
     return stats
+
+
+# ============================================================================
+# DATA QUALITY + BETTABLE GATE
+# ============================================================================
+
+def compute_data_quality_score(batter_prov: dict, pitcher_prov: dict,
+                                lineup_confirmed: bool, sp_known: bool,
+                                hand_real: bool) -> int:
+    """
+    0-100 score: % of key TB scoring inputs that are 'measured'.
+    Inputs listed in importance order for TB / O0.5 market.
+    """
+    checks = [
+        batter_prov.get("k_rate",          "league_avg") == "measured",
+        batter_prov.get("woba",            "league_avg") == "measured",
+        batter_prov.get("slg_proxy",       "league_avg") == "measured",
+        batter_prov.get("hard_hit_rate",   "league_avg") == "measured",
+        batter_prov.get("barrel_rate",     "league_avg") == "measured",
+        batter_prov.get("iso_proxy",       "league_avg") == "measured",
+        pitcher_prov.get("k_rate_allowed", "league_avg") == "measured",
+        pitcher_prov.get("hard_hit_allowed","league_avg") == "measured",
+        lineup_confirmed,
+        sp_known,
+        hand_real,
+    ]
+    return round(sum(checks) / len(checks) * 100)
+
+
+def check_bettable_tb(batter_prov: dict, pitcher_prov: dict,
+                       batter_matched: bool, pitcher_matched: bool,
+                       lineup_confirmed: bool, sp_known: bool,
+                       hand_real: bool) -> tuple:
+    """
+    Returns (is_bettable: bool, reasons: list[str]) for TB / O0.5 market.
+    Required core must ALL be 'measured' — any gap = non-bettable.
+    """
+    reasons = []
+    if not batter_matched:
+        reasons.append("player not matched to real stats")
+    if not hand_real:
+        reasons.append("batter handedness defaulted (not confirmed)")
+    if not sp_known:
+        reasons.append("opposing SP unknown (TBD)")
+    if not pitcher_matched:
+        reasons.append("SP has no real stats")
+    if not lineup_confirmed:
+        reasons.append("lineup not confirmed")
+    if batter_prov.get("k_rate",        "league_avg") != "measured":
+        reasons.append("K% not measured")
+    if batter_prov.get("slg_proxy",     "league_avg") != "measured":
+        reasons.append("xSLG/SLG not measured")
+    if batter_prov.get("woba",          "league_avg") != "measured":
+        reasons.append("wOBA not measured (Savant or real wOBA needed)")
+    if batter_prov.get("hard_hit_rate", "league_avg") != "measured":
+        reasons.append("hard-hit% not measured (Savant column drift — fix in fetch pipeline)")
+    return (len(reasons) == 0, reasons)
 
 
 # ============================================================================
@@ -2538,29 +2712,10 @@ def compute_batter_score(statcast: Dict, fg_stats: Dict = None) -> Tuple[float, 
     bat_speed_raw = f("bat_speed",      0.0)
     blast_raw   = f("blast_rate",       0.0)
 
-    # V1.6+: When Savant bat-tracking signals are unavailable (default=0),
-    # derive them from xSLG + ISO rather than league-average constants.
-    # This prevents 30% of the bat score (ev50+bat_speed+blast) from
-    # collapsing to identical league-avg values for every player.
-    # Derivation research:
-    #   EV50 ~ xSLG × 18 pts range + ISO × 6 pts (r≈0.82 with actual Savant)
-    #   bat_speed ~ xSLG × 9 pts range (higher contact quality = faster swing)
-    #   blast_rate ~ barrel_rate × 0.45 + ISO × 0.25 (well-squared contact)
-    if ev50_raw < 50:  # not populated — derive from xSLG+ISO
-        ev50 = 86 + (xslg - 0.200) / 0.450 * 18 + (iso - 0.080) / 0.240 * 6
-        ev50 = max(85.0, min(104.0, ev50))
-    else:
-        ev50 = ev50_raw
-    if bat_speed_raw < 30:  # not populated
-        bat_speed = 68.0 + (xslg - 0.200) / 0.450 * 9.0
-        bat_speed = max(66.0, min(77.0, bat_speed))
-    else:
-        bat_speed = bat_speed_raw
-    if blast_raw < 0.01:  # not populated
-        blast_rate = 0.14 + barrel_rate / 0.20 * 0.09 + (iso - 0.080) / 0.240 * 0.06
-        blast_rate = max(0.12, min(0.32, blast_rate))
-    else:
-        blast_rate = blast_raw
+    # Bat-tracking signals — only use when real Savant data present (not derived)
+    ev50       = ev50_raw
+    bat_speed  = bat_speed_raw
+    blast_rate = blast_raw
 
     details["xSLG"]     = round(xslg, 3)
     details["Barrel%"]  = f"{barrel_rate*100:.1f}%"
@@ -3381,74 +3536,35 @@ def compute_final_score(
     bvp_score: float = 50.0,
     bvp_weight_boost: float = 0.0,
 ) -> float:
-    """
-    Final weighted composite. V1.8 research-calibrated weights.
-
-    Research sources:
-    - FanGraphs barrel study: "Hitters supply the power — whether a pitcher
-      surrenders barrels has more to do with who they face than how they pitch"
-    - Pitcher List K%/HH study: K% is #1 pitcher predictor (r=-0.375 next ERA);
-      HardHit/9 is #2; barrel% allowed has r²≈0.12 (barely predictive)
-    - FullCountProps: platoon +56 SLG effect is large and stable
-    - FiveThirtyEight Elo: 7-game streaks real but noisy — limit to 5%
-    - FTA BvP research: meaningful at 15+ AB; limit to 2%
-
-    V1.8 weight rationale:
-    - Pitcher 30%: primary matchup driver — wider scale now gives real separation
-    - Batter 28%: quality matters but shouldn't override bad matchup
-    - Platoon 12%: +56 SLG well-documented; most stable contextual signal
-    - Vegas 8%: team total r=0.61 with scoring — was underweighted at 5%
-    - Park 7%: Coors/Petco park effects real (r≈0.85 Y-to-Y)
-    - Streak 5%: real but 7-game window is noisy
-    - TTO 4%: 3rd TTO +17-20 wOBA documented
-    - Weather 4%: wind 15+ mph = ~12% more HR
-    - Pitch matchup 2%: rarely has data; was placeholder at 4%
-    - BvP 2%: very small samples; dynamic boost preserved for "owns" cases
-    - Lineup 1%: least predictive — 1 extra PA is marginal
-    """
-    # V1.8 research-calibrated weights (sum ≈ 1.03, normalized below)
-    # Key changes from V1.7:
-    #   Batter  0.33→0.28: less dominance — matchup should drive picks, not career quality
-    #   Pitcher 0.25→0.30: primary matchup signal; wider scale now gives real separation
-    #   Platoon 0.08→0.12: most stable contextual signal (+56 SLG well-documented)
-    #   Vegas   0.05→0.08: implied total r=0.61 with scoring — was underweighted
-    #   Streak  0.06→0.05: 7-game window is noisy, trim
-    #   Matchup 0.04→0.02: pitch-type splits rarely available, reduce placeholder weight
-    #   BvP     0.03→0.02: very small samples, reduce (dynamic boost preserved)
-    # Dynamic BvP boost: when batter "owns" this SP (high AVG + SLG career history),
-    # BvP weight rises from 0.02 → 0.10 and batter weight reduced to compensate.
-    # "owns" requires AVG >= .400 AND SLG >= .700 (or equivalent power marks)
-    _bvp_w = 0.02 + bvp_weight_boost           # 0.02 normally; 0.10 when "owns"
-    _bat_w = max(0.20, 0.28 - bvp_weight_boost) # 0.28 normally; 0.20 when "owns"
-    raw = (
-        batter_score        * _bat_w +  # batter quality: important but matchup matters more
-        pitcher_vuln_score  * 0.30 +  # pitcher matchup: primary pick driver (bumped from 0.25)
-        platoon_score       * 0.12 +  # platoon: most stable contextual signal (bumped from 0.08)
-        vegas_score         * 0.08 +  # implied total: r=0.61 with scoring (bumped from 0.05)
-        park_score          * 0.07 +  # park: Coors/Petco real (r≈0.85 Y-to-Y)
-        streak_score        * 0.05 +  # streak: real but noisy 7-game window (trimmed from 0.06)
-        tto_bonus           * 0.04 +  # TTO: 3rd TTO +17-20 wOBA documented
-        weather_score       * 0.04 +  # weather: wind 15+ mph = ~12% more HR
-        pitch_matchup_score * 0.02 +  # pitch matchup: often no data — keep small (trimmed from 0.04)
-        bvp_score           * _bvp_w +  # BvP: 2% base; 10% when batter "owns" this SP (AVG .400+)
-        lineup_score        * 0.01    # lineup: least predictive; 1 extra PA is marginal
-    )  # sum = 1.03 → normalize
-    raw = raw / 1.03  # normalize to true 0-100 scale
-    # V1.8 offset: reduced from 10→7 (less artificial inflation, more room above 80 for elite matchups)
-    # Proxy mode offset also reduced: 13→10
-    import streamlit as _st
-    _bat_src  = _st.session_state.get("_batting_source", "")
-    _bat_cols = _st.session_state.get("batting_cols", [])
-    # Full data = Barrel%, HH%, AND wRC+ all present
-    _has_full = ("Barrel%" in _bat_cols or "barrel_batted_rate" in _bat_cols) and \
-                ("Hard%" in _bat_cols or "hard_hit_percent" in _bat_cols) and \
-                ("wRC+" in _bat_cols)
-    # Proxy mode: source says mlbapi only, or statcast columns missing
-    _is_proxy = ("mlbapi" in _bat_src or _bat_src in ("mlbapi_only",) or
-                 "disk_cache_stale" in _bat_src or not _has_full)
-    _offset = 9.5 if _is_proxy else 7.0   # V2.1: calibrated for new contact-first batter weights
-    calibrated = raw + _offset
-    return max(0, min(100, round(calibrated, 1)))
+    """Thin Streamlit-aware wrapper; pure logic lives in scoring/final.py."""
+    _bat_src  = st.session_state.get("_batting_source", "")
+    _bat_cols = st.session_state.get("batting_cols", [])
+    _has_full = (
+        ("Barrel%" in _bat_cols or "barrel_batted_rate" in _bat_cols)
+        and ("Hard%" in _bat_cols or "hard_hit_percent" in _bat_cols)
+        and ("wRC+" in _bat_cols)
+    )
+    _is_proxy = (
+        "mlbapi" in _bat_src
+        or _bat_src in ("mlbapi_only",)
+        or "disk_cache_stale" in _bat_src
+        or not _has_full
+    )
+    return _compute_final_score_pure(
+        batter_score=batter_score,
+        pitcher_vuln_score=pitcher_vuln_score,
+        platoon_score=platoon_score,
+        lineup_score=lineup_score,
+        park_score=park_score,
+        weather_score=weather_score,
+        vegas_score=vegas_score,
+        tto_bonus=tto_bonus,
+        pitch_matchup_score=pitch_matchup_score,
+        streak_score=streak_score,
+        bvp_score=bvp_score,
+        bvp_weight_boost=bvp_weight_boost,
+        proxy_mode=_is_proxy,
+    )
 
 
 def score_to_prob(score: float) -> float:
@@ -3524,20 +3640,19 @@ def compute_hr_score(
     - Pitch matchup   4% — favorable pitch type RV for FB/power pitches (NEW V1.6)
     - Wind/weather dynamic
     """
-    # ── Derive bat-tracking signals when Savant unavailable ────────────────
-    # When ev50/bat_speed/blast_rate are 0 (not populated), derive from
-    # barrel_rate + iso so elite power hitters score distinctly from average ones.
-    # Derivation validated against 2024 Savant leaderboard (r≈0.80 for ev50, r≈0.76 bat_speed)
-    if ev50 < 50:  # 0 = not populated; real values are 85-105 range
-        # barrel 7%→ev50 91, barrel 20%→ev50 99; iso 0.165→+0, iso 0.300→+3
-        ev50 = 88.0 + (barrel_rate / 0.20) * 11.0 + max(0, (iso - 0.080) / 0.240) * 4.0
-        ev50 = max(85.0, min(104.0, ev50))
-    if bat_speed < 30:  # 0 = not populated; real values are 65-78 range
-        bat_speed = 67.0 + (barrel_rate / 0.20) * 6.0 + max(0, (iso - 0.080) / 0.240) * 3.0
-        bat_speed = max(65.0, min(78.0, bat_speed))
-    if blast_rate < 0.01:  # 0 = not populated; real values are 0.10-0.35 range
-        blast_rate = 0.13 + barrel_rate * 0.45 + max(0, iso - 0.080) * 0.25
-        blast_rate = max(0.10, min(0.35, blast_rate))
+    # ── Availability flags — only score what is measured ─────────────────
+    # Do NOT derive ev50/bat_speed/blast_rate from other stats.
+    # If Savant bat-tracking not available, omit those signals and
+    # redistribute their weight to barrel% (strongest HR predictor).
+    has_ev50      = ev50 >= 50          # real values are 85-105 mph
+    has_bat_speed = bat_speed >= 30     # real values are 65-78 mph
+    has_blast     = blast_rate >= 0.01  # real values are 0.10-0.35
+
+    # Weights redistributed to barrel% when bat-tracking signals absent
+    _ev50_w    = 0.10 if has_ev50      else 0.0
+    _speed_w   = 0.08 if has_bat_speed else 0.0
+    _blast_w   = 0.06 if has_blast     else 0.0
+    _barrel_w  = 0.35 + (0.10 - _ev50_w) + (0.08 - _speed_w) + (0.06 - _blast_w)
 
     # ── Barrel% — #1 HR predictor (r=0.93) ────────────────────────────
     barrel_score = max(0, min(100, barrel_rate / 0.20 * 100))
@@ -3618,17 +3733,18 @@ def compute_hr_score(
     # Redistribute weight: wind steals from park_score when significant
     adjusted_park_weight = max(0.06, 0.15 - wind_weight)
 
-    # ── Composite V1.6 ─────────────────────────────────────────────────
+    # ── Composite — only score signals that are measured ─────────────────
+    # _barrel_w absorbs weight from any missing bat-tracking signals
     base = (
-        barrel_score    * 0.35 +
-        ev50_score      * 0.10 +     # V1.6 NEW: best power ceiling signal
-        bat_speed_score * 0.08 +     # V1.6 NEW: mechanical HR ceiling
+        barrel_score    * _barrel_w +
         park_score      * adjusted_park_weight +
         hh_score        * 0.08 +
         iso_score       * 0.07 +
-        blast_score     * 0.06 +     # V1.6 NEW: swing quality
         vegas_score     * 0.05 +
-        matchup_score   * 0.04       # V1.6 NEW: pitch type matchup
+        matchup_score   * 0.04 +
+        (ev50_score      * _ev50_w   if has_ev50      else 0) +
+        (bat_speed_score * _speed_w  if has_bat_speed else 0) +
+        (blast_score     * _blast_w  if has_blast     else 0)
     )
 
     wind_contribution = wind_raw * wind_weight if wind_weight > 0 else 0.0
@@ -3716,8 +3832,8 @@ def fetch_team_id(abbreviation: str) -> Optional[int]:
         for team in r.json().get("teams", []):
             if team.get("abbreviation") == abbreviation:
                 return team["id"]
-    except:
-        pass
+    except Exception as e:
+        logging.warning(f"[get_team_id abbr={abbreviation}] {e}")
     return None
 
 # ============================================================================
@@ -4045,11 +4161,13 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             # 3. FanGraphs Bats column (rarely available on Streamlit Cloud)
             # 4. MLB API people endpoint individual call
             # 5. "R" hardcoded default (last resort — will be scored as RHB)
+            hand_real = bool(batter_hand and batter_hand not in ("?", ""))  # True if from boxscore
             if not batter_hand or batter_hand in ("?", ""):
                 # 2. Constant map — instant, no network call
                 bat_from_map = MLBAM_BATTER_HAND.get(str(player_id), "")
                 if bat_from_map in ("L", "R", "S"):
                     batter_hand = bat_from_map
+                    hand_real = True
             if not batter_hand or batter_hand in ("?", ""):
                 # 3. FanGraphs Bats column (type=8 — may be blocked on cloud)
                 fg_row = find_player_row(batting_df, name, player_id)
@@ -4057,6 +4175,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                     fg_bats = str(fg_row.get("Bats", "") or "").strip().upper()
                     if fg_bats in ("L", "R", "S", "B"):
                         batter_hand = fg_bats
+                        hand_real = True
             if not batter_hand or batter_hand in ("?", ""):
                 # 4. MLB API people endpoint — individual call (adds ~50ms per unresolved player)
                 try:
@@ -4066,10 +4185,13 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                         timeout=4
                     )
                     batter_hand = _pr.json().get("people", [{}])[0].get("batSide", {}).get("code", "R")
+                    hand_real = True
                 except Exception:
                     batter_hand = "R"
+                    hand_real = False
             if not batter_hand or batter_hand in ("?", ""):
                 batter_hand = "R"  # 5. absolute final fallback
+                hand_real = False
 
             # DIAGNOSTIC: on first batter, show exactly what find_player_row sees
             if not first_batter_logged:
@@ -4129,166 +4251,61 @@ def run_model(date_str: str, status_container) -> List[Dict]:
             _pitcher_k_rate = float(pitcher_statcast.get("k_rate_allowed", 0.228) or 0.228)
             _pitcher_swstr  = float(pitcher_statcast.get("swstr_pct", 0.0) or 0.0)
 
-            # ── SCORE COMPONENTS ────────────────────────
-            bat_score, _, bat_details = compute_batter_score(batter_statcast)
-            # V1.3: Look up opponent team's specific bullpen vulnerability
-            opp_team = batter.get("opponent", "").strip().upper()
-            bp_vuln = team_bullpen_scores.get(opp_team, 42.0)
-            pit_score, pit_label = compute_pitcher_score(pitcher_statcast, bullpen_vuln=bp_vuln)
-            # V1.5: Pitch arsenal matchup — batter RV vs SP's actual pitch mix
-            matchup_sc, matchup_label = compute_pitch_matchup_score(batter_statcast, pitcher_statcast)
-            plat_score, plat_label = compute_platoon_score(batter_hand, sp_hand)
-            lineup_sc, lineup_label = compute_lineup_score(lineup_slot)
-            park_sc, park_label = compute_park_score(park_team, True)
-            weather_sc, weather_label = compute_weather_score(weather)
-            implied = implied_totals.get(team, 0)
-            vegas_sc, vegas_label = compute_vegas_score(implied)
-            tto_sc, tto_label = compute_tto_bonus(lineup_slot)
-
-            # V1.7 NEW: Recent form (last 7 games) ──────────────────────────
-            recent_form = fetch_batter_recent_form(str(player_id), n_games=7)
-            season_slg  = batter_statcast.get("slg_proxy", 0.398)
-            streak_sc, streak_label = compute_streak_score(recent_form, season_slg)
-
-            # V1.7 NEW: Career Batter vs Pitcher ────────────────────────────
-            bvp_data = fetch_batter_vs_pitcher(str(player_id), sp_id)
-            bvp_sc, bvp_label, bvp_sig = compute_bvp_score(bvp_data, season_slg)
-
-            # "Owns" flag: boost final score weight when batter dominates this SP
-            # This fires when batter has elite career numbers vs this specific pitcher
-            _bvp_weight_boost = 0.08 if bvp_sig == "owns" else 0.0
-
-            final_score = compute_final_score(
-                bat_score, pit_score, plat_score, lineup_sc,
-                park_sc, weather_sc, vegas_sc, tto_sc,
-                pitch_matchup_score=matchup_sc,
-                streak_score=streak_sc,
-                bvp_score=bvp_sc,
-                bvp_weight_boost=_bvp_weight_boost,
-            )
-
-            # Caps & flags
             sp_tbd = not sp_name or sp_name == "TBD"
-            if sp_tbd:
-                final_score = min(final_score, 72)
-            if not batter.get("lineup_confirmed", True):
-                final_score = min(final_score, 70)
+            implied = implied_totals.get(team, 0)
 
-            prob = score_to_prob(final_score)
-            # Detect proxy mode for adaptive tier thresholds
-            _bat_src_loop = st.session_state.get("_batting_source", "")
-            _proxy_mode = "mlbapi" in _bat_src_loop or _bat_src_loop in ("disk_cache_stale", "mlbapi_only")
-            tier = get_tier(final_score, proxy_mode=_proxy_mode)
+            # Recent form and BvP (network calls — stay in orchestrator)
+            recent_form = fetch_batter_recent_form(str(player_id), n_games=7)
+            bvp_data    = fetch_batter_vs_pitcher(str(player_id), sp_id)
 
-            # Market edge calculation
-            # Market edge — use prop-specific odds when available
+            # Prop-specific implied probability (for edge calc)
             prop_implied = None
             if prop_odds:
-                norm_name = _norm(name)
-                prop_data = prop_odds.get(norm_name)
-                if not prop_data:
-                    # Try last name match
-                    last = norm_name.split()[-1] if norm_name else ""
-                    prop_data = next((v for k, v in prop_odds.items() if last in k), None)
-                if prop_data:
-                    prop_implied = prop_data.get("market_implied")
-            market_edge, edge_label = compute_market_edge(prob, implied, team, prop_implied)
+                _norm_n = _norm(name)
+                _pd = prop_odds.get(_norm_n)
+                if not _pd:
+                    _last = _norm_n.split()[-1] if _norm_n else ""
+                    _pd = next((v for k, v in prop_odds.items() if _last in k), None)
+                if _pd:
+                    prop_implied = _pd.get("market_implied")
 
-            hr_score = compute_hr_score(
-                barrel_rate=batter_statcast.get("barrel_rate", 0.07),
-                sweet_spot=batter_statcast.get("sweet_spot_rate", 0.30),
-                park_hr_factor=PARK_HR_FACTORS.get(park_team, 1.0),
-                implied_total=implied,
-                weather=weather,
-                hard_hit=batter_statcast.get("hard_hit_rate", 0.37),
-                exit_velocity=batter_statcast.get("exit_velocity_avg", 88.5),
-                iso=batter_statcast.get("iso_proxy", 0.165),
-                ev50=batter_statcast.get("ev50", 0.0),       # 0 = not populated, derive from xSLG
-                bat_speed=batter_statcast.get("bat_speed", 0.0),   # 0 = not populated
-                blast_rate=batter_statcast.get("blast_rate", 0.0), # 0 = not populated
-                pitch_matchup_score=matchup_sc,
+            # Detect proxy mode for tier thresholds and scoring offset
+            _bat_src_loop = st.session_state.get("_batting_source", "")
+            _proxy_mode = (
+                "mlbapi" in _bat_src_loop
+                or _bat_src_loop in ("disk_cache_stale", "mlbapi_only")
             )
 
-            results.append({
-                "name": name,
-                "player_id": player_id,
-                "team": team,
-                "opponent": batter.get("opponent", "?"),
-                "game_id": str(game_pk),
-                "lineup_slot": lineup_slot,
-                "lineup_confirmed": batter.get("lineup_confirmed", True),
-                "batter_hand": batter_hand,
-                "batter_position": batter.get("position", ""),
-                "sp_name": sp_name,
-                "sp_hand": sp_hand,
-                "sp_tbd": sp_tbd,
-                "score": final_score,
-                "prob": prob,
-                "tier": tier,
-                "park": park_team,
-                "park_label": park_label,
-                "weather": weather,
-                "weather_label": weather_label,
-                "implied_total": implied,
-                "market_edge": round(market_edge * 100, 1),  # as percentage
-                "edge_label": edge_label,
-                "tto_label": tto_label,
-                "platoon_label": plat_label,
-                "lineup_label": lineup_label,
-                "pitcher_label": pit_label,
-                "hr_score": hr_score,
-                "xslg": bat_details.get("xSLG", 0),
-                "barrel_rate": batter_statcast.get("barrel_rate", 0),
-                "hard_hit_rate": batter_statcast.get("hard_hit_rate", 0),
-                "k_rate": batter_statcast.get("k_rate", 0),
-                "bb_rate": batter_statcast.get("bb_rate", 0.082),
-                "wrc_plus": batter_statcast.get("wrc_plus", 100.0),
-                "iso": bat_details.get("ISO", 0),
-                "exit_velocity": batter_statcast.get("exit_velocity_avg", 0),
-                "sweet_spot_rate": batter_statcast.get("sweet_spot_rate", 0),
-                "sub_batter": round(bat_score, 1),
-                "sub_pitcher": round(pit_score, 1),
-                "sub_matchup": round(matchup_sc, 1),
-                "matchup_label": matchup_label,
-                # V1.7 NEW: recent form and BvP
-                "sub_streak": round(streak_sc, 1),
-                "streak_label": streak_label,
-                "recent_tb_per_game": recent_form.get("tb_per_game"),
-                "recent_games": recent_form.get("games", 0),
-                "_hr_last7": recent_form.get("hr_last_7", 0),
-                "game_total": round(
-                    implied_totals.get(home_team, 4.7) + implied_totals.get(away_team, 4.3), 1
-                ),
-                "_h_last7":  recent_form.get("h_last_7", 0),
-                "_ab_last7": recent_form.get("ab_last_7", 0),
-                "sub_bvp": round(bvp_sc, 1),
-                "bvp_label": bvp_label,
-                "bvp_sig": bvp_sig,         # 'owns'/'edge'/'neutral'/'fade'/'dominated'/'no_data'
-                "bvp_ab": bvp_data.get("ab", 0),
-                "bvp_slg": bvp_data.get("slg"),
-                "bvp_hr": bvp_data.get("hr", 0),
-                "bvp_xbh": bvp_data.get("xbh", 0),
-                "sp_id": sp_id,
-                "sub_platoon": round(plat_score, 1),
-                "sub_lineup": round(lineup_sc, 1),
-                "sub_park": round(park_sc, 1),
-                "sub_weather": round(weather_sc, 1),
-                "sub_vegas": round(vegas_sc, 1),
-                "bullpen_vuln": round(bp_vuln, 1),
-                "platoon_edge": plat_label,
-                "bat_speed":    batter_statcast.get("bat_speed", 0),
-                "blast_rate":   batter_statcast.get("blast_rate", 0),
-                "ev50":         batter_statcast.get("ev50", 0),
-                "sprint_speed": batter_statcast.get("sprint_speed", 0),
-                "temperature": weather.get("temperature", 70),
-                "wind_speed": weather.get("wind_speed", 0),
-                "wind_dir": weather.get("wind_dir_label", ""),
-                "wind_effect": weather.get("wind_effect", "neutral"),
-                "is_dome": weather.get("is_dome", False),
-                # V1.9: pitcher K signals for K Props tab
-                "_pitcher_k_rate": _pitcher_k_rate,
-                "_pitcher_swstr":  _pitcher_swstr,
-            })
+            result = _score_one_batter_pure(
+                name=name,
+                player_id=player_id,
+                team=team,
+                opponent=batter.get("opponent", "?"),
+                game_pk=str(game_pk),
+                batter_hand=batter_hand,
+                hand_real=hand_real,
+                sp_hand=sp_hand,
+                sp_name=sp_name,
+                sp_id=sp_id,
+                lineup_slot=lineup_slot,
+                lineup_confirmed=batter.get("lineup_confirmed", True),
+                batter_position=batter.get("position", ""),
+                park_team=park_team,
+                batter_stats=batter_statcast,
+                pitcher_stats=pitcher_statcast,
+                recent_form=recent_form,
+                bvp_data=bvp_data,
+                weather=weather,
+                implied=implied,
+                prop_implied=prop_implied,
+                team_bullpen_scores=team_bullpen_scores,
+                proxy_mode=_proxy_mode,
+            )
+            # game_total requires both sides' implied — set it here in the orchestrator
+            result["game_total"] = round(
+                implied_totals.get(home_team, 4.7) + implied_totals.get(away_team, 4.3), 1
+            )
+            results.append(result)
             total_batters += 1
 
         log(f"  ✅ {away_team}@{home_team} done — {len(all_batters)} batters scored")
@@ -4328,530 +4345,15 @@ def build_parlays(
     plays: List[Dict],
     num_legs: int = 3,
     max_same_team: int = 2,
-    min_score: float = 70.0
+    min_score: float = 70.0,
 ) -> List[Dict]:
-    """
-    Build optimal parlays from eligible plays.
-    Prioritizes: high score, different teams/games, Tier 1 anchors.
-    """
-    eligible = [p for p in plays if p["score"] >= min_score and not p["sp_tbd"]]
-    
-    if len(eligible) < num_legs:
-        return []
-    
-    best_parlays = []
-    
-    for combo in combinations(eligible[:20], num_legs):  # Limit combos for performance
-        # Check team diversity
-        teams = [p["team"] for p in combo]
-        games = [p["game_id"] for p in combo]
-        
-        team_counts = {}
-        for t in teams:
-            team_counts[t] = team_counts.get(t, 0) + 1
-        
-        if max(team_counts.values()) > max_same_team:
-            continue
-        
-        # Calculate combined probability (assume independence + small correlation discount)
-        probs = [p["prob"] for p in combo]
-        
-        # Correlation discount: same game = 0.95, same team = 0.90
-        corr_factor = 1.0
-        for i in range(len(combo)):
-            for j in range(i+1, len(combo)):
-                if combo[i]["team"] == combo[j]["team"]:
-                    corr_factor *= 0.90
-                elif combo[i]["game_id"] == combo[j]["game_id"]:
-                    corr_factor *= 0.95
-        
-        combined_raw = 1.0
-        for p in probs:
-            combined_raw *= p
-        combined_prob = combined_raw * corr_factor
-        
-        # Fair payout (decimal odds)
-        fair_payout = 1.0 / combined_prob if combined_prob > 0 else 999
-        
-        # Implied market odds (assuming -115 per leg)
-        market_prob_per_leg = 0.535  # -115 American = 53.5% implied
-        market_combined = market_prob_per_leg ** num_legs
-        
-        # EV estimate
-        ev = (combined_prob * fair_payout) - 1.0
-        
-        avg_score = sum(p["score"] for p in combo) / num_legs
-        min_score_combo = min(p["score"] for p in combo)
-        
-        parlay = {
-            "players": [p["name"] for p in combo],
-            "teams": teams,
-            "games": list(set(games)),
-            "num_legs": num_legs,
-            "combined_prob": round(combined_prob * 100, 1),
-            "combined_prob_raw": round(combined_raw * 100, 1),
-            "fair_payout": round(fair_payout, 2),
-            "ev": round(ev * 100, 1),
-            "avg_score": round(avg_score, 1),
-            "min_score": round(min_score_combo, 1),
-            "corr_factor": round(corr_factor, 3),
-            "combo": combo,
-            "notes": "SGP ⭐" if len(set(games)) == 1 else f"{len(set(games))} games",
-        }
-        best_parlays.append(parlay)
-    
-    # Sort by combined probability (best model confidence first)
-    best_parlays.sort(key=lambda x: x["combined_prob"], reverse=True)
-    
-    return best_parlays[:10]
+    """Delegates to markets/tb_o15.py — pure logic lives there."""
+    return _build_parlays_pure(plays, num_legs=num_legs,
+                               max_same_team=max_same_team, min_score=min_score)
 
 # ============================================================================
 # DISPLAY FUNCTIONS
 # ============================================================================
-
-def display_leaderboard(plays: List[Dict]):
-    """Display the full ranked leaderboard with tier color coding."""
-    
-    if not plays:
-        st.info("No scored plays available. Run the model first.")
-        return
-
-    # Proxy mode indicator
-    _bat_src_ui = st.session_state.get("_batting_source", "")
-    _is_proxy_ui = "mlbapi" in _bat_src_ui or _bat_src_ui in ("mlbapi_only",)
-    if _is_proxy_ui:
-        st.warning("⚠️ **Proxy Data Mode** — Savant unavailable. Using MLB Stats API derived signals. "
-                   "Tier thresholds adjusted −5 pts: Tier 1 ≥75 · Tier 2 ≥65 · Tier 3 ≥55. "
-                   "Scores run ~5-8 pts lower than full-Savant mode.")
-    elif "disk_cache_fresh" in _bat_src_ui:
-        st.info("💾 Serving from fresh disk cache — full Savant column set, normal thresholds.")
-
-    # BvP "owns" alert — surface elite matchups prominently regardless of tier
-    bvp_owns = [p for p in plays if p.get("bvp_sig") == "owns"]
-    if bvp_owns:
-        owns_names = " · ".join(
-            f"{p['name']} ({p['team']}) {p.get('bvp_label','')}" for p in bvp_owns[:3]
-        )
-        st.error(f"🔥 **OWNS MATCHUP** — elite career dominance vs today's SP: {owns_names}")
-
-    bvp_fades = [p for p in plays if p.get("bvp_sig") in ("fade", "dominated")]
-    if bvp_fades:
-        fade_names = " · ".join(f"{p['name']} ({p['team']})" for p in bvp_fades[:3])
-        st.warning(f"⚠️ **BvP Fades** — career struggles vs today's SP: {fade_names}")
-
-    # Summary metrics
-    tier1 = [p for p in plays if p["tier"] == "🔒 TIER 1"]
-    tier2 = [p for p in plays if p["tier"] == "✅ TIER 2"]
-    tier3 = [p for p in plays if p["tier"] == "📊 TIER 3"]
-    no_play = [p for p in plays if p["tier"] == "❌ NO PLAY"]
-    
-    # Tier summary banner
-    if tier1:
-        st.success(f"🔒 {len(tier1)} TIER 1 PLAYS — Parlay anchors. Don't sleep on these.")
-    elif tier2:
-        st.info(f"✅ {len(tier2)} TIER 2 PLAYS — Solid value, build parlays around these.")
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1: st.metric("🔒 Tier 1", len(tier1))
-    with col2: st.metric("✅ Tier 2", len(tier2))
-    with col3: st.metric("📊 Tier 3", len(tier3))
-    with col4: st.metric("❌ No Play", len(no_play))
-    with col5: st.metric("Total Batters", len(plays))
-    
-    st.markdown("---")
-    
-    # Filters
-    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
-    with col_f1:
-        tier_filter = st.multiselect("Filter by Tier", 
-            ["🔒 TIER 1", "✅ TIER 2", "📊 TIER 3", "❌ NO PLAY"],
-            default=["🔒 TIER 1", "✅ TIER 2", "📊 TIER 3"])
-    with col_f2:
-        teams = sorted(list(set(p["team"] for p in plays)))
-        team_filter = st.multiselect("Filter by Team", teams, default=[])
-    with col_f3:
-        min_score_filter = st.slider("Min Score", 0, 100, 50)
-    with col_f4:
-        hand_filter = st.multiselect("Batter Hand", ["L", "R", "B"], default=[])
-    
-    # Apply filters
-    filtered = plays
-    if tier_filter:
-        filtered = [p for p in filtered if p["tier"] in tier_filter]
-    if team_filter:
-        filtered = [p for p in filtered if p["team"] in team_filter]
-    if min_score_filter > 0:
-        filtered = [p for p in filtered if p["score"] >= min_score_filter]
-    if hand_filter:
-        filtered = [p for p in filtered if p["batter_hand"] in hand_filter]
-    
-    st.markdown(f"**Showing {len(filtered)} batters**")
-    
-    # Build display dataframe
-    rows = []
-    for p in filtered:
-        tier_emoji = p["tier"].split()[0]
-        
-        # Color-coded score
-        score_display = f"{p['score']:.0f}"
-        
-        wind_icon = ""
-        if p.get("wind_effect") == "strong_out":
-            wind_icon = "💨⬆️"
-        elif p.get("wind_effect") == "out":
-            wind_icon = "💨"
-        elif p.get("wind_effect") == "in":
-            wind_icon = "💨⬇️"
-        elif p.get("is_dome"):
-            wind_icon = "🏟️"
-        
-        tbd_flag = " ⚠️TBD" if p.get("sp_tbd") else ""
-        
-        rows.append({
-            "Score": score_display,
-            "Tier": p["tier"],
-            "Player": p["name"],
-            "Team": p["team"],
-            "Vs": p["opponent"],
-            "Slot": f"#{p['lineup_slot']}",
-            "Hand": p["batter_hand"],
-            "Opp SP": p["sp_name"][:20] + tbd_flag,
-            "SP 🤚": p["sp_hand"],
-            "Prob": f"{p['prob']*100:.0f}%",
-            "Edge": f"{p.get('market_edge', 0):+.0f}%" if p.get('implied_total', 0) > 0 else "—",
-            "xSLG": f"{p['xslg']:.3f}" if p["xslg"] else "—",
-            "Barrel%": f"{p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "—",
-            "HH%": f"{p['hard_hit_rate']*100:.1f}%" if p["hard_hit_rate"] else "—",
-            "K%": f"{p['k_rate']*100:.1f}%" if p["k_rate"] else "—",
-            "Platoon": p["platoon_label"].split("(")[0].strip(),
-            "Form 🔥": p.get("streak_label", "—").replace("Form: ", ""),
-            "BvP★": "🔥 OWNS" if p.get("bvp_sig") == "owns"
-                    else "🟢 Edge" if p.get("bvp_sig") == "edge"
-                    else "🔴 Fade" if p.get("bvp_sig") == "fade"
-                    else "⚠️ Dom'd" if p.get("bvp_sig") == "dominated"
-                    else "—",
-            "BvP Stats": p.get("bvp_label", "—").replace("BvP: ", ""),
-            "Park": p["park"],
-            f"Wind{wind_icon}": p["weather_label"].split("|")[0].strip() if "|" in p["weather_label"] else p["weather_label"],
-            "°F": f"{p['temperature']:.0f}°",
-            "Imp.Runs": f"{p['implied_total']:.1f}" if p.get('implied_total', 0) > 0 else "—",
-            "HR Score": f"{p['hr_score']:.0f}",
-        })
-    
-    if rows:
-        df = pd.DataFrame(rows)
-        
-        # Color code by tier
-        def color_tier(val):
-            if "TIER 1" in str(val) or "🔒" in str(val):
-                return "color: #00ff88; font-weight: bold"
-            elif "TIER 2" in str(val) or "✅" in str(val):
-                return "color: #ffdd00; font-weight: bold"
-            elif "TIER 3" in str(val) or "📊" in str(val):
-                return "color: #ff8800; font-weight: bold"
-            return "color: #888888"
-        
-        def color_score(val):
-            try:
-                v = float(str(val))
-                if v >= 80: return "color: #00ff88; font-weight: bold"
-                elif v >= 70: return "color: #ffdd00; font-weight: bold"
-                elif v >= 60: return "color: #ff8800"
-                return "color: #888888"
-            except:
-                return ""
-
-        def color_edge(val):
-            try:
-                v = float(str(val).replace("%","").replace("+",""))
-                if v >= 10: return "color: #00ff88; font-weight: bold"   # strong positive = green
-                elif v >= 5: return "color: #66dd88; font-weight: bold"  # moderate positive = light green
-                elif v >= 0: return "color: #ffdd00"                     # thin edge = yellow
-                return "color: #ff4444"                                  # negative edge = red
-            except:
-                return ""
-
-        def color_form(val):
-            v = str(val)
-            if "🔥" in v or "Hot" in v:   return "color: #ff8800; font-weight: bold"
-            if "❄️" in v or "Cold" in v:  return "color: #88aaff"
-            return ""
-
-        def color_bvp(val):
-            v = str(val)
-            if "🔥" in v or "OWNS" in v:  return "color: #ff6600; font-weight: bold; font-size: 1.05em"
-            if "🟢" in v or "Edge" in v:  return "color: #00ff88; font-weight: bold"
-            if "🔴" in v or "Fade" in v:  return "color: #ff4444; font-weight: bold"
-            if "⚠️" in v or "Dom" in v:   return "color: #ffaa00; font-weight: bold"
-            return ""
-
-        styled = df.style.map(color_tier, subset=["Tier"]).map(color_score, subset=["Score"])
-        if "Edge" in df.columns:
-            styled = styled.map(color_edge, subset=["Edge"])
-        if "Form 🔥" in df.columns:
-            styled = styled.map(color_form, subset=["Form 🔥"])
-        if "BvP Stats" in df.columns:
-            styled = styled.map(color_bvp, subset=["BvP Stats"])
-        if "BvP★" in df.columns:
-            styled = styled.map(color_bvp, subset=["BvP★"])
-        st.dataframe(styled, use_container_width=True, height=500)
-        
-        # Export button
-        csv = df.to_csv(index=False)
-        st.download_button("📥 Export CSV", csv, f"mlb_tb_picks_{datetime.now(EST).strftime('%Y%m%d')}.csv", "text/csv")
-    
-    # ── 🔥 PARLAY TARGETS — Hot + Model convergence ───────────────────────────
-    st.markdown("---")
-    st.subheader("🔥 Parlay Targets — Hot Streak + Model Convergence")
-    st.caption(
-        "Players who score well on BOTH the O1.5 TB model AND the hot streak signal. "
-        "Highest-conviction parlay legs — model confidence backed by real recent form."
-    )
-
-    # Filter: must have real recent form data AND a meaningful model score
-    parlay_candidates = [
-        p for p in (filtered if filtered else plays)
-        if p.get("score", 0) >= 60
-        and p.get("sub_streak", 0) >= 55
-        and p.get("recent_tb_per_game") is not None
-        and p.get("recent_games", 0) >= 3
-    ]
-    # Rank by composite: 60% model score + 40% streak score (model is primary pick driver)
-    parlay_candidates.sort(
-        key=lambda x: x.get("score", 0) * 0.60 + x.get("sub_streak", 0) * 0.40,
-        reverse=True
-    )
-    top_parlay = parlay_candidates[:4]
-
-    if top_parlay:
-        # ── Player cards ──────────────────────────────────────────────────────
-        card_cols = st.columns(min(4, len(top_parlay)))
-        for col, p in zip(card_cols, top_parlay):
-            model_sc  = p.get("score", 0)
-            streak_sc = p.get("sub_streak", 0)
-            tb_pg     = p.get("recent_tb_per_game", 0) or 0
-            prob      = p.get("prob", 0.5)
-            composite = model_sc * 0.60 + streak_sc * 0.40
-
-            # Color by composite strength
-            if composite >= 72:
-                card_color = "#00ff88"; label = "🔥🔥 ELITE"
-            elif composite >= 64:
-                card_color = "#ff8800"; label = "🔥 STRONG"
-            else:
-                card_color = "#ffdd00"; label = "📈 SOLID"
-
-            model_color  = "#00ff88" if model_sc >= 70 else "#ffdd00" if model_sc >= 60 else "#ff8800"
-            streak_color = "#ff4444" if streak_sc >= 70 else "#ff8800" if streak_sc >= 60 else "#ffdd00"
-
-            with col:
-                st.markdown(
-                    f"<div style='background:#1a1a2e;border:2px solid {card_color};"
-                    f"border-radius:12px;padding:14px 12px;text-align:center;margin-bottom:6px'>"
-                    f"<div style='font-size:0.65rem;color:{card_color};font-weight:700;"
-                    f"letter-spacing:0.1em;margin-bottom:4px'>{label}</div>"
-                    f"<div style='font-size:1.05rem;font-weight:800;color:#e0e0ff;margin-bottom:2px'>"
-                    f"{p['name']}</div>"
-                    f"<div style='font-size:0.75rem;color:#9090a8;margin-bottom:10px'>"
-                    f"{p['team']} · #{p.get('lineup_slot','?')} · vs {p.get('sp_name','TBD')[:14]}</div>"
-                    f"<div style='display:flex;justify-content:space-around;margin-bottom:8px'>"
-                    f"<div><div style='font-size:1.4rem;font-weight:900;color:{model_color}'>{model_sc:.0f}</div>"
-                    f"<div style='font-size:0.6rem;color:#888'>MODEL</div></div>"
-                    f"<div style='color:#444;font-size:1.2rem;padding-top:4px'>|</div>"
-                    f"<div><div style='font-size:1.4rem;font-weight:900;color:{streak_color}'>{streak_sc:.0f}</div>"
-                    f"<div style='font-size:0.6rem;color:#888'>STREAK</div></div>"
-                    f"</div>"
-                    f"<div style='font-size:0.75rem;color:#b0b0c8'>"
-                    f"{tb_pg:.2f} TB/g last 7 · {prob*100:.0f}% prob</div>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-
-        # ── Auto-generated parlay strings ─────────────────────────────────────
-        st.markdown("")
-        if len(top_parlay) >= 2:
-            leg2 = top_parlay[:2]
-            leg3 = top_parlay[:3]
-
-            p2_str = " + ".join(f"{p['name']} O1.5 TB" for p in leg2)
-            p3_str = " + ".join(f"{p['name']} O1.5 TB" for p in leg3)
-
-            pcol2, pcol3 = st.columns(2)
-            with pcol2:
-                st.markdown(
-                    f"<div style='background:#0d1a0d;border:1px solid #00cc66;"
-                    f"border-radius:8px;padding:10px 12px'>"
-                    f"<div style='color:#00cc66;font-size:0.7rem;font-weight:700;"
-                    f"letter-spacing:0.1em;margin-bottom:4px'>2-LEG PARLAY</div>"
-                    f"<div style='color:#e0e0e0;font-size:0.85rem;font-weight:600'>{p2_str}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-            with pcol3:
-                if len(top_parlay) >= 3:
-                    st.markdown(
-                        f"<div style='background:#0d1a0d;border:1px solid #00cc66;"
-                        f"border-radius:8px;padding:10px 12px'>"
-                        f"<div style='color:#00cc66;font-size:0.7rem;font-weight:700;"
-                        f"letter-spacing:0.1em;margin-bottom:4px'>3-LEG PARLAY</div>"
-                        f"<div style='color:#e0e0e0;font-size:0.85rem;font-weight:600'>{p3_str}</div>"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
-                else:
-                    st.info("Need 3+ qualifying plays for a 3-leg parlay.")
-    else:
-        st.info(
-            "No plays currently qualify (need Score ≥ 60 + Streak Score ≥ 55 + 3 recent games). "
-            "Run the model once lineups post — streak data requires confirmed lineup slots."
-        )
-
-    # Expandable detail cards for top plays
-    st.markdown("---")
-    st.subheader("🏆 Top Plays — Full Breakdown")
-    
-    top5 = [p for p in filtered if p["score"] >= 60][:5]
-    for i, p in enumerate(top5, 1):
-        tier_color = "#00ff88" if p["tier"] == "🔒 TIER 1" else "#ffdd00" if p["tier"] == "✅ TIER 2" else "#ff8800"
-        
-        with st.expander(f"{p['tier']} #{i}: {p['name']} ({p['team']}) — Score: {p['score']:.0f} | Prob: {p['prob']*100:.0f}%"):
-            col_a, col_b, col_c = st.columns(3)
-            
-            with col_a:
-                st.markdown("**🏏 Batter Profile**")
-                st.write(f"• xSLG: {p['xslg']:.3f}" if p["xslg"] else "• xSLG: Limited data")
-                st.write(f"• Barrel%: {p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "• Barrel%: —")
-                st.write(f"• HardHit%: {p['hard_hit_rate']*100:.1f}%" if p["hard_hit_rate"] else "• HardHit%: —")
-                st.write(f"• K%: {p['k_rate']*100:.1f}%" if p["k_rate"] else "• K%: —")
-                st.write(f"• Exit Velo: {p['exit_velocity']:.1f} mph" if p["exit_velocity"] else "• Exit Velo: —")
-                ev50 = p.get("ev50", 0)
-                st.write(f"• EV50: {ev50:.1f} mph" if ev50 and ev50 > 50 else "• EV50: —")
-                bs = p.get("bat_speed", 0)
-                st.write(f"• Bat Speed: {bs:.1f} mph" if bs and bs > 30 else "• Bat Speed: —")
-                # V1.7: Recent form + BvP
-                streak_lbl = p.get("streak_label", "")
-                if streak_lbl and streak_lbl not in ("Form: no data", "Form: no baseline"):
-                    st.write(f"• {streak_lbl}")
-                bvp_lbl = p.get("bvp_label", "")
-                bvp_sig = p.get("bvp_sig", "no_data")
-                if bvp_lbl and bvp_sig != "no_data":
-                    st.write(f"• {bvp_lbl}")
-                br = p.get("blast_rate", 0)
-                st.write(f"• Blast%: {br*100:.1f}%" if br and br > 0 else "• Blast%: —")
-                st.write(f"• Lineup: {p['lineup_label']}")
-                st.write(f"• Platoon: {p['platoon_label']}")
-            
-            with col_b:
-                st.markdown("**⚾ Pitcher Matchup**")
-                tbd_note = " ⚠️ TBD — score capped at 72" if p["sp_tbd"] else ""
-                st.write(f"• SP: {p['sp_name']}{tbd_note}")
-                st.write(f"• SP Hand: {p['sp_hand']}")
-                st.write(f"• {p['pitcher_label']}")
-                st.markdown("**🌤️ Environment**")
-                st.write(f"• {p['park_label']}")
-                st.write(f"• {p['weather_label']}")
-                st.write(f"• Implied Runs: {p['implied_total']:.1f}")
-            
-            with col_c:
-                st.markdown("**📊 Score Breakdown**")
-                sub_labels = {
-                    "⚾ Pitcher Vuln (30%)": p["sub_pitcher"],
-                    "🏏 Batter (28%)": p["sub_batter"],
-                    "🤚 Platoon (12%)": p["sub_platoon"],
-                    "💰 Vegas (8%)": p["sub_vegas"],
-                    "🏟️ Park (7%)": p["sub_park"],
-                    "📈 Streak (5%)": p.get("sub_streak", 50),
-                    "🔄 TTO (4%)": p.get("sub_tto", 50),
-                    "🌤️ Weather (4%)": p["sub_weather"],
-                    "🎯 Pitch Mix (2%)": p.get("sub_matchup", 50),
-                    "📊 BvP (2%)": p.get("sub_bvp", 50),
-                    "📋 Lineup (1%)": p["sub_lineup"],
-                }
-                matchup_lbl = p.get("matchup_label", "")
-                if matchup_lbl and matchup_lbl != "Pitch mix: avg splits":
-                    st.caption(f"🎯 {matchup_lbl}")
-                for label, val in sub_labels.items():
-                    bar_color = "#00ff88" if val >= 70 else "#ffdd00" if val >= 50 else "#ff4444"
-                    bar_width = int(val)
-                    st.markdown(f"{label}: **{val:.0f}**")
-                    st.markdown(f'<div style="background:#333;border-radius:4px;height:6px;width:100%"><div style="background:{bar_color};width:{bar_width}%;height:6px;border-radius:4px"></div></div>', unsafe_allow_html=True)
-                
-                st.markdown(f"**🎯 Final Score: {p['score']:.0f} ({p['prob']*100:.0f}%)**")
-                st.markdown(f"**💣 HR Score: {p['hr_score']:.0f}**")
-
-
-def display_hr_plays(plays: List[Dict]):
-    """Display top HR upside plays."""
-    
-    st.header("💣 Home Run Plays")
-    st.caption("Top 10 daily HR candidates. Powered by barrel rate, hard hit%, exit velocity, ISO, park factor, wind, and implied total.")
-
-    hr_sorted = sorted(plays, key=lambda x: x["hr_score"], reverse=True)[:10]
-
-    rows = []
-    for p in hr_sorted:
-        wind_label = p.get("weather_label", "").split("|")[0].strip()
-        park_name = STADIUM_COORDS.get(p["park"], (0, 0, p["park"], False))[2]
-        sweet = p.get("sweet_spot_rate", 0)
-
-        rows.append({
-            "HR Score": f"{p['hr_score']:.0f}",
-            "Player": p["name"],
-            "Team": p["team"],
-            "Opp SP": p["sp_name"][:20],
-            "Barrel%": f"{p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "—",
-            "HH%": f"{p['hard_hit_rate']*100:.1f}%" if p.get("hard_hit_rate") else "—",
-            "EV": f"{p.get('exit_velocity', 0):.1f}" if p.get("exit_velocity", 0) > 0 else "—",
-            "ISO": f"{p.get('iso', 0):.3f}" if p.get("iso", 0) > 0 else "—",
-            "Sweet Spot%": f"{sweet*100:.1f}%" if sweet and sweet != 0.305 else "—",
-            "Park HR Factor": f"{PARK_HR_FACTORS.get(p['park'], 1.0):.2f}x",
-            "Park": park_name[:20],
-            "Wind": p.get("wind_dir", "") + f" {p.get('wind_speed', 0):.0f}mph",
-            "Wind Effect": "🔥 Out" if p.get("wind_effect") == "strong_out" else "💨 Out" if p.get("wind_effect") == "out" else "❄️ In" if p.get("wind_effect") == "in" else "🏟️" if p.get("is_dome") else "—",
-            "Imp. Runs": f"{p['implied_total']:.1f}",
-            "TB Score": f"{p['score']:.0f}",
-        })
-    
-    if rows:
-        df = pd.DataFrame(rows)
-        
-        def color_hr(val):
-            try:
-                v = float(val)
-                if v >= 75: return "color: #ff4444; font-weight: bold"
-                elif v >= 60: return "color: #ff8800; font-weight: bold"
-                return ""
-            except:
-                return ""
-        
-        styled = df.style.map(color_hr, subset=["HR Score"])
-        st.dataframe(styled, use_container_width=True)
-    
-    # Top 3 HR plays detailed
-    st.markdown("---")
-    st.subheader("🔥 Top 3 HR Plays — Detail")
-    
-    for i, p in enumerate(hr_sorted[:3], 1):
-        with st.expander(f"#{i}: {p['name']} ({p['team']}) — HR Score: {p['hr_score']:.0f}"):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write(f"**Barrel%:** {p['barrel_rate']*100:.1f}%" if p["barrel_rate"] else "**Barrel%:** —")
-                st.write(f"**Hard Hit%:** {p['hard_hit_rate']*100:.1f}%" if p.get("hard_hit_rate") else "**Hard Hit%:** —")
-                st.write(f"**Exit Velocity:** {p.get('exit_velocity', 0):.1f} mph" if p.get("exit_velocity", 0) > 0 else "**Exit Velocity:** —")
-                st.write(f"**ISO:** {p.get('iso', 0):.3f}" if p.get("iso", 0) > 0 else "**ISO:** —")
-                st.write(f"**Park:** {STADIUM_COORDS.get(p['park'], (0,0,p['park'],False))[2]}")
-                st.write(f"**Park HR Factor:** {PARK_HR_FACTORS.get(p['park'], 1.0):.2f}x")
-            with col2:
-                st.write(f"**Wind:** {p.get('wind_dir', '')} @ {p.get('wind_speed', 0):.0f}mph ({p.get('wind_effect', 'neutral')})")
-                st.write(f"**Temp:** {p['temperature']:.0f}°F")
-                st.write(f"**Implied Runs:** {p['implied_total']:.1f}")
-                st.write(f"**Total Bases Score:** {p['score']:.0f}")
-            
-            # SGP opportunity check
-            if p["score"] >= 60:
-                same_game = [op for op in hr_sorted if op["game_id"] == p["game_id"] and op["name"] != p["name"]]
-                if same_game:
-                    st.success(f"⭐ SGP Opportunity: {p['name']} HR + {same_game[0]['name']} O1.5 TB in same game!")
 
 
 # ============================================================================
@@ -5046,296 +4548,6 @@ def compute_k_score(batter_statcast: Dict, pitcher_statcast: Dict,
     return round(final, 1), label, details
 
 
-def display_k_props_tab(plays: List[Dict], ump_data: Dict):
-    """
-    Tab: ⚡ K Props — PITCHER strikeout prop model (e.g. Crochet O7.5 Ks).
-    Ranks today's starting pitchers by their projected strikeout upside.
-    Score 0-100: HIGH = elite K pitcher in a favorable matchup = bet the OVER on their K prop.
-    
-    Inputs:
-      - SP K% + SwStr% (primary strikeout predictors)
-      - Opposing lineup K% average (how much does this lineup swing and miss)
-      - Umpire zone tendency (k_rate_added)
-      - Game environment (low implied total = pitcher's duel = more Ks)
-      - Innings opportunity (SP projected to go deep vs short hook)
-    """
-    st.header("⚡ K Props — Pitcher Strikeout Model")
-    st.caption(
-        "Ranks today's starters by projected strikeout upside. "
-        "**HIGH score = bet the OVER on that pitcher's K prop.** "
-        "e.g. Garrett Crochet O7.5 Ks, Paul Skenes O6.5 Ks. "
-        "Score 80+ = elite K spot. Inputs: SP K%/SwStr%, opposing lineup K%, umpire zone, game total."
-    )
-
-    if not plays:
-        st.info("Run the model first to see pitcher K prop scores.")
-        return
-
-    pitching_df = st.session_state.get("_pitching_df_global", pd.DataFrame())
-
-    # ── Build one row per unique starting pitcher ─────────────────────────────
-    # Collect games from plays
-    seen_pitchers = {}  # sp_name -> aggregated data
-    for p in plays:
-        sp_name = p.get("sp_name", "TBD")
-        if not sp_name or sp_name == "TBD":
-            continue
-        team = p.get("opponent", "")  # pitcher's team is the opponent of the batter
-        game_id = p.get("game_id", "")
-
-        # Batter K% for this opponent batter (contributes to lineup K avg)
-        batter_k = p.get("k_rate", 0.228) or 0.228
-
-        if sp_name not in seen_pitchers:
-            seen_pitchers[sp_name] = {
-                "sp_name":   sp_name,
-                "sp_team":   team,
-                "sp_hand":   p.get("sp_hand", "R"),
-                "game_id":   game_id,
-                "opp_team":  p.get("team", ""),
-                "_pitcher_k_rate":  p.get("_pitcher_k_rate", 0.228),
-                "_pitcher_swstr":   p.get("_pitcher_swstr", 0.0),
-                "implied_total":    p.get("implied_total", 4.5),
-                "batter_k_list":    [batter_k],
-                "n_batters":        1,
-            }
-        else:
-            seen_pitchers[sp_name]["batter_k_list"].append(batter_k)
-            seen_pitchers[sp_name]["n_batters"] += 1
-
-    if not seen_pitchers:
-        st.warning("No starting pitcher data found. Run the model with confirmed lineups.")
-        return
-
-    # ── Score each pitcher ────────────────────────────────────────────────────
-    pitcher_rows = []
-    for sp_name, d in seen_pitchers.items():
-        pit_k     = d["_pitcher_k_rate"] or 0.228
-        pit_swstr = d["_pitcher_swstr"]  or 0.0
-        opp_k_avg = sum(d["batter_k_list"]) / len(d["batter_k_list"]) if d["batter_k_list"] else 0.228
-        implied   = d["implied_total"] or 4.5
-        n_bat     = d["n_batters"]
-
-        # Umpire adjustment
-        game_pk_int = None
-        try: game_pk_int = int(d["game_id"])
-        except: pass
-        ump_entry = ump_data.get(game_pk_int, {})
-        ump_k_adj = float(ump_entry.get("k_rate_added", 0.0))
-        ump_name  = ump_entry.get("ump_name", "—")
-
-        # ── COMPONENT 1: SP K% (40%) ─────────────────────────────────────────
-        # MLB SP K% range: 14% (soft) → 32% (elite). Avg ~22.8%.
-        # Z-score: avg=50, ±1SD (6pp) = ±25 pts
-        sp_k_score = 50.0 + (pit_k - 0.228) / 0.060 * 25.0
-        sp_k_score = max(0, min(100, sp_k_score))
-
-        # ── COMPONENT 2: SP SwStr% bonus (20%) ────────────────────────────────
-        # SwStr% 11% avg. Elite: 16%+. 
-        # True SwStr% from FanGraphs when available; K%*0.49 proxy otherwise.
-        # Proxy correlation: r≈0.85 with actual SwStr%, error 2-5%.
-        if pit_swstr > 0.02:
-            swstr_score = 50.0 + (pit_swstr - 0.110) / 0.040 * 25.0
-            swstr_score = max(0, min(100, swstr_score))
-        else:
-            swstr_score = 50.0  # true neutral only if proxy also unavailable
-
-        # ── COMPONENT 3: Opposing lineup K% (25%) ────────────────────────────
-        # High opp K% = lineup full of strikeout-prone batters = more Ks for SP
-        opp_k_score = 50.0 + (opp_k_avg - 0.228) / 0.060 * 25.0
-        opp_k_score = max(0, min(100, opp_k_score))
-
-        # ── COMPONENT 4: Game context (15%) ───────────────────────────────────
-        # Low implied total = pitcher's duel → SP goes deeper, more K chances
-        # Umpire zone: tight zone = more Ks
-        if implied <= 3.5:
-            game_score = 75.0   # low-scoring game, pitchers dominate
-        elif implied <= 4.5:
-            game_score = 62.0
-        elif implied <= 5.5:
-            game_score = 50.0
-        else:
-            game_score = 35.0   # high-scoring game, bullpen comes early
-
-        ump_adj = ump_k_adj * 400.0
-        ump_adj = max(-15.0, min(15.0, ump_adj))
-        context_score = max(0, min(100, game_score + ump_adj))
-
-        # ── COMPOSITE ────────────────────────────────────────────────────────
-        raw = (sp_k_score    * 0.40 +
-               swstr_score   * 0.20 +
-               opp_k_score   * 0.25 +
-               context_score * 0.15)
-        final = max(0, min(100, raw))
-
-        # Tier
-        if final >= 80:
-            tier = "⚡ Elite K Spot"
-        elif final >= 70:
-            tier = "🔥 Strong K"
-        elif final >= 60:
-            tier = "📊 Lean K"
-        else:
-            tier = "➖ Skip"
-
-        # Projected K range (rough: elite K SP ~8-9 Ks/9, avg ~6.5)
-        # Use K% * ~27 batters faced (avg ~6IP)
-        proj_bf = 21 if implied <= 4.0 else 18  # fewer BF in high-scoring games
-        proj_ks = round(pit_k * proj_bf, 1)
-
-        pitcher_rows.append({
-            "final":      final,
-            "tier":       tier,
-            "sp_name":    sp_name,
-            "sp_team":    d["sp_team"],
-            "opp_team":   d["opp_team"],
-            "sp_hand":    d["sp_hand"],
-            "pit_k":      pit_k,
-            "pit_swstr":       pit_swstr,
-            "swstr_is_proxy":  d.get("_pitcher_swstr", 0.0) == 0.0,  # True if we used K%*0.49 proxy
-            "opp_k_avg":  opp_k_avg,
-            "implied":    implied,
-            "ump_name":   ump_name,
-            "ump_k_adj":  ump_k_adj * 100,
-            "n_batters":  n_bat,
-            "sp_k_score": sp_k_score,
-            "swstr_score":swstr_score,
-            "opp_k_score":opp_k_score,
-            "ctx_score":  context_score,
-            "proj_ks":    proj_ks,
-        })
-
-    pitcher_rows.sort(key=lambda x: x["final"], reverse=True)
-
-    # ── Summary metrics ──────────────────────────────────────────────────────
-    elite = [r for r in pitcher_rows if r["final"] >= 80]
-    strong= [r for r in pitcher_rows if 70 <= r["final"] < 80]
-    lean  = [r for r in pitcher_rows if 60 <= r["final"] < 70]
-    skip  = [r for r in pitcher_rows if r["final"] < 60]
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("⚡ Elite (80+)",  len(elite))
-    m2.metric("🔥 Strong (70-79)", len(strong))
-    m3.metric("📊 Lean (60-69)", len(lean))
-    m4.metric("➖ Skip",         len(skip))
-    m5.metric("SPs Today",       len(pitcher_rows))
-
-    # ── Ranked pitcher cards ─────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🎯 Pitcher K Prop Rankings")
-    st.caption("Ranked from best K spot to worst. Higher score = bet the OVER on that pitcher's K line.")
-
-    for rank, r in enumerate(pitcher_rows, 1):
-        sc = r["final"]
-        if sc >= 80:
-            border = "#ff4444"; flame = "⚡⚡"
-        elif sc >= 70:
-            border = "#ff8800"; flame = "🔥"
-        elif sc >= 60:
-            border = "#ffdd00"; flame = "📊"
-        else:
-            border = "#444444"; flame = "➖"
-
-        with st.container():
-            c_rank, c_pit, c_stats, c_badge = st.columns([0.4, 2.8, 4.2, 1.4])
-
-            with c_rank:
-                st.markdown(
-                    f"<div style='text-align:center;margin-top:10px'>"
-                    f"<div style='font-size:1.6rem;font-weight:900;color:{border}'>{rank}</div>"
-                    f"<div style='font-size:0.6rem;color:{border}'>{flame}</div></div>",
-                    unsafe_allow_html=True)
-
-            with c_pit:
-                st.markdown(f"**{r['sp_name']}** &nbsp;`{r['sp_team']}`")
-                st.caption(f"vs {r['opp_team']} lineup · {r['sp_hand']}HP")
-                tier_col = "#ff4444" if "Elite" in r["tier"] else "#ff8800" if "Strong" in r["tier"] else "#ffdd00" if "Lean" in r["tier"] else "#666"
-                st.markdown(f"<span style='background:#111;border:1px solid {tier_col};"
-                            f"color:{tier_col};border-radius:5px;padding:1px 8px;"
-                            f"font-size:0.75rem'>{r['tier']}</span>", unsafe_allow_html=True)
-                proj_str = f"Proj Ks: ~{r['proj_ks']:.0f}"
-                st.caption(proj_str)
-
-            with c_stats:
-                pk_pct  = f"{r['pit_k']*100:.1f}%"
-                sw_pct  = f"{r['pit_swstr']*100:.1f}%{'~' if r.get('swstr_is_proxy') else ''}"
-                ok_pct  = f"{r['opp_k_avg']*100:.1f}%"
-                impl    = f"{r['implied']:.1f}" if r["implied"] > 0 else "N/A"
-                ump_s   = f"{r['ump_name']} ({r['ump_k_adj']:+.1f}pp)" if r["ump_name"] != "—" else "—"
-
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.caption(f"**SP K%:** {pk_pct}")
-                    st.caption(f"**SP SwStr%:** {sw_pct}")
-                    st.caption(f"**Umpire:** {ump_s}")
-                with col_b:
-                    st.caption(f"**Opp Lineup K%:** {ok_pct}")
-                    st.caption(f"**Game Total:** {impl}")
-                    st.caption(f"**BFs scored:** {r['n_batters']}/9")
-
-            with c_badge:
-                st.markdown(
-                    f"<div style='text-align:center;background:#1a1a2e;"
-                    f"border:2px solid {border};border-radius:10px;padding:10px 4px;margin-top:4px'>"
-                    f"<div style='font-size:1.6rem;font-weight:900;color:{border}'>{sc:.0f}</div>"
-                    f"<div style='font-size:0.65rem;color:#aaa'>K SCORE</div>"
-                    f"<div style='font-size:0.7rem;color:{border};margin-top:2px'>"
-                    f"~{r['proj_ks']:.0f} Ks</div></div>",
-                    unsafe_allow_html=True)
-
-        st.markdown("<hr style='margin:6px 0;border-color:#2a2a2a'>", unsafe_allow_html=True)
-
-    # ── Full table ────────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📋 Full Pitcher K Table")
-
-    table_rows = []
-    for r in pitcher_rows:
-        table_rows.append({
-            "K Score":        r["final"],
-            "Tier":           r["tier"],
-            "Pitcher":        r["sp_name"],
-            "Team":           r["sp_team"],
-            "Hand":           r["sp_hand"],
-            "vs Lineup":      r["opp_team"],
-            "SP K%":          f"{r['pit_k']*100:.1f}%",
-            "SP SwStr%":      f"{r['pit_swstr']*100:.1f}%{'~' if r.get('swstr_is_proxy') else ''}",
-            "Opp Lineup K%":  f"{r['opp_k_avg']*100:.1f}%",
-            "Game Total":     f"{r['implied']:.1f}" if r["implied"] > 0 else "N/A",
-            "Proj Ks":        f"~{r['proj_ks']:.0f}",
-        })
-
-    df_k = pd.DataFrame(table_rows)
-
-    def color_k_score(val):
-        try:
-            v = float(val)
-            if v >= 80: return "color:#ff4444;font-weight:bold"
-            if v >= 70: return "color:#ff8800;font-weight:bold"
-            if v >= 60: return "color:#ffdd00"
-            return "color:#888888"
-        except: return ""
-
-    def color_k_tier(val):
-        s = str(val)
-        if "Elite" in s: return "color:#ff4444;font-weight:bold"
-        if "Strong" in s: return "color:#ff8800;font-weight:bold"
-        if "Lean" in s:  return "color:#ffdd00"
-        return "color:#888888"
-
-    styled_k = df_k.style.map(color_k_score, subset=["K Score"]).map(color_k_tier, subset=["Tier"])
-    st.dataframe(styled_k, use_container_width=True)
-
-    csv_k = df_k.to_csv(index=False)
-    st.download_button("📥 Export K Props CSV", csv_k, "k_props.csv", "text/csv", key="dl_kprops")
-
-    st.markdown("---")
-    st.caption(
-        "💡 **How to use:** Find pitchers with K Score 70+. "
-        "Cross with their actual posted K prop line (e.g. Crochet -115 O7.5 Ks on HardRock). "
-        "Proj Ks is a rough estimate based on K% × ~18-21 projected batters faced. "
-        "Elite K spots (80+) = high confidence OVER plays."
-    )
 
 
 def compute_k_score_for_play(p: Dict, pitcher_statcast: Dict,
@@ -5716,738 +4928,6 @@ def compute_win_probability(
 # ============================================================================
 # MONEYLINE TAB — Professional ML picker with ranked confidence cards
 # ============================================================================
-def display_moneyline_tab(games: List[Dict], plays: List[Dict],
-                          ml_odds: Dict, run_diffs: Dict,
-                          implied_totals: Dict,
-                          team_bullpen_scores: Dict):
-    """
-    Tab: 🏦 Moneyline
-    Games ranked by ML Confidence Score (0-100).
-    Confidence = edge magnitude + SP quality + lineup data + odds availability.
-    Strong Edge >7% | Lean 4-7% | No Play <4%.
-    """
-    st.header("🏦 Moneyline — Win Probability Model")
-    st.caption(
-        "Log5-style win probability vs Vegas implied odds (vig-removed). "
-        "**Edge = model% minus market%.** Strong Edge >7% · Lean 4-7% · No Play <4%. "
-        "**Confidence score** ranks games by conviction: edge magnitude + SP quality + "
-        "lineup data completeness + odds availability."
-    )
-
-    if not games:
-        st.info("Run the model first to see moneyline analysis.")
-        return
-
-    pitching_df = st.session_state.get("_pitching_df_global", pd.DataFrame())
-
-    # ── Build game rows ──────────────────────────────────────────────────────
-    game_rows = []
-    for game in games:
-        home = game.get("home_team", "")
-        away = game.get("away_team", "")
-        home_sp = game.get("home_pitcher") or "TBD"
-        away_sp = game.get("away_pitcher") or "TBD"
-        home_sp_id = str(game.get("home_pitcher_id") or "")
-        away_sp_id = str(game.get("away_pitcher_id") or "")
-
-        hsr = get_pitcher_stats(home_sp, home_sp_id, pitching_df)
-        asr = get_pitcher_stats(away_sp, away_sp_id, pitching_df)
-
-        hbp = team_bullpen_scores.get(home, 42.0)
-        abp = team_bullpen_scores.get(away, 42.0)
-
-        hv, _ = compute_pitcher_score(hsr, bullpen_vuln=hbp)
-        av, _ = compute_pitcher_score(asr, bullpen_vuln=abp)
-        hsr["_sp_vuln"] = hv; asr["_sp_vuln"] = av
-
-        hwrc, hn = compute_team_offense_score(plays, home)
-        awrc, an = compute_team_offense_score(plays, away)
-
-        hrd = run_diffs.get(home, 0.0)
-        ard = run_diffs.get(away, 0.0)
-
-        hir = implied_totals.get(home, 0.0)
-        air = implied_totals.get(away, 0.0)
-
-        hwp, lbl = compute_win_probability(hsr, asr, hwrc, awrc, hbp, abp, hrd, ard, hir, air)
-        awp = round(1.0 - hwp, 4)
-
-        # Match ML odds
-        ml_key = None
-        for k in ml_odds:
-            parts = k.split("|")
-            if len(parts) == 2:
-                if (_norm(parts[0]) in _norm(game.get("away_team_name", away)) or
-                    _norm(away) in _norm(parts[0])):
-                    ml_key = k; break
-                if (_norm(parts[1]) in _norm(game.get("home_team_name", home)) or
-                    _norm(home) in _norm(parts[1])):
-                    ml_key = k; break
-
-        if ml_key and ml_key in ml_odds:
-            mkt = ml_odds[ml_key]
-            hmkt = mkt["home_implied"]; amkt = mkt["away_implied"]
-            ho_raw = mkt["home_odds"]; ao_raw = mkt["away_odds"]
-            hos = f"{ho_raw:+.0f}"; aos = f"{ao_raw:+.0f}"
-            has_odds = True
-        else:
-            hmkt = amkt = None; ho_raw = ao_raw = None
-            hos = aos = "N/A"; has_odds = False
-
-        hedge = round((hwp - hmkt) * 100, 1) if hmkt is not None else None
-        aedge = round((awp - amkt) * 100, 1) if amkt is not None else None
-
-        # ── Confidence score ─────────────────────────────────────────────────
-        def _conf(side_edge, sp_name, n_bat, sp_vuln, has_o):
-            if side_edge is None or side_edge < 0:
-                return 0.0
-            e_pts  = min(50.0, side_edge / 7.0 * 50.0)
-            sp_pts = max(0.0, min(20.0, (60.0 - sp_vuln) / 60.0 * 20.0))
-            l_pts  = min(15.0, n_bat / 9.0 * 15.0)
-            o_pts  = 10.0 if has_o else 0.0
-            s_pts  = 5.0 if sp_name not in ("TBD", "", None) else 0.0
-            return round(min(100.0, e_pts + sp_pts + l_pts + o_pts + s_pts), 1)
-
-        hconf = _conf(hedge, home_sp, hn, hsr.get("_sp_vuln", 50), has_odds)
-        aconf = _conf(aedge, away_sp, an, asr.get("_sp_vuln", 50), has_odds)
-
-        # Best pick
-        if hedge is not None and aedge is not None:
-            if hedge >= 4 and hedge >= aedge:
-                pick = home; pedge = hedge; pconf = hconf
-                pwp = hwp; pods = hos; pmkt = hmkt
-                psp = home_sp; osp = away_sp; pop_vuln = hv
-            elif aedge >= 4 and aedge > hedge:
-                pick = away; pedge = aedge; pconf = aconf
-                pwp = awp; pods = aos; pmkt = amkt
-                psp = away_sp; osp = home_sp; pop_vuln = av
-            else:
-                pick = None; pedge = max(hedge or 0, aedge or 0)
-                pconf = 0; pwp = None; pods = "—"; pmkt = None
-                psp = "—"; osp = "—"; pop_vuln = 50
-        else:
-            pick = None; pedge = 0; pconf = 0
-            pwp = None; pods = "—"; pmkt = None
-            psp = "—"; osp = "—"; pop_vuln = 50
-
-        if pick and pedge >= 7:
-            ptier = "🔥 Strong Edge"
-        elif pick and pedge >= 4:
-            ptier = "📊 Lean"
-        else:
-            ptier = "➖ No Play"
-
-        game_rows.append({
-            "matchup": f"{away} @ {home}", "away": away, "home": home,
-            "home_sp": home_sp, "away_sp": away_sp,
-            "hwp": hwp, "awp": awp, "hmkt": hmkt, "amkt": amkt,
-            "hedge": hedge, "aedge": aedge,
-            "hos": hos, "aos": aos, "ho_raw": ho_raw, "ao_raw": ao_raw,
-            "hconf": hconf, "aconf": aconf,
-            "pick": pick, "pedge": pedge, "pconf": pconf,
-            "ptier": ptier, "pwp": pwp, "pods": pods, "pmkt": pmkt,
-            "psp": psp, "osp": osp,
-            "hn": hn, "an": an, "hrd": hrd, "ard": ard,
-            "hwrc": hwrc, "awrc": awrc,
-            "hv": hv, "av": av, "hbp": hbp, "abp": abp,
-            "has_odds": has_odds, "lbl": lbl,
-        })
-
-    if not game_rows:
-        st.warning("No games to display.")
-        return
-
-    game_rows.sort(key=lambda x: (x["pconf"], x["pedge"] or 0), reverse=True)
-
-    # ── Summary metrics ──────────────────────────────────────────────────────
-    strong = [r for r in game_rows if r["ptier"] == "🔥 Strong Edge"]
-    lean   = [r for r in game_rows if r["ptier"] == "📊 Lean"]
-    nop    = [r for r in game_rows if r["ptier"] == "➖ No Play"]
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Games",              len(game_rows))
-    m2.metric("🔥 Strong Edge",    len(strong))
-    m3.metric("📊 Lean",           len(lean))
-    m4.metric("➖ No Play",        len(nop))
-
-    if not any(r["has_odds"] for r in game_rows):
-        st.warning("⚠️ No Odds API key — edge = N/A. Add key in sidebar for full model.")
-
-    # ── Ranked pick cards ────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🏆 ML Picks — Ranked by Confidence")
-    st.caption("Games ranked by Confidence Score (0-100). "
-               "Confidence = edge magnitude (50%) + SP quality (20%) + "
-               "lineup data (15%) + odds loaded (10%) + SP known (5%).")
-
-    for rank, r in enumerate(game_rows, 1):
-        tier = r["ptier"]; conf = r["pconf"]
-        if "Strong" in tier:
-            border = "#00ff88"; rank_col = "#00ff88"
-        elif "Lean" in tier:
-            border = "#ffdd00"; rank_col = "#ffdd00"
-        else:
-            border = "#444444"; rank_col = "#666666"
-
-        with st.container():
-            c_rank, c_pick, c_probs, c_conf = st.columns([0.5, 3.0, 4.0, 1.5])
-
-            with c_rank:
-                st.markdown(
-                    f"<div style='text-align:center;margin-top:8px'>"
-                    f"<div style='font-size:1.6rem;font-weight:900;color:{rank_col}'>{rank}</div>"
-                    f"<div style='font-size:0.6rem;color:#666'>RANK</div></div>",
-                    unsafe_allow_html=True)
-
-            with c_pick:
-                st.markdown(f"**{r['matchup']}**")
-                if r["pick"]:
-                    e_str = f"+{r['pedge']:.1f}%" if r["pedge"] > 0 else f"{r['pedge']:.1f}%"
-                    odds_str = r["pods"] if r["pods"] != "—" else "N/A (no odds loaded)"
-                    st.markdown(
-                        f"<span style='color:{border};font-weight:bold;font-size:1.05rem'>"
-                        f"✅ {r['pick']} {odds_str}</span> &nbsp;"
-                        f"<span style='color:{border}'>Edge: {e_str}</span>",
-                        unsafe_allow_html=True)
-                    st.caption(f"SP: {r['psp'][:22]}  ·  Opp SP: {r['osp'][:22]}")
-                else:
-                    st.markdown("<span style='color:#666'>➖ No Play — edge below threshold</span>",
-                                unsafe_allow_html=True)
-                    st.caption(f"Home SP: {r['home_sp']}  ·  Away SP: {r['away_sp']}")
-                tier_c = "#00ff88" if "Strong" in tier else "#ffdd00" if "Lean" in tier else "#666"
-                st.markdown(f"<span style='background:#111;border:1px solid {tier_c};"
-                            f"color:{tier_c};border-radius:5px;padding:1px 8px;"
-                            f"font-size:0.75rem'>{tier}</span>", unsafe_allow_html=True)
-
-            with c_probs:
-                h = r["home"]; a = r["away"]
-                hm_s = f"{r['hmkt']*100:.1f}%" if r["hmkt"] else "N/A"
-                am_s = f"{r['amkt']*100:.1f}%" if r["amkt"] else "N/A"
-                he_s = f"{r['hedge']:+.1f}%" if r["hedge"] is not None else "N/A"
-                ae_s = f"{r['aedge']:+.1f}%" if r["aedge"] is not None else "N/A"
-                st.caption(
-                    f"**{h}**: Model {r['hwp']*100:.1f}% · Mkt {hm_s} · Edge {he_s} · "
-                    f"SP vuln {r['hv']:.0f} · wRC+ {r['hwrc']:.0f} · {r['hn']}bat")
-                st.caption(
-                    f"**{a}**: Model {r['awp']*100:.1f}% · Mkt {am_s} · Edge {ae_s} · "
-                    f"SP vuln {r['av']:.0f} · wRC+ {r['awrc']:.0f} · {r['an']}bat")
-                st.caption(
-                    f"7d RunDiff: {h} {r['hrd']:+.1f} / {a} {r['ard']:+.1f} · "
-                    f"Bullpen vuln: {h} {r['hbp']:.0f} / {a} {r['abp']:.0f}")
-
-            with c_conf:
-                cc = "#00ff88" if conf >= 60 else "#ffdd00" if conf >= 35 else "#666"
-                st.markdown(
-                    f"<div style='text-align:center;background:#1a1a2e;"
-                    f"border:2px solid {cc};border-radius:10px;padding:10px 4px'>"
-                    f"<div style='font-size:1.5rem;font-weight:900;color:{cc}'>{conf:.0f}</div>"
-                    f"<div style='font-size:0.6rem;color:#aaa'>CONF</div></div>",
-                    unsafe_allow_html=True)
-
-        st.markdown("<hr style='margin:6px 0;border-color:#2a2a2a'>", unsafe_allow_html=True)
-
-    # ── Full table ────────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📋 Full Games Table")
-
-    tbl = []
-    for r in game_rows:
-        tbl.append({
-            "Rank":     game_rows.index(r) + 1,
-            "Matchup":  r["matchup"],
-            "Pick":     f"{r['pick']} ({r['ptier']})" if r["pick"] else "➖ No Play",
-            "Conf":     r["pconf"],
-            "Away Mdl": f"{r['awp']*100:.1f}%",
-            "Home Mdl": f"{r['hwp']*100:.1f}%",
-            "Away Mkt": f"{r['amkt']*100:.1f}%" if r["amkt"] else "N/A",
-            "Home Mkt": f"{r['hmkt']*100:.1f}%" if r["hmkt"] else "N/A",
-            "Away Odds":r["aos"], "Home Odds": r["hos"],
-            "Away Edge":f"{r['aedge']:+.1f}%" if r["aedge"] is not None else "N/A",
-            "Home Edge":f"{r['hedge']:+.1f}%" if r["hedge"] is not None else "N/A",
-            "Away SP":  r["away_sp"][:18], "Home SP": r["home_sp"][:18],
-        })
-
-    df_ml = pd.DataFrame(tbl)
-
-    def _cp(val):
-        s = str(val)
-        if "Strong" in s: return "color:#00ff88;font-weight:bold"
-        if "Lean" in s:   return "color:#ffdd00"
-        return "color:#888888"
-
-    def _ce(val):
-        try:
-            v = float(str(val).replace("%","").replace("+",""))
-            if v >= 7:  return "color:#00ff88;font-weight:bold"
-            if v >= 4:  return "color:#ffdd00"
-            if v <= -4: return "color:#ff4444"
-        except: pass
-        return ""
-
-    def _cc(val):
-        try:
-            v = float(val)
-            if v >= 60: return "color:#00ff88;font-weight:bold"
-            if v >= 35: return "color:#ffdd00"
-        except: pass
-        return "color:#888888"
-
-    ecols = [c for c in df_ml.columns if "Edge" in c]
-    s = df_ml.style.map(_cp, subset=["Pick"]).map(_cc, subset=["Conf"])
-    for ec in ecols:
-        s = s.map(_ce, subset=[ec])
-    st.dataframe(s, use_container_width=True)
-    csv = df_ml.to_csv(index=False)
-    st.download_button("📥 Export Moneyline CSV", csv, "moneyline.csv", "text/csv", key="dl_ml")
-
-    if not any(r["has_odds"] for r in game_rows):
-        st.warning("⚠️ Add Odds API key in sidebar for edge calculation.")
-
-
-def display_hot_streaks_tab(plays: List[Dict]):
-    """
-    Tab: 🔥 Hot Streaks
-    Ranks the top 10 hottest batters by recent form score and TB/game.
-    Shows streak label, recent TB/game vs season baseline, HR pace, and
-    the model score so hot batters can be cross-referenced against today's lineup.
-    """
-    st.header("🔥 Hot Streaks — Top Batters in Form")
-    st.caption(
-        "Top batters ranked by recent performance (last 7 games). "
-        "TB/g = total bases per game over last 7. "
-        "🔥 Hot = recent TB/g is 20%+ above season baseline. "
-        "Cold or no-data batters are excluded."
-    )
-
-    if not plays:
-        st.info("Run the model first to see streak data.")
-        return
-
-    # ── Build streak-ranked list ──────────────────────────────────────────────
-    streak_plays = []
-    for p in plays:
-        streak_label = p.get("streak_label", "")
-        sub_streak   = p.get("sub_streak", 50.0)
-        tb_pg        = p.get("recent_tb_per_game")
-        recent_games = p.get("recent_games", 0)
-
-        # Only include batters with real recent data and a hot/neutral signal
-        # Exclude: no data, cold (sub_streak < 40), and < 3 game samples
-        if tb_pg is None or recent_games < 3:
-            continue
-        if sub_streak < 40:
-            continue
-
-        # Derive season TB expectation from xSLG proxy (same as model)
-        season_slg = p.get("xslg", 0.398) or 0.398
-        season_exp = season_slg * 3.7  # TB/game estimate from SLG (consistent with compute_streak_score)
-        pct_above  = ((tb_pg / season_exp) - 1.0) * 100 if season_exp > 0 else 0.0
-
-        streak_plays.append({
-            "name":          p["name"],
-            "team":          p["team"],
-            "opponent":      p.get("opponent", ""),
-            "sp_name":       p.get("sp_name", "TBD"),
-            "sp_hand":       p.get("sp_hand", "R"),
-            "batter_hand":   p.get("batter_hand", "R"),
-            "lineup_slot":   p.get("lineup_slot", 9),
-            "sub_streak":    sub_streak,
-            "tb_per_game":   tb_pg,
-            "recent_games":  recent_games,
-            "season_exp":    round(season_exp, 2),
-            "pct_above":     round(pct_above, 1),
-            "streak_label":  streak_label,
-            "hr_last_7":     p.get("_hr_last7", 0),
-            "h_last_7":      p.get("_h_last7", 0),
-            "ab_last_7":     p.get("_ab_last7", 0),
-            "model_score":   p.get("score", 0),
-            "tier":          p.get("tier", "❌ NO PLAY"),
-            "barrel_rate":   p.get("barrel_rate", 0),
-            "hard_hit_rate": p.get("hard_hit_rate", 0),
-            "bvp_sig":       p.get("bvp_sig", ""),
-            "bvp_label":     p.get("bvp_label", ""),
-            "hr_score":      p.get("hr_score", 0),
-            "prob":          p.get("prob", 0),
-        })
-
-    # Sort: composite of streak score (50%) + absolute TB/g (50%)
-    # TB/g normalized: 3.0+ TB/g = 100, 0.5 TB/g = 0
-    # This prevents a barely-above-baseline player outranking a genuinely hot elite hitter
-    def streak_composite(p):
-        streak_sc  = p["sub_streak"]
-        tb_norm    = min(100, max(0, (p["tb_per_game"] - 0.5) / (3.5 - 0.5) * 100))
-        return streak_sc * 0.50 + tb_norm * 0.50
-    streak_plays.sort(key=streak_composite, reverse=True)
-
-    if not streak_plays:
-        st.info("No recent form data available — lineups may not be confirmed yet, "
-                "or no batters have 3+ recent games loaded.")
-        return
-
-    top10 = streak_plays[:10]
-    cold_count = len([p for p in plays if p.get("sub_streak", 50) < 40 and p.get("recent_tb_per_game") is not None])
-
-    # ── Summary metrics ───────────────────────────────────────────────────────
-    blazing = [p for p in streak_plays if p["sub_streak"] >= 70]
-    hot     = [p for p in streak_plays if 60 <= p["sub_streak"] < 70]
-    warm    = [p for p in streak_plays if 50 <= p["sub_streak"] < 60]
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("🔥🔥 Blazing (70+)", len(blazing))
-    m2.metric("🔥 Hot (60-69)",     len(hot))
-    m3.metric("📈 Warm (50-59)",    len(warm))
-    m4.metric("❄️ Cold (faded)",    cold_count)
-
-    st.markdown("---")
-    st.subheader(f"🏆 Top {len(top10)} Batters in Form")
-
-    # ── Ranked streak cards ───────────────────────────────────────────────────
-    for rank, p in enumerate(top10, 1):
-        score     = p["sub_streak"]
-        tb_pg     = p["tb_per_game"]
-        pct_above = p["pct_above"]
-
-        # Color by streak intensity
-        if score >= 70:
-            border = "#ff4444"; flame = "🔥🔥"; heat_label = "BLAZING"
-        elif score >= 60:
-            border = "#ff8800"; flame = "🔥"; heat_label = "HOT"
-        else:
-            border = "#ffdd00"; flame = "📈"; heat_label = "WARM"
-
-        # Tier color for model score badge
-        model_sc = p["model_score"]
-        if model_sc >= 80:
-            tier_color = "#00ff88"
-        elif model_sc >= 70:
-            tier_color = "#ffdd00"
-        elif model_sc >= 60:
-            tier_color = "#ff8800"
-        else:
-            tier_color = "#666666"
-
-        with st.container():
-            col_rank, col_player, col_streak, col_context, col_badges = st.columns([0.4, 2.2, 2.6, 2.6, 1.6])
-
-            with col_rank:
-                st.markdown(
-                    f"<div style='text-align:center;margin-top:8px'>"
-                    f"<div style='font-size:1.6rem;font-weight:900;color:{border}'>{rank}</div>"
-                    f"<div style='font-size:0.65rem;color:{border};font-weight:bold'>{heat_label}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True)
-
-            with col_player:
-                st.markdown(f"**{p['name']}** &nbsp;`{p['team']}`")
-                vs_str = f"vs {p['opponent']}" if p["opponent"] else ""
-                sp_str = f"· {p['sp_name'][:20]} ({p['sp_hand']}HP)" if p["sp_name"] not in ("TBD","") else "· SP TBD"
-                st.caption(f"#{p['lineup_slot']} · {p['batter_hand']}HB {vs_str} {sp_str}")
-                # BvP note if relevant
-                bvp = p.get("bvp_sig", "")
-                if bvp == "owns":
-                    st.caption("🔥 OWNS this pitcher career")
-                elif bvp == "edge":
-                    st.caption("🟢 Edge vs this pitcher")
-                elif bvp == "dominated":
-                    st.caption("⚠️ Dominated by this pitcher")
-
-            with col_streak:
-                # TB/game progress vs baseline
-                bl = p["season_exp"]
-                bar_pct = min(100, int(tb_pg / max(bl, 0.1) * 60))
-                pct_str = f"+{pct_above:.0f}% above baseline" if pct_above >= 0 else f"{pct_above:.0f}% below"
-                color_bar = border
-
-                st.markdown(f"{flame} **{tb_pg:.2f} TB/g** last {p['recent_games']}g")
-                st.markdown(
-                    f"<div style='font-size:0.75rem;color:#aaa;margin-bottom:2px'>"
-                    f"Baseline: {bl:.2f} · {pct_str}</div>"
-                    f"<div style='background:#333;border-radius:4px;height:6px;width:100%'>"
-                    f"<div style='background:{color_bar};width:{bar_pct}%;height:6px;border-radius:4px'>"
-                    f"</div></div>",
-                    unsafe_allow_html=True)
-                st.markdown(" ")
-                # Hitting line
-                h7  = p["h_last_7"]
-                ab7 = p["ab_last_7"]
-                hr7 = p["hr_last_7"]
-                avg7 = f"{h7/ab7:.3f}" if ab7 > 0 else "—"
-                hr_str = f" · {hr7}HR" if hr7 > 0 else ""
-                st.caption(f"Last {p['recent_games']}g line: {h7}/{ab7} ({avg7}){hr_str}")
-
-            with col_context:
-                # Contact quality + today's matchup context
-                barrel = p["barrel_rate"] * 100
-                hh = p["hard_hit_rate"] * 100
-                st.caption(f"**Barrel%:** {barrel:.1f}%  |  **HH%:** {hh:.1f}%")
-                st.caption(f"**HR Score:** {p['hr_score']:.0f}/100  |  **O1.5 Prob:** {p['prob']*100:.0f}%")
-                # Streak label cleaned
-                lbl = p["streak_label"].replace("Form: ", "").replace("🔥 Hot", "").replace("❄️ Cold", "").strip()
-                if lbl:
-                    st.caption(lbl)
-
-            with col_badges:
-                # Model score badge
-                st.markdown(
-                    f"<div style='text-align:center;background:#1a1a2e;"
-                    f"border:2px solid {tier_color};border-radius:10px;padding:6px 2px;margin-bottom:4px'>"
-                    f"<div style='font-size:1.2rem;font-weight:900;color:{tier_color}'>{model_sc:.0f}</div>"
-                    f"<div style='font-size:0.6rem;color:#aaa'>MODEL</div></div>",
-                    unsafe_allow_html=True)
-                # Streak score badge
-                st.markdown(
-                    f"<div style='text-align:center;background:#1a1a2e;"
-                    f"border:2px solid {border};border-radius:10px;padding:6px 2px'>"
-                    f"<div style='font-size:1.2rem;font-weight:900;color:{border}'>{score:.0f}</div>"
-                    f"<div style='font-size:0.6rem;color:#aaa'>STREAK</div></div>",
-                    unsafe_allow_html=True)
-
-        st.markdown("<hr style='margin:6px 0;border-color:#2a2a2a'>", unsafe_allow_html=True)
-
-    # ── Full streaks table ────────────────────────────────────────────────────
-    if len(streak_plays) > 10:
-        st.markdown("---")
-        with st.expander(f"📋 Full Streak Rankings ({len(streak_plays)} batters with recent data)"):
-            full_rows = []
-            for i, p in enumerate(streak_plays, 1):
-                h7 = p["h_last_7"]; ab7 = p["ab_last_7"]; hr7 = p["hr_last_7"]
-                platoon_str = (
-                    "LHB" if p["batter_hand"] == "L"
-                    else "Switch" if p["batter_hand"] == "S"
-                    else "RHB"
-                ) + " vs " + p["sp_hand"] + "HP"
-                full_rows.append({
-                    "Rank":         i,
-                    "Player":       p["name"],
-                    "Hand":         p["batter_hand"],
-                    "Team":         p["team"],
-                    "Streak Score": p["sub_streak"],
-                    "TB/g (last7)": f"{p['tb_per_game']:.2f}",
-                    "vs Baseline":  f"{p['pct_above']:+.0f}%",
-                    "Hitting Line": f"{h7}/{ab7}" + (f" {hr7}HR" if hr7 else ""),
-                    "Games":        p["recent_games"],
-                    "Model Score":  p["model_score"],
-                    "Tier":         p["tier"],
-                    "Platoon":      platoon_str,
-                    "vs":           p["opponent"],
-                    "Opp SP":       p["sp_name"][:18],
-                })
-            df_str = pd.DataFrame(full_rows)
-
-            def color_streak_sc(val):
-                try:
-                    v = float(val)
-                    if v >= 70: return "color:#ff4444;font-weight:bold"
-                    if v >= 60: return "color:#ff8800;font-weight:bold"
-                    if v >= 50: return "color:#ffdd00"
-                    return "color:#888888"
-                except: return ""
-
-            styled_str = df_str.style.map(color_streak_sc, subset=["Streak Score"])
-            st.dataframe(styled_str, use_container_width=True)
-
-            # ── CSV Export ────────────────────────────────────────────────────
-            import io as _io
-            _csv_buf = _io.StringIO()
-            df_str.to_csv(_csv_buf, index=False)
-            st.download_button(
-                label="📥 Export Hot Streaks CSV",
-                data=_csv_buf.getvalue(),
-                file_name=f"hot_streaks_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-                key="streak_export_btn",
-            )
-
-    # ── Targeting note ────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.info(
-        "💡 **How to use Hot Streaks:** Cross-reference these batters with the O1.5 Leaderboard. "
-        "A hot batter (70+ streak score) with a Tier 2+ model score and a weak opposing pitcher "
-        "is your highest-confidence same-game parlay anchor."
-    )
-
-
-def display_hits_tab(plays: List[Dict]):
-    """
-    Over 0.5 Total Bases tab.
-    Re-scores all players using contact/hit model.
-    Tiers: SAFE+ (85+), SAFE (75-84), LIKELY (65-74), SKIP (<65).
-    """
-    st.header("🎯 Over 0.5 Total Bases")
-    st.caption("Any hit model — singles count. Higher base rate (~65%). Contact + K-avoidance driven.")
-
-    if not plays:
-        st.info("Run the model first.")
-        return
-
-    # Re-score every player using the hits model
-    hits_plays = []
-    for p in plays:
-        # We need pitcher statcast — get it from stored labels
-        # Re-use the pre-loaded stats from the original run
-        # Build a minimal statcast dict from stored pitcher label
-        pitcher_mock = {
-            "k_rate_allowed": 0.220, "era": 4.20, "fip": 4.20,
-            "whip": 1.30, "hard_hit_allowed": 0.370,
-        }
-        # Parse pitcher label back into stats if available
-        pit_label = p.get("pitcher_label", "")
-        try:
-            if "K%:" in pit_label:
-                k_str = pit_label.split("K%:")[1].split("%")[0].strip()
-                pitcher_mock["k_rate_allowed"] = float(k_str) / 100
-            if "FIP:" in pit_label:
-                fip_str = pit_label.split("FIP:")[1].strip().split()[0]
-                pitcher_mock["fip"] = float(fip_str)
-        except Exception:
-            pass
-
-        batter_mock = {
-            "k_rate":        p.get("k_rate", 0.228),
-            # Use stored wRC+ if available, otherwise derive from xSLG
-            "wrc_plus":      p.get("wrc_plus") or max(40, min(220, 100 + (p.get("xslg", 0.398) - 0.398) / 0.005)),
-            "avg":           0.255,
-            "bb_rate":       p.get("bb_rate", 0.082),
-            "woba":          p.get("xslg", 0.398) * 0.78,
-            "hard_hit_rate": p.get("hard_hit_rate", 0.370),
-            "slg_proxy":     p.get("xslg", 0.398),
-        }
-
-        h_score, h_prob, h_tier, h_details = compute_hits_score_for_player(
-            batter_statcast=batter_mock,
-            pitcher_statcast=pitcher_mock,
-            batter_hand=p.get("batter_hand", "R"),
-            sp_hand=p.get("sp_hand", "R"),
-            lineup_slot=p.get("lineup_slot", 5),
-            park_team=p.get("park", p.get("team", "")),
-            weather=p.get("weather", {}),
-            implied=p.get("implied_total", 0),
-            sp_tbd=p.get("sp_tbd", False),
-            lineup_confirmed=p.get("lineup_confirmed", True),
-            pitch_matchup_score=p.get("sub_matchup", 50.0),  # V1.6
-        )
-
-        hits_plays.append({**p, "h_score": h_score, "h_prob": h_prob,
-                           "h_tier": h_tier, "h_details": h_details})
-
-    hits_plays.sort(key=lambda x: x["h_score"], reverse=True)
-
-    # Summary metrics
-    safe_plus = [p for p in hits_plays if p["h_tier"] == "🔒 SAFE+"]
-    safe      = [p for p in hits_plays if p["h_tier"] == "✅ SAFE"]
-    likely    = [p for p in hits_plays if p["h_tier"] == "📊 LIKELY"]
-    skip      = [p for p in hits_plays if p["h_tier"] == "❌ SKIP"]
-
-    if safe_plus:
-        st.success(f"🔒 {len(safe_plus)} SAFE+ plays — elite contact spots, parlay anchors")
-    elif safe:
-        st.info(f"✅ {len(safe)} SAFE plays — strong contact matchups")
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1: st.metric("🔒 SAFE+", len(safe_plus))
-    with col2: st.metric("✅ SAFE", len(safe))
-    with col3: st.metric("📊 LIKELY", len(likely))
-    with col4: st.metric("❌ SKIP", len(skip))
-
-    st.caption("Tier thresholds: SAFE+ 78+ | SAFE 68-77 | LIKELY 58-67 | SKIP <58")
-    st.markdown("---")
-
-    # Filters
-    col_f1, col_f2, col_f3 = st.columns(3)
-    with col_f1:
-        tier_filter = st.multiselect(
-            "Filter tier", ["🔒 SAFE+", "✅ SAFE", "📊 LIKELY", "❌ SKIP"],
-            default=["🔒 SAFE+", "✅ SAFE", "📊 LIKELY"], key="hits_tier_filter"
-        )
-    with col_f2:
-        teams = sorted(set(p["team"] for p in hits_plays))
-        team_filter = st.multiselect("Filter team", teams, default=[], key="hits_team_filter")
-    with col_f3:
-        min_score = st.slider("Min score", 0, 100, 60, key="hits_min_score")
-
-    filtered = [p for p in hits_plays
-                if p["h_tier"] in tier_filter
-                and (not team_filter or p["team"] in team_filter)
-                and p["h_score"] >= min_score]
-
-    st.markdown(f"**Showing {len(filtered)} batters**")
-
-    # Build table
-    rows = []
-    for p in filtered:
-        tbd = " ⚠️" if p.get("sp_tbd") else ""
-        rows.append({
-            "H-Score": f"{p['h_score']:.0f}",
-            "Tier": p["h_tier"],
-            "Player": p["name"],
-            "Team": p["team"],
-            "Vs": p["opponent"],
-            "Slot": f"#{p['lineup_slot']}",
-            "Hand": p["batter_hand"],
-            "Opp SP": p["sp_name"][:20] + tbd,
-            "SP 🤚": p["sp_hand"],
-            "Prob": f"{p['h_prob']*100:.0f}%",
-            "K%": f"{p.get('k_rate', 0)*100:.1f}%" if p.get("k_rate") else "—",
-            "HH%": f"{p.get('hard_hit_rate', 0)*100:.1f}%" if p.get("hard_hit_rate") else "—",
-            "xSLG": f"{p.get('xslg', 0):.3f}" if p.get("xslg") else "—",
-            "Platoon": p.get("platoon_label", "").split("(")[0].strip(),
-            "Park": p.get("park", ""),
-            "Imp.Runs": f"{p.get('implied_total', 0):.1f}" if p.get("implied_total", 0) > 0 else "—",
-            "O1.5 Score": f"{p['score']:.0f}",  # cross-reference
-        })
-
-    if rows:
-        df = pd.DataFrame(rows)
-
-        def color_htier(val):
-            if "SAFE+" in str(val): return "color: #00ff88; font-weight: bold"
-            elif "SAFE" in str(val): return "color: #66ddff; font-weight: bold"
-            elif "LIKELY" in str(val): return "color: #ffdd00"
-            return "color: #888888"
-
-        def color_hscore(val):
-            try:
-                v = float(str(val))
-                if v >= 85: return "color: #00ff88; font-weight: bold"
-                elif v >= 75: return "color: #66ddff; font-weight: bold"
-                elif v >= 65: return "color: #ffdd00"
-                return "color: #888888"
-            except: return ""
-
-        styled = df.style.map(color_htier, subset=["Tier"]).map(color_hscore, subset=["H-Score"])
-        st.dataframe(styled, use_container_width=True, height=500)
-
-        csv = df.to_csv(index=False)
-        st.download_button("📥 Export O0.5 Plays", csv,
-                           f"o05_picks_{datetime.now(EST).strftime('%Y%m%d')}.csv", "text/csv")
-
-    # Top plays detail
-    st.markdown("---")
-    st.subheader("🏆 Top O0.5 Plays — Full Breakdown")
-    top = [p for p in filtered if p["h_score"] >= 60][:5]
-    for i, p in enumerate(top, 1):
-        with st.expander(f"{p['h_tier']} #{i}: {p['name']} ({p['team']}) — H-Score: {p['h_score']:.0f} | Prob: {p['h_prob']*100:.0f}% | O1.5 Score: {p['score']:.0f}"):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**Contact Profile (O0.5 drivers)**")
-                st.write(f"• K%: {p.get('k_rate', 0)*100:.1f}% ← most critical" if p.get("k_rate") else "• K%: —")
-                st.write(f"• Hard Hit%: {p.get('hard_hit_rate', 0)*100:.1f}%" if p.get("hard_hit_rate") else "• HH%: —")
-                st.write(f"• xSLG: {p.get('xslg', 0):.3f}" if p.get("xslg") else "• xSLG: —")
-                st.write(f"• Platoon: {p.get('platoon_label', '—')}")
-                st.write(f"• Lineup: {p.get('lineup_label', '—')}")
-            with col_b:
-                st.markdown("**Pitcher + Environment**")
-                st.write(f"• SP: {p['sp_name']} ({p['sp_hand']}HP)")
-                st.write(f"• {p.get('pitcher_label', '—')}")
-                st.write(f"• Park: {p.get('park_label', p.get('park', '—'))}")
-                st.write(f"• Implied runs: {p.get('implied_total', 0):.1f}" if p.get("implied_total", 0) > 0 else "• Implied: —")
-                st.markdown(f"**O0.5 Score: {p['h_score']:.0f} ({p['h_prob']*100:.0f}%)**")
-                st.markdown(f"*vs O1.5 Score: {p['score']:.0f} ({p['prob']*100:.0f}%)*")
-
-    # Mixed parlay note
-    st.markdown("---")
-    st.info("💡 **Mixed Parlay tip:** Combine SAFE+ plays from this tab with Tier 1/2 plays from the O1.5 Leaderboard in the Parlay Builder. High-contact bats + power matchups = diversified legs.")
-
 # ============================================================================
 # MAIN APP
 # ============================================================================
@@ -9019,7 +7499,7 @@ def display_fd_hand_builder(plays: List[Dict]):
             sal_v = sal_e["salary"] if sal_e else 0
             try:
                 score_int = int(float(str(s.get("grade","0"))))
-            except:
+            except (ValueError, TypeError):
                 score_int = 0
             sc_color = "#00ff88" if score_int >= 75 else "#ffdd00" if score_int >= 55 else "#ff8800"
             with col:
@@ -11746,576 +10226,7 @@ Tomorrow's plays dropping at 12PM EST 🔒"""
                                "mlb_parlays.csv", "text/csv")
 
 
-def main():
-    # Initialize DB
-    init_db()
-    
-    # Init session state
-    if "plays" not in st.session_state:
-        st.session_state.plays = []
-    if "analysis_date" not in st.session_state:
-        st.session_state.analysis_date = None
-    if "model_ran" not in st.session_state:
-        st.session_state.model_ran = False
-    
-    # ── SIDEBAR ───────────────────────────────────────────
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        
-        today_est = datetime.now(EST).date()
-        selected_date = st.date_input("📅 Select Date", value=today_est)
-        date_str = selected_date.strftime("%Y-%m-%d")
-        
-        st.markdown("---")
-        
-        st.subheader("💰 Bankroll")
-        unit_size = st.number_input("Unit Size ($)", min_value=1, max_value=1000, value=25)
-        
-        st.markdown("---")
-        
-        # V1.9: type="primary" renders grey on dark Streamlit themes. Use CSS override.
-        st.markdown("""<style>
-        div[data-testid="stSidebar"] div.stButton:first-of-type > button {
-            background-color: #00cc66 !important; color: #000 !important;
-            font-weight: 700 !important; border: none !important; font-size: 1rem !important;
-        }
-        div[data-testid="stSidebar"] div.stButton:first-of-type > button:hover {
-            background-color: #00ff88 !important;
-        }
-        </style>""", unsafe_allow_html=True)
-        run_btn = st.button("⚾ Run Today's Model", use_container_width=True)
-        
-        if st.button("🔄 Clear Cache + Rerun", use_container_width=True):
-            st.cache_data.clear()
-            st.session_state.plays = []
-            st.rerun()
-        
-        st.markdown("---")
-        
-        # Data source status
-        st.subheader("📡 Data Sources")
-        
-        try:
-            odds_key = st.secrets.get("odds_api", {}).get("api_key", "")
-            has_odds_key = bool(odds_key and odds_key.strip())
-        except:
-            has_odds_key = False
-
-        st.markdown(f"✅ MLB Stats API *(always accessible)*")
-        bat_src   = st.session_state.get("_batting_source", "")
-        pit_src   = st.session_state.get("_pitching_source", "")
-        bat_cols  = st.session_state.get("batting_cols", [])
-        has_xstats    = "xSLG" in bat_cols or "est_slg" in bat_cols
-        has_statcast  = "Barrel%" in bat_cols or "barrel_batted_rate" in bat_cols
-        has_bat_track = "bat_speed" in bat_cols
-        if not bat_src:
-            st.markdown("⏳ Baseball Savant *(run model to check)*")
-        elif has_xstats and has_statcast and has_bat_track:
-            st.markdown("✅ Baseball Savant *(full: xStats + Statcast + Bat Tracking)*")
-        elif has_xstats and has_statcast:
-            st.markdown("🟡 Baseball Savant *(partial: xStats + Statcast, no bat tracking)*")
-        elif has_xstats:
-            st.markdown("⚠️ Baseball Savant *(xStats only — Statcast leaderboard blocked [502])*")
-        else:
-            st.markdown("❌ Baseball Savant *(blocked — using MLB API proxies)*")
-        st.markdown(f"✅ Open-Meteo Weather")
-        
-        if has_odds_key:
-            st.markdown(f"✅ The Odds API *(live lines)*")
-        else:
-            st.markdown(f"⚠️ The Odds API *(no key — scores degraded)*")
-            with st.expander("🔑 Add Odds API Key (required for best scores)"):
-                st.markdown("""
-**Step 1:** Sign up free at [the-odds-api.com](https://the-odds-api.com)
-— 500 calls/month free (~$0 for daily use all season)
-
-**Step 2:** Go to Streamlit Cloud → your app → **⋮ Settings → Secrets**
-
-**Step 3:** Paste this (replace with your real key):
-```toml
-[odds_api]
-api_key = "your_key_here"
-```
-**Step 4:** Save → app auto-restarts
-
-**Usage math:** 1 call per model run × ~180 game days = ~180 calls/season.
-Free tier (500/mo) is more than enough.
-                """)
-        
-        st.markdown("---")
-        
-        with st.expander("📖 Model Info"):
-            st.markdown("""
-            **Scoring: 1B=1, 2B=2, 3B=3, HR=4**
-            Walks, HBP, SB = 0 TB (never counted)
-            
-            **V1.8 Weights:**
-            - ⚾ Pitcher Vuln: 30% (K%, HH%, FIP, barrel, WHIP — wider scale)
-            - 🏏 Batter: 28% (xSLG, barrel, HH%, wRC+, ISO, K%)
-            - 🤚 Platoon: 12% (LHB vs RHP = +56 SLG documented)
-            - 💰 Vegas: 8% (implied total r=0.61 with scoring)
-            - 🏟️ Park: 7% (Coors/Petco effects real)
-            - 📈 Streak: 5% (last 7 games form)
-            - 🔄 TTO: 4% (times through order bonus)
-            - 🌤️ Weather: 4% (wind direction/speed)
-            - 🎯 Pitch Mix: 2%
-            - 📊 BvP: 2% (career vs SP)
-            - 📋 Lineup: 1%
-            
-            **V1.8 Tiers:**
-            - 🔒 Tier 1 (78+): Strong play, parlay anchor
-            - ✅ Tier 2 (68-77): Viable, parlay filler
-            - 📊 Tier 3 (58-67): Marginal, single only
-            - ❌ Below 58: Fade
-            """)
-        
-        with st.expander("🔍 Debug: Data Quality Check"):
-            st.caption("Expand after running model to verify all key stats loaded")
-
-            # ── Raw gameLog API probe ──────────────────────────────────────
-            st.markdown("**🔬 Recent Form API Probe** — verify raw game log data")
-            probe_name = st.text_input("Enter player name to probe (e.g. 'Brice Turang'):", key="probe_name_input")
-            if st.button("🔍 Probe API", key="probe_api_btn") and probe_name and st.session_state.plays:
-                probe_p = next((p for p in st.session_state.plays
-                                if probe_name.lower() in p.get("name","").lower()), None)
-                if probe_p:
-                    pid = str(probe_p.get("player_id",""))
-                    import datetime as _dt
-                    yr = _dt.datetime.now().year
-                    url = (f"https://statsapi.mlb.com/api/v1/people/{pid}/stats"
-                           f"?stats=gameLog&group=hitting&gameType=R&season={yr}&limit=12")
-                    try:
-                        import requests as _rq
-                        resp = _rq.get(url, timeout=8)
-                        st.caption(f"Player: {probe_p['name']} | ID: {pid} | URL: {url}")
-                        st.caption(f"HTTP status: {resp.status_code}")
-                        if resp.status_code == 200:
-                            splits = resp.json().get("stats",[{}])[0].get("splits",[])
-                            st.caption(f"Splits returned: {len(splits)}")
-                            rows = []
-                            for i, s in enumerate(splits[:10]):
-                                st_ = s.get("stat",{})
-                                rows.append({
-                                    "game#": i,
-                                    "date": s.get("date","?"),
-                                    "AB": st_.get("atBats","?"),
-                                    "H": st_.get("hits","?"),
-                                    "2B": st_.get("doubles","?"),
-                                    "3B": st_.get("triples","?"),
-                                    "HR": st_.get("homeRuns","?"),
-                                    "TB(api)": st_.get("totalBases","?"),
-                                    "season": s.get("season","?"),
-                                })
-                            if rows:
-                                st.dataframe(pd.DataFrame(rows), hide_index=True)
-                    except Exception as e:
-                        st.error(f"Probe failed: {e}")
-                else:
-                    st.warning(f"Player '{probe_name}' not found in current model run")
-
-            st.markdown("---")
-            bat_src  = st.session_state.get("_batting_source", "not_run")
-            pit_src  = st.session_state.get("_pitching_source", "not_run")
-            src_icon = {
-                # Live fetch sources
-                "fangraphs_live": "✅", "fangraphs+pybaseball": "✅",
-                "savant+mlbapi": "✅", "mlbapi+savant": "✅",
-                "savant+mlbapi+fangraphs": "✅",
-                "mlbapi": "✅", "mlbapi_only": "⚠️",
-                "savant_xstats": "✅", "savant_statcast": "✅",
-                "matched": "✅",
-                # Disk cache
-                "disk_cache": "💾", "disk_cache_fresh": "💾",
-                "disk_cache_stale": "⚠️",
-                # Failure states
-                "failed": "❌", "not_run": "⏳", "unknown": "❓",
-            }
-            st.markdown(f"**Batting stats source:** {src_icon.get(bat_src,'❓')} `{bat_src}`")
-            st.markdown(f"**Pitching stats source:** {src_icon.get(pit_src,'❓')} `{pit_src}`")
-
-            # Show FanGraphs errors if any
-            fg_bat_errs = st.session_state.get("_fg_batting_errors", [])
-            fg_pit_errs = st.session_state.get("_fg_pitching_errors", [])
-            if fg_bat_errs:
-                st.error("**FanGraphs batting fetch errors:**\n" + "\n".join(fg_bat_errs))
-            if fg_pit_errs:
-                st.error("**FanGraphs pitching fetch errors:**\n" + "\n".join(fg_pit_errs))
-
-            # Arsenal merge error surfacing
-            _am_err = st.session_state.get("_arsenal_merge_err")
-            _ba_err = st.session_state.get("_batter_arsenal_err")
-            if _am_err:
-                st.error(f"⚠️ Pitcher arsenal merge error (non-fatal): {_am_err}")
-            if _ba_err:
-                st.error(f"⚠️ Batter arsenal merge error (non-fatal): {_ba_err}")
-
-            # Disk cache status
-            import os as _os, time as _time
-            _cache_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "stat_cache")
-            for _cname in ("batting_stats", "pitching_stats"):
-                _p = _os.path.join(_cache_dir, f"{_cname}.pkl")
-                if _os.path.exists(_p):
-                    _age = (_time.time() - _os.path.getmtime(_p)) / 3600
-                    _age_label = f"{_age:.1f}h old"
-                    _freshness = "✅ fresh" if _age < 6 else ("⚠️ stale" if _age > 120 else "💾 cached")
-                    st.caption(f"💾 Disk cache `{_cname}`: {_age_label} — {_freshness}")
-                else:
-                    st.caption(f"⬜ No disk cache for `{_cname}` — run `seed_stat_cache.py` locally and commit `stat_cache/`")
-
-            st.markdown("---")
-            matched = st.session_state.get("_matched", 0)
-            unmatched = st.session_state.get("_unmatched", 0)
-            total = matched + unmatched
-            if total > 0:
-                rate = matched / total * 100
-                color = "✅" if rate > 80 else "⚠️" if rate > 50 else "❌"
-                st.markdown(f"**{color} Player match rate: {matched}/{total} ({rate:.0f}%)**")
-                if rate < 80:
-                    st.warning("Low match rate — scores using league averages for unmatched players")
-            
-            # Show raw name samples — use .get() everywhere to avoid AttributeError
-            # before model has been run (session_state keys may not exist yet)
-            lookup_diag = st.session_state.get("lookup_diag")
-            batting_df_sample = st.session_state.get("batting_df_sample", [])
-            norm_name_sample  = st.session_state.get("norm_name_sample", [])
-            search_sample     = st.session_state.get("search_sample", [])
-            batting_cols      = st.session_state.get("batting_cols", [])
-            pitching_cols     = st.session_state.get("pitching_cols", [])
-            sample_player     = st.session_state.get("sample_player")
-
-            if lookup_diag:
-                st.markdown("**🔬 Live lookup diagnostic (first batter):**")
-                st.json(lookup_diag)
-                if batting_df_sample:
-                    st.markdown("**Raw _name values in batting DataFrame (first 10):**")
-                    st.code("\n".join(str(x) for x in batting_df_sample))
-            if norm_name_sample:
-                st.markdown("**Normalized _norm_name values (first 10):**")
-                st.code("\n".join(str(x) for x in norm_name_sample))
-            if search_sample:
-                st.markdown("**Names we searched for (first 5):**")
-                st.code("\n".join(str(x) for x in search_sample))
-            if batting_cols:
-                critical_bat = ["xSLG", "xwOBA", "SLG", "ISO", "K%", "BB%", "OBP",
-                                "wRC+", "Barrel%", "Hard%", "EV"]
-                # What provides each stat (real source vs proxy)
-                _source_map = {
-                    "xSLG":    ("Savant xStats ✅", None),
-                    "xwOBA":   ("Savant xStats ✅", None),
-                    "SLG":     ("MLB Stats API ✅", None),
-                    "ISO":     ("MLB Stats API ✅", None),
-                    "K%":      ("MLB Stats API ✅", None),
-                    "BB%":     ("MLB Stats API ✅", None),
-                    "OBP":     ("MLB Stats API ✅", None),
-                    "wRC+":    ("FanGraphs (blocked ❌)", "OBP proxy ~±25pts"),
-                    "Barrel%": ("Savant Statcast (blocked ❌)", "HR/PA proxy ~±5-8%"),
-                    "Hard%":   ("Savant Statcast (blocked ❌)", "SLG+K% proxy ~±6-10%"),
-                    "EV":      ("Savant Statcast (blocked ❌)", "xSLG+ISO derived"),
-                }
-                st.markdown("**📊 Batting data — real vs proxy:**")
-                real_count = 0
-                proxy_count = 0
-                for c in critical_bat:
-                    src, proxy_note = _source_map.get(c, ("Unknown", None))
-                    if c in batting_cols:
-                        st.markdown(f"✅ **`{c}`** — {src.split(' ✅')[0]}")
-                        real_count += 1
-                    elif proxy_note:
-                        st.markdown(f"🔄 **`{c}`** — {proxy_note} *(real source: {src.split(' (')[0]})*")
-                        proxy_count += 1
-                    else:
-                        st.markdown(f"❌ **`{c}`** — missing, league avg used")
-                
-                completeness = real_count / len(critical_bat) * 100
-                color = "🟢" if completeness >= 80 else "🟡" if completeness >= 50 else "🔴"
-                st.caption(f"Total columns: {len(batting_cols)} | "
-                           f"{color} Data completeness: {completeness:.0f}% real | "
-                           f"{proxy_count} proxies active")
-                if proxy_count > 0:
-                    st.warning(f"⚠️ {proxy_count} stats are derived proxies, not real Statcast data. "
-                               "Scores are adjusted with +13pt offset to compensate.")
-                    with st.expander("🔧 Fix: Generate local cache seeder script"):
-                        st.markdown("""
-**Why this happens:** Streamlit Cloud IPs are blocked by Baseball Savant's 
-Statcast leaderboard endpoint. The real fix is seeding the cache from your 
-local machine daily.
-
-**Steps:**
-1. Download the seeder script below
-2. Run it locally: `python3 seed_stat_cache.py`
-3. Commit the generated `stat_cache/` folder to your GitHub repo
-4. Streamlit Cloud will use the cached data automatically
-
-The cache is valid for 6 hours — run the script before posting daily picks.
-                        """)
-                        seed_script = '#!/usr/bin/env python3\n# Propex stat cache seeder -- run locally daily, commit stat_cache/ to GitHub\n'
-                        seed_script += '"""Fetches real Savant Statcast data from your local IP where endpoints are unblocked."""\n'
-                        seed_script += """
-import requests, pandas as pd, pickle, os, time
-
-CACHE_DIR = os.path.join(os.path.dirname(__file__), "stat_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-def fetch(url, label):
-    print(f"Fetching {label}...")
-    r = requests.get(url, timeout=30, headers={
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
-        "Referer": "https://baseballsavant.mlb.com/",
-    })
-    if r.status_code == 200 and len(r.content) > 1000:
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        print(f"  ✅ {len(df)} rows, columns: {list(df.columns[:6])}")
-        return df
-    print(f"  ❌ HTTP {r.status_code}")
-    return pd.DataFrame()
-
-yr = 2026
-
-# Fetch all Savant endpoints
-xstats = fetch(f"https://baseballsavant.mlb.com/leaderboard/expected_statistics?type=batter&year={yr}&min=1&csv=true", "xStats")
-statcast = fetch(f"https://baseballsavant.mlb.com/leaderboard/statcast?year={yr}&min=1&type=batter&csv=true", "Statcast")
-bat_track = fetch(f"https://baseballsavant.mlb.com/leaderboard/bat-tracking?year={yr}&minSwings=50&type=batter&csv=true", "Bat Tracking")
-
-# Merge into one batting frame
-result = xstats.copy() if not xstats.empty else pd.DataFrame()
-if not statcast.empty and not result.empty:
-    # normalize player_id
-    for df in [result, statcast, bat_track]:
-        if "player_id" in df.columns:
-            df["mlbam_id"] = df["player_id"].astype(str)
-    result = result.merge(statcast[["mlbam_id","barrel_batted_rate","hard_hit_percent","avg_exit_velocity"]].dropna(subset=["mlbam_id"]), on="mlbam_id", how="left")
-    if not bat_track.empty:
-        result = result.merge(bat_track[["mlbam_id","bat_speed","blast_rate"]].dropna(subset=["mlbam_id"]), on="mlbam_id", how="left")
-
-if not result.empty:
-    path = os.path.join(CACHE_DIR, "batting_stats.pkl")
-    with open(path, "wb") as f:
-        pickle.dump({"df": result, "ts": time.time()}, f)
-    print(f"✅ Batting cache saved: {len(result)} players, {len(result.columns)} columns")
-    print(f"   Columns: {list(result.columns)}")
-else:
-    print("❌ Could not build batting cache")
-"""
-                        st.download_button(
-                            "⬇️ Download cache seeder script",
-                            seed_script,
-                            "seed_stat_cache.py",
-                            "text/plain",
-                            key="dl_seed_script"
-                        )
-            else:
-                st.info("Run the model to see batting column status.")
-            if pitching_cols:
-                critical_pit = ["K%", "ERA", "FIP", "xFIP", "Hard%", "Barrel%",
-                                "SO", "TBF", "xERA", "G", "GS", "Team", "WHIP"]
-                st.markdown("**Pitching — critical columns:**")
-                for c in critical_pit:
-                    st.markdown(f"{'✅' if c in pitching_cols else '❌'} `{c}`")
-                st.caption(f"Total pitching columns: {len(pitching_cols)}")
-            else:
-                st.info("Run the model to see pitching column status.")
-            if sample_player:
-                st.markdown("**Sample player (Judge):**")
-                st.json(sample_player)
-
-        # ── V1.3 NEW: Bullpen Quality Debug ──────────────────────────────
-        with st.expander("🔬 Debug: V1.3 Bullpen Quality Scores"):
-            st.caption("Per-team bullpen vulnerability (0=unhittable, 100=mop-up arms). "
-                       "High score = weak bullpen = good for batters. "
-                       "Was fixed at 42.0 for all teams in V1.2.")
-            bp_scores = st.session_state.get("team_bullpen_scores", {})
-            if bp_scores:
-                bp_df = pd.DataFrame([
-                    {"Team": t, "Bullpen Vuln Score": v,
-                     "Quality": "🔒 Elite" if v < 35 else "✅ Good" if v < 45 else "⚠️ Average" if v < 55 else "💀 Weak"}
-                    for t, v in sorted(bp_scores.items(), key=lambda x: x[1])
-                ])
-
-                def color_bp(val):
-                    try:
-                        v = float(val)
-                        if v < 35:  return "color: #00ff88; font-weight: bold"
-                        elif v < 45: return "color: #66ddff"
-                        elif v < 55: return "color: #ffdd00"
-                        return "color: #ff4444; font-weight: bold"
-                    except: return ""
-
-                styled_bp = bp_df.style.map(color_bp, subset=["Bullpen Vuln Score"])
-                st.dataframe(styled_bp, use_container_width=True)
-                st.caption(f"✅ {len(bp_scores)} teams scored | League avg baseline: 42.0")
-
-                # Show score impact on a sample batter
-                st.markdown("**Score impact example (avg batter, avg SP, score = 55):**")
-                example_rows = []
-                for label, bp_v in [("Best bullpen (score ~28)", 28), ("League avg (42)", 42), ("Worst bullpen (score ~62)", 62)]:
-                    sp_score_ex = 45.0  # avg SP
-                    blended_ex  = sp_score_ex * 0.60 + bp_v * 0.40
-                    example_rows.append({"Scenario": label, "SP Score": 45, "BP Vuln": bp_v,
-                                         "Blended Pit Score": round(blended_ex, 1)})
-                st.table(pd.DataFrame(example_rows))
-            else:
-                st.warning("Bullpen scores not computed — pitching_df may be missing GS or Team columns. "
-                           "All teams defaulting to league average (42.0). "
-                           "Run model and check pitching critical columns above.")
-
-        # ── V1.3 NEW: Per-player score breakdown debug ───────────────────
-        with st.expander("🔬 Debug: Score Component Breakdown (top 10 plays)"):
-            st.caption("Shows exactly how each sub-score contributed to the final score. "
-                       "BP Vuln = the opponent's bullpen score used for that batter.")
-            plays_debug = st.session_state.get("plays", [])
-            if plays_debug:
-                debug_rows = []
-                for p in plays_debug[:10]:
-                    debug_rows.append({
-                        "Player":     p["name"],
-                        "Team":       p["team"],
-                        "Opp":        p.get("opponent", "?"),
-                        "Final":      p["score"],
-                        "Batter":     p.get("sub_batter", "—"),
-                        "Pitcher":    p.get("sub_pitcher", "—"),
-                        "Matchup":    p.get("sub_matchup", "—"),
-                        "BP Vuln":    p.get("bullpen_vuln", "—"),
-                        "Platoon":    p.get("sub_platoon", "—"),
-                        "Park":       p.get("sub_park", "—"),
-                        "Weather":    p.get("sub_weather", "—"),
-                        "Vegas":      p.get("sub_vegas", "—"),
-                        "Lineup":     p.get("sub_lineup", "—"),
-                    })
-                st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
-            else:
-                st.info("Run the model to see per-player score breakdowns.")
-
-        st.caption(f"v1.6 | {datetime.now(EST).strftime('%I:%M %p EST')}")
-    
-    # ── MAIN CONTENT ──────────────────────────────────────
-    st.title("⚾ MLB TB Analyzer V2.1")
-    import hashlib as _hlib
-    _sig = _hlib.md5(b"v21_contact_model_dk_slate_aware").hexdigest()[:6]
-    st.caption(f"🔑 Build sig: {_sig} — V2.1: Contact-first TB model | DK pipeline | Slate-aware stacks | 2026 game logs")
-    st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | FD + DK portfolios | Team stack scores")
-    
-    # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
-        "📊 O1.5 Leaderboard",
-        "🎯 O0.5 Any Hit",
-        "⚡ K Props",
-        "🏦 Moneyline",
-        "🔥 Hot Streaks",
-        "💣 HR Plays",
-        "🎯 Command Center",
-        "🔬 Hand Builder",
-        "🚀 FD Portfolio",
-        "⚡ DK Portfolio",
-        "📈 Results Tracker",
-    ])
-    
-    # ── RUN MODEL ────────────────────────────────────────
-    if run_btn:
-        with tab1:
-            st.markdown(f"**📅 Running model for {date_str}...**")
-            status = st.container()
-            plays = run_model(date_str, status)
-            st.session_state.plays = plays
-            st.session_state.analysis_date = date_str
-            st.session_state.model_ran = True
-            if plays:
-                save_picks_to_db(plays, date_str)
-                # ── V1.9: Pre-fetch ump data and run differential for new tabs ──
-                try:
-                    st.session_state["_ump_data"] = fetch_umpire_data()
-                except Exception:
-                    st.session_state["_ump_data"] = {}
-                try:
-                    st.session_state["_run_diffs"] = fetch_team_run_differential(date_str, days=7)
-                except Exception:
-                    st.session_state["_run_diffs"] = {}
-                try:
-                    st.session_state["_ml_odds"] = fetch_moneyline_odds(date_str)
-                except Exception:
-                    st.session_state["_ml_odds"] = {}
-                st.rerun()
-            else:
-                st.warning(f"No games or lineups found for {date_str}.")
-                st.info("Opening Day is March 27, 2026. Change the date in the sidebar.")
-
-    # ── DISPLAY TABS ─────────────────────────────────────
-    with tab1:
-        if st.session_state.plays:
-            date_label = st.session_state.analysis_date or date_str
-            games = fetch_schedule(date_label)
-            if games:
-                game_labels = " • ".join([f"{g['away_team']}@{g['home_team']}" for g in games])
-                st.caption(f"📅 {date_label} | {len(games)} games: {game_labels}")
-            display_leaderboard(st.session_state.plays)
-        else:
-            st.info("👈 Click **⚾ Run Today's Model** to fetch today's plays")
-
-    with tab2:
-        if st.session_state.plays:
-            display_hits_tab(st.session_state.plays)
-        else:
-            st.info("Run the model first to see O0.5 any-hit plays.")
-
-    with tab3:
-        # ── K Props ──────────────────────────────────────
-        if st.session_state.plays:
-            ump_data = st.session_state.get("_ump_data", {})
-            display_k_props_tab(st.session_state.plays, ump_data)
-        else:
-            st.info("Run the model first to see K prop scores.")
-
-    with tab4:
-        # ── Moneyline ────────────────────────────────────
-        if st.session_state.plays:
-            _games_for_ml = fetch_schedule(st.session_state.analysis_date or date_str)
-            _ml_odds      = st.session_state.get("_ml_odds", {})
-            _run_diffs    = st.session_state.get("_run_diffs", {})
-            _impl_totals  = {}
-            try:
-                _impl_totals = fetch_odds(st.session_state.analysis_date or date_str)
-            except Exception:
-                pass
-            _bp_scores    = st.session_state.get("team_bullpen_scores", {})
-            display_moneyline_tab(
-                games=_games_for_ml,
-                plays=st.session_state.plays,
-                ml_odds=_ml_odds,
-                run_diffs=_run_diffs,
-                implied_totals=_impl_totals,
-                team_bullpen_scores=_bp_scores,
-            )
-        else:
-            st.info("Run the model first to see moneyline analysis.")
-
-    with tab5:
-        # ── Hot Streaks ───────────────────────────────────
-        if st.session_state.plays:
-            display_hot_streaks_tab(st.session_state.plays)
-        else:
-            st.info("Run the model first to see hot streak rankings.")
-
-    with tab6:
-        if st.session_state.plays:
-            display_hr_plays(st.session_state.plays)
-        else:
-            st.info("Run the model first to see HR plays.")
-
-    with tab7:
-        display_fd_command_center(st.session_state.plays if st.session_state.plays else [])
-
-    with tab8:
-        display_fd_hand_builder(st.session_state.plays if st.session_state.plays else [])
-
-    with tab9:
-        display_fd_portfolio_builder(st.session_state.plays if st.session_state.plays else [])
-
-    with tab10:
-        display_dk_portfolio_builder(st.session_state.plays if st.session_state.plays else [])
-
-    with tab11:
-        display_results_tracker()
-
 
 if __name__ == "__main__":
+    from app import main
     main()
