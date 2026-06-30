@@ -48,6 +48,9 @@ def display_leaderboard(plays: List[Dict]):
         and ("hard_hit_percent" in _bat_cols_ui or "Hard%" in _bat_cols_ui)
         and ("wRC+" in _bat_cols_ui)
     )
+    # Source label is still used for the cache-provenance banner below — a
+    # separate concern from proxy detection (which uses column presence above).
+    _bat_src_ui = st.session_state.get("_batting_source", "")
     if _is_proxy_ui:
         st.warning("⚠️ **Proxy Data Mode** — Savant unavailable. Using MLB Stats API derived signals. "
                    "Tier thresholds adjusted −5 pts: Tier 1 ≥75 · Tier 2 ≥65 · Tier 3 ≥55. "

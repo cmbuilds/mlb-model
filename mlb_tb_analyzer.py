@@ -3560,7 +3560,6 @@ def compute_final_score(
     bvp_weight_boost: float = 0.0,
 ) -> float:
     """Thin Streamlit-aware wrapper; pure logic lives in scoring/final.py."""
-    _bat_src  = st.session_state.get("_batting_source", "")
     _bat_cols = st.session_state.get("batting_cols", [])
     _has_full = (
         ("Barrel%" in _bat_cols or "barrel_batted_rate" in _bat_cols)
