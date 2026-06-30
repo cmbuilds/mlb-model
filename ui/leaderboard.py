@@ -92,6 +92,8 @@ def display_leaderboard(plays: List[Dict]):
 
     st.markdown("---")
 
+    hide_nb = st.sidebar.toggle("Hide non-bettable", value=False)
+
     # Filters
     col_f1, col_f2, col_f3, col_f4 = st.columns(4)
     with col_f1:
@@ -116,6 +118,8 @@ def display_leaderboard(plays: List[Dict]):
         filtered = [p for p in filtered if p["score"] >= min_score_filter]
     if hand_filter:
         filtered = [p for p in filtered if p["batter_hand"] in hand_filter]
+    if hide_nb:
+        filtered = [p for p in filtered if p.get("bettable", True)]
 
     st.markdown(f"**Showing {len(filtered)} batters**")
 
