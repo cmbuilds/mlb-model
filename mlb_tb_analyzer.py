@@ -823,6 +823,8 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
                         _col_map = {
                             "player_id": "mlbam_id",
                             "avg_hit_speed": "avg_exit_velocity",
+                            "brl_percent": "barrel_batted_rate",
+                            "ev95percent": "hard_hit_percent",
                             "b_k_percent": "k_percent",
                             "b_bb_percent": "bb_percent",
                             "b_xba": "est_ba", "b_xslg": "est_slg",
@@ -885,8 +887,15 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
             (f"https://baseballsavant.mlb.com/statcast_search/csv?player_type=batter&year={yr}&group_by=name&min_pitches=25&type=details", "Savant statcast_search CSV"),
         ]:
             _df = _fetch_savant_csv(_url, _lbl)
-            if not _df.empty and len(_sc_required.intersection(set(_df.columns))) >= 2:
-                return _df
+            if not _df.empty:
+                _df = _df.rename(columns={
+                    "brl_percent":           "barrel_batted_rate",
+                    "avg_hit_speed":         "avg_exit_velocity",
+                    "ev95percent":           "hard_hit_percent",
+                    "anglesweetspotpercent": "sweet_spot_percent",
+                })
+                if len(_sc_required.intersection(set(_df.columns))) >= 2:
+                    return _df
 
         # ── Attempt 4: FanGraphs Statcast type=24 ─────────────────────────────
         try:
@@ -1426,6 +1435,12 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                         lambda s: _re_html2.sub(r'<[^>]+>', '', s).strip()
                     )
                 break
+        # Savant renamed columns — normalize to internal names used by merges
+        df = df.rename(columns={
+            "brl_percent":  "barrel_batted_rate",
+            "avg_hit_speed": "avg_exit_velocity",
+            "ev95percent":  "hard_hit_percent",
+        })
         return df
 
     sc_pit_cur = _normalize_savant_pit(sc_pit_cur)
@@ -2129,7 +2144,7 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
         # ── MLB Stats API proxy fallback for Barrel%/HH% allowed ──────────
         # When Savant is blocked, use counting-stat proxies
         barrel_p = safe_get(row, 'barrel_proxy', default=None)
-        if barrel_p is not None and stats["barrel_allowed"] == 0.065:
+        if barrel_p is not None and stats["barrel_allowed"] == 0.070:
             stats["barrel_allowed"] = round(max(0.010, barrel_p), 4)
             prov["barrel_allowed"] = "proxy"
 
@@ -2138,18 +2153,16 @@ def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
             stats["hard_hit_allowed"] = round(hard_p, 3)
             prov["hard_hit_allowed"] = "proxy"
 
-        # ── SwStr% proxy from K% ──────────────────────────────────────────
-        # FanGraphs type=8 (true SwStr%) is blocked on Streamlit Cloud.
-        # K% and SwStr% correlate strongly (r≈0.85): SwStr% ≈ K% × 0.49
-        # MLB avg: K%=22.8% → SwStr%=11.2%. Error: 2-5% vs actual.
-        # Only use proxy if true SwStr% not already populated from FanGraphs.
-        if stats.get("swstr_pct", 0.0) == 0.0 and stats["k_rate_allowed"] > 0:
+        # ── SwStr% — read real value from pitching_df before falling back to proxy ──
+        swstr_real = safe_get(row, 'swstr_pct', 'SwStr%', default=None)
+        if swstr_real is not None and swstr_real > 0:
+            stats["swstr_pct"] = swstr_real if swstr_real < 1 else swstr_real / 100
+            stats["swstr_pct_is_proxy"] = False
+            prov["swstr_pct"] = "measured"
+        elif stats["k_rate_allowed"] > 0:
             stats["swstr_pct"] = round(stats["k_rate_allowed"] * 0.49, 4)
             stats["swstr_pct_is_proxy"] = True
             prov["swstr_pct"] = "proxy"
-        else:
-            stats["swstr_pct_is_proxy"] = False
-            prov["swstr_pct"] = "measured"
 
         # Label pitcher source based on available columns
         if any(c in row.index for c in ('barrel_proxy','hard_proxy_pit','H_per_9')):
@@ -3202,7 +3215,7 @@ def fetch_batter_recent_form(player_id: str, n_games: int = 7) -> Dict:
             is_cumulative = (sorted(hits_vals, reverse=True) == hits_vals and
                              max(hits_vals) > 5 and min(hits_vals) == 0)
 
-            recent = splits[:n_games]
+            recent = splits[-n_games:]  # API returns oldest-first; take the tail for most recent games
 
             if is_cumulative:
                 # Diff consecutive rows to get per-game stats
