@@ -695,7 +695,7 @@ def load_all_batting_stats(season: int = 2025) -> pd.DataFrame:
             url = (
                 f"https://statsapi.mlb.com/api/v1/stats"
                 f"?stats=season&group=hitting&season={season_yr}"
-                f"&limit=2000&offset=0&sportId=1"
+                f"&limit=2000&offset=0&sportId=1&playerPool=All"
             )
             r = requests.get(url, timeout=25)
             if r.status_code == 200:
@@ -1314,12 +1314,13 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
             url = (
                 f"https://statsapi.mlb.com/api/v1/stats"
                 f"?stats=season&group=pitching&season={season_yr}"
-                f"&limit=2000&offset=0&sportId=1"
+                f"&limit=2000&offset=0&sportId=1&playerPool=All"
             )
             r = requests.get(url, timeout=25)
             if r.status_code == 200:
                 splits = r.json().get("stats", [{}])[0].get("splits", [])
                 if splits:
+                    from lib.constants import TEAM_ABB_MAP as _TEAM_ABB_MAP
                     rows = []
                     for s in splits:
                         p   = s.get("player", {})
@@ -1341,6 +1342,10 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                         era  = round(er / ip * 9, 2) if ip > 0 else 4.50
                         whip = round((h + bb) / ip, 3) if ip > 0 else 1.35
                         hr_a = int(st_.get("homeRuns", 0) or 0)
+                        # Team: API splits have id+name but no abbreviation field —
+                        # map full name through TEAM_ABB_MAP
+                        _tm_name = tm.get("name", "")
+                        _tm_abbr = _TEAM_ABB_MAP.get(_tm_name, tm.get("abbreviation", ""))
                         # Derived Statcast proxies from counting stats
                         # HR allowed / TBF → barrel% allowed proxy
                         # League avg: HR/TBF ~2.9% → barrel_allowed ~6.5%
@@ -1351,7 +1356,7 @@ def load_all_pitching_stats(season: int = 2025) -> pd.DataFrame:
                         rows.append({
                             "mlbam_id":      str(p.get("id", "")),
                             "_name":         p.get("fullName", ""),
-                            "Team":          tm.get("abbreviation", ""),
+                            "Team":          _tm_abbr,
                             "ERA":           era,
                             "WHIP":          whip,
                             "K%":            round(so / tbf, 3) if tbf > 0 else 0.228,

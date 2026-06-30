@@ -29,6 +29,9 @@ from datetime import datetime, timezone
 import pandas as pd
 import requests
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from lib.constants import TEAM_ABB_MAP
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -193,7 +196,7 @@ def fetch_bat_tracking(season: int) -> pd.DataFrame:
 
 def fetch_mlb_hitting(season: int) -> pd.DataFrame:
     url = (f"https://statsapi.mlb.com/api/v1/stats"
-           f"?stats=season&group=hitting&season={season}&limit=2000&offset=0&sportId=1")
+           f"?stats=season&group=hitting&season={season}&limit=2000&offset=0&sportId=1&playerPool=All")
     try:
         r = requests.get(url, timeout=25)
         if r.status_code != 200:
@@ -301,7 +304,7 @@ def fetch_fangraphs_hitting(season: int) -> pd.DataFrame:
 
 def fetch_mlb_pitching(season: int) -> pd.DataFrame:
     url = (f"https://statsapi.mlb.com/api/v1/stats"
-           f"?stats=season&group=pitching&season={season}&limit=2000&offset=0&sportId=1")
+           f"?stats=season&group=pitching&season={season}&limit=2000&offset=0&sportId=1&playerPool=All")
     try:
         r = requests.get(url, timeout=25)
         if r.status_code != 200:
@@ -340,7 +343,7 @@ def fetch_mlb_pitching(season: int) -> pd.DataFrame:
             rows.append({
                 "mlbam_id":       str(p.get("id", "")),
                 "_name":          p.get("fullName", ""),
-                "Team":           tm.get("abbreviation", ""),
+                "Team":           TEAM_ABB_MAP.get(tm.get("name", ""), tm.get("abbreviation", "")),
                 "ERA":            era,
                 "WHIP":           whip,
                 "K%":             k_pct,
