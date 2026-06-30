@@ -39,9 +39,15 @@ def display_leaderboard(plays: List[Dict]):
     if _fresh_warn:
         st.warning(f"⏰ **Stale dataset:** {_fresh_warn}")
 
-    # Proxy mode indicator
-    _bat_src_ui = st.session_state.get("_batting_source", "")
-    _is_proxy_ui = "mlbapi" in _bat_src_ui or _bat_src_ui in ("mlbapi_only",)
+    # Proxy mode indicator — driven by column presence, not source label.
+    # "savant+mlbapi" contains "mlbapi" as a substring; string matching gives
+    # false positives. Use the columns that are actually in the loaded data.
+    _bat_cols_ui = st.session_state.get("batting_cols", [])
+    _is_proxy_ui = not (
+        ("barrel_batted_rate" in _bat_cols_ui or "Barrel%" in _bat_cols_ui)
+        and ("hard_hit_percent" in _bat_cols_ui or "Hard%" in _bat_cols_ui)
+        and ("wRC+" in _bat_cols_ui)
+    )
     if _is_proxy_ui:
         st.warning("⚠️ **Proxy Data Mode** — Savant unavailable. Using MLB Stats API derived signals. "
                    "Tier thresholds adjusted −5 pts: Tier 1 ≥75 · Tier 2 ≥65 · Tier 3 ≥55. "

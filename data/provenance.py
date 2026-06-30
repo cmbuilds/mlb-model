@@ -51,12 +51,23 @@ def check_bettable_tb(
     lineup_confirmed: bool,
     sp_known: bool,
     hand_real: bool,
+    batter_pa: int = 0,
+    min_pa: int = 50,
 ) -> Tuple[bool, List[str]]:
     """
     9-condition bettable gate for TB / O0.5 props.
     Returns (is_bettable, reasons_list). All conditions must be True to bet.
+
+    batter_pa / min_pa: player blocked if PA known and below threshold.
+    50 PA is the floor for rate stats (barrel%, HH%, wRC+) to carry any signal.
+    Below that, a 1-for-2 game inflates wRC+ to 800+ and barrel% to 50% —
+    noise that passes the provenance check but means nothing.
     """
     reasons: List[str] = []
+    if batter_pa == 0:
+        reasons.append("plate appearances unknown — cannot verify sufficient sample")
+    elif batter_pa < min_pa:
+        reasons.append(f"insufficient sample ({batter_pa} PA < {min_pa} minimum)")
     if not batter_matched:
         reasons.append("player not matched to real stats")
     if not hand_real:
@@ -85,6 +96,8 @@ def check_bettable_hr(
     lineup_confirmed: bool,
     sp_known: bool,
     hand_real: bool,
+    batter_pa: int = 0,
+    min_pa: int = 50,
 ) -> Tuple[bool, List[str]]:
     """
     7-condition bettable gate for Home Run props.
@@ -92,6 +105,10 @@ def check_bettable_hr(
     ISO and HH% also required; K%/xSLG/wOBA are NOT required (not in HR formula).
     """
     reasons: List[str] = []
+    if batter_pa == 0:
+        reasons.append("plate appearances unknown — cannot verify sufficient sample")
+    elif batter_pa < min_pa:
+        reasons.append(f"insufficient sample ({batter_pa} PA < {min_pa} minimum)")
     if not batter_matched:
         reasons.append("player not matched to real stats")
     if not hand_real:
@@ -140,6 +157,8 @@ def check_bettable_o05(
     lineup_confirmed: bool,
     sp_known: bool,
     hand_real: bool,
+    batter_pa: int = 0,
+    min_pa: int = 50,
 ) -> Tuple[bool, List[str]]:
     """
     9-condition bettable gate for O0.5 Any Hit props.
@@ -147,6 +166,10 @@ def check_bettable_o05(
     SP K% required (strikeout = direct no-hit outcome).
     """
     reasons: List[str] = []
+    if batter_pa == 0:
+        reasons.append("plate appearances unknown — cannot verify sufficient sample")
+    elif batter_pa < min_pa:
+        reasons.append(f"insufficient sample ({batter_pa} PA < {min_pa} minimum)")
     if not batter_matched:
         reasons.append("player not matched to real stats")
     if not hand_real:

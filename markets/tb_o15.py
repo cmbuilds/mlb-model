@@ -107,7 +107,8 @@ def score_one_batter(
     lineup_sc, lineup_label  = compute_lineup_score(lineup_slot)
     park_sc, park_label      = compute_park_score(park_team, True)
     weather_sc, weather_label = compute_weather_score(weather)
-    vegas_sc, _              = (0.0, "no lines") if not implied else compute_vegas_score(implied)
+    vegas_missing = not bool(implied)
+    vegas_sc, vegas_label = (0.0, "no lines") if vegas_missing else compute_vegas_score(implied)
     tto_sc, tto_label        = compute_tto_bonus(lineup_slot)
 
     season_slg = batter_stats.get("slg_proxy", 0.398)
@@ -130,6 +131,7 @@ def score_one_batter(
         bvp_score=bvp_sc,
         bvp_weight_boost=_bvp_boost,
         proxy_mode=proxy_mode,
+        vegas_missing=vegas_missing,
     )
 
     # Caps
@@ -164,10 +166,12 @@ def score_one_batter(
     bat_matched = batter_stats.get("data_source", "league_avg") != "league_avg"
     pit_matched = pitcher_stats.get("data_source", "league_avg") != "league_avg"
     sp_known = not sp_tbd
+    batter_pa = int(batter_stats.get("pa", 0) or 0)
     dq_score = compute_data_quality_score(bat_prov, pit_prov, lineup_confirmed, sp_known, hand_real)
     is_bettable, bet_reasons = check_bettable_tb(
         bat_prov, pit_prov, bat_matched, pit_matched,
         lineup_confirmed, sp_known, hand_real,
+        batter_pa=batter_pa,
     )
 
     return {
@@ -232,6 +236,8 @@ def score_one_batter(
         "sub_park":         round(park_sc, 1),
         "sub_weather":      round(weather_sc, 1),
         "sub_vegas":        round(vegas_sc, 1),
+        "vegas_missing":    vegas_missing,
+        "batter_pa":        batter_pa,
         "bullpen_vuln":     round(bp_vuln, 1),
         "platoon_edge":     plat_label,
         "bat_speed":        batter_stats.get("bat_speed", 0),

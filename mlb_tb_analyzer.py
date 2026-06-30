@@ -2069,6 +2069,11 @@ def get_batter_stats(player_name: str, mlb_id: str,
             h26 = hard_26 if hard_26 < 1 else hard_26 / 100
             stats["hard_hit_rate"] = stats["hard_hit_rate"] * 0.65 + h26 * 0.35
 
+        # ── Plate appearances — passed to bettable gate for sample-size check ─
+        _pa = safe_get(row, 'pa', 'PA', default=None)
+        if _pa is not None and _pa > 0:
+            stats["pa"] = int(_pa)
+
     return stats
 
 def get_pitcher_stats(pitcher_name: str, pitcher_mlb_id: str,
@@ -3562,12 +3567,10 @@ def compute_final_score(
         and ("Hard%" in _bat_cols or "hard_hit_percent" in _bat_cols)
         and ("wRC+" in _bat_cols)
     )
-    _is_proxy = (
-        "mlbapi" in _bat_src
-        or _bat_src in ("mlbapi_only",)
-        or "disk_cache_stale" in _bat_src
-        or not _has_full
-    )
+    # Proxy mode = required Savant columns absent. Do NOT pattern-match the
+    # source label: "savant+mlbapi" contains "mlbapi" as a substring and would
+    # falsely fire proxy mode even with full measured data.
+    _is_proxy = not _has_full
     return _compute_final_score_pure(
         batter_score=batter_score,
         pitcher_vuln_score=pitcher_vuln_score,
@@ -4287,11 +4290,14 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 if _pd:
                     prop_implied = _pd.get("market_implied")
 
-            # Detect proxy mode for tier thresholds and scoring offset
-            _bat_src_loop = st.session_state.get("_batting_source", "")
-            _proxy_mode = (
-                "mlbapi" in _bat_src_loop
-                or _bat_src_loop in ("disk_cache_stale", "mlbapi_only")
+            # Proxy mode: driven by whether required Savant columns are present,
+            # not by source label ("savant+mlbapi" contains "mlbapi" as a substring
+            # and would falsely fire proxy mode even with full measured data).
+            _bat_cols_loop = st.session_state.get("batting_cols", [])
+            _proxy_mode = not (
+                ("barrel_batted_rate" in _bat_cols_loop or "Barrel%" in _bat_cols_loop)
+                and ("hard_hit_percent" in _bat_cols_loop or "Hard%" in _bat_cols_loop)
+                and ("wRC+" in _bat_cols_loop)
             )
 
             result = _score_one_batter_pure(
