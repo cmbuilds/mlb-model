@@ -361,9 +361,20 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
     # Contest type
     contest_type = st.radio(
         "Contest type",
-        ["Single entry (balanced, $40K Battery equiv.)", "Multi-entry GPP (Deuces Wild, $300K)"],
+        ["Single entry ($40K Battery)", "Multi-entry GPP (Deuces Wild $300K / 10×$18)"],
         key="fd_contest_type",
     )
+    is_multi = "Multi" in contest_type
+
+    # n_lineups override for multi-entry
+    if is_multi:
+        n_lineups_override = st.number_input(
+            "Number of lineups", min_value=2, max_value=150, value=10, step=1,
+            key="fd_n_lineups",
+            help="FD Deuces Wild: enter up to 150. 10×$18 DK: typically 10.",
+        )
+    else:
+        n_lineups_override = 1
 
     # Optional manual overrides
     with st.expander("⚙️ Manual overrides"):
@@ -381,11 +392,12 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
         from dfs.optimize import (
             build_fd_lineups, export_fd_csv,
             CONTEST_SINGLE_ENTRY, CONTEST_MULTI_ENTRY_GPP,
+            with_n_lineups, check_lineup_diversity,
         )
-        contest = (CONTEST_MULTI_ENTRY_GPP
-                   if "Multi" in contest_type else CONTEST_SINGLE_ENTRY)
+        base_contest = CONTEST_MULTI_ENTRY_GPP if is_multi else CONTEST_SINGLE_ENTRY
+        contest = with_n_lineups(base_contest, n_lineups_override)
 
-        with st.spinner(f"Building {contest.n_lineups} lineup(s)…"):
+        with st.spinner(f"Building {contest.n_lineups} FD lineup(s)…"):
             try:
                 lineups = build_fd_lineups(
                     board=board,
@@ -398,6 +410,14 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
                 return
 
         st.success(f"✅ {len(lineups)} lineup(s) built")
+
+        # ── Uniqueness check ──────────────────────────────────────────────────
+        if len(lineups) > 1:
+            div_warnings = check_lineup_diversity(lineups, warn_threshold=7)
+            if div_warnings:
+                with st.expander(f"⚠️ {len(div_warnings)} similar lineup pair(s) detected"):
+                    for w in div_warnings:
+                        st.caption(w)
 
         # ── Exposure report ───────────────────────────────────────────────────
         if len(lineups) > 1:
@@ -461,6 +481,7 @@ def _render_dk_builder(board: List[ConsensusRow]):
     from dfs.optimize import (
         build_dk_lineups, export_dk_csv,
         CONTEST_SINGLE_ENTRY, CONTEST_MULTI_ENTRY_GPP,
+        with_n_lineups, check_lineup_diversity,
     )
 
     contest_type = st.radio(
@@ -468,6 +489,15 @@ def _render_dk_builder(board: List[ConsensusRow]):
         ["Single entry ($40K Battery)", "Multi-entry GPP (10×$18)"],
         key="dk_contest_type",
     )
+    is_multi_dk = "Multi" in contest_type
+
+    if is_multi_dk:
+        n_lineups_dk = st.number_input(
+            "Number of lineups", min_value=2, max_value=150, value=10, step=1,
+            key="dk_n_lineups",
+        )
+    else:
+        n_lineups_dk = 1
 
     with st.expander("⚙️ Manual overrides"):
         all_names = sorted(r.name for r in board if r.state == ConfidenceState.CONFIDENT and r.salary >= 3000)
@@ -481,7 +511,8 @@ def _render_dk_builder(board: List[ConsensusRow]):
         build_btn = st.button("⚡ Build DK Lineups", type="primary", key="dk_build_btn")
 
     if build_btn:
-        contest = CONTEST_MULTI_ENTRY_GPP if "Multi" in contest_type else CONTEST_SINGLE_ENTRY
+        base = CONTEST_MULTI_ENTRY_GPP if is_multi_dk else CONTEST_SINGLE_ENTRY
+        contest = with_n_lineups(base, n_lineups_dk)
         with st.spinner(f"Building {contest.n_lineups} DK lineup(s)…"):
             try:
                 lineups = build_dk_lineups(
@@ -493,6 +524,13 @@ def _render_dk_builder(board: List[ConsensusRow]):
                 return
 
         st.success(f"✅ {len(lineups)} lineup(s) built")
+
+        if len(lineups) > 1:
+            div_warnings = check_lineup_diversity(lineups, warn_threshold=7)
+            if div_warnings:
+                with st.expander(f"⚠️ {len(div_warnings)} similar lineup pair(s)"):
+                    for w in div_warnings:
+                        st.caption(w)
 
         if len(lineups) > 1:
             _render_exposure_report(lineups, cap=50_000, key_prefix="dk")

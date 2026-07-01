@@ -49,6 +49,39 @@ CONTEST_MULTI_ENTRY_GPP = ContestConfig(
 )
 
 
+def with_n_lineups(config: ContestConfig, n: int) -> ContestConfig:
+    """Return a copy of config with n_lineups overridden."""
+    return ContestConfig(
+        n_lineups=n, max_exposure=config.max_exposure,
+        min_teams=config.min_teams, stack_size=config.stack_size,
+        randomness=config.randomness, label=config.label,
+    )
+
+
+def lineup_uniqueness_score(lu1: Dict, lu2: Dict) -> int:
+    """Count shared players between two lineups. 7+ of 9 is degenerate for FD."""
+    names1 = {p["name"] for p in lu1["players"]}
+    names2 = {p["name"] for p in lu2["players"]}
+    return len(names1 & names2)
+
+
+def check_lineup_diversity(lineups: List[Dict], warn_threshold: int = 7) -> List[str]:
+    """
+    Return a list of warning strings for degenerate lineup pairs.
+    warn_threshold: lineups sharing >= this many players are flagged.
+    """
+    warnings = []
+    n = len(lineups)
+    for i in range(n):
+        for j in range(i + 1, n):
+            shared = lineup_uniqueness_score(lineups[i], lineups[j])
+            if shared >= warn_threshold:
+                warnings.append(
+                    f"Lineups {i+1} and {j+1} share {shared} players — may be too similar"
+                )
+    return warnings
+
+
 # ── FanDuel ────────────────────────────────────────────────────────────────────
 _FD_POS_MAP = {
     "SP": "P", "RP": "P",
