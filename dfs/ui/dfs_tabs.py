@@ -453,6 +453,30 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
             "text/csv", key="fd_download_csv",
         )
 
+        # ── Lineup log ────────────────────────────────────────────────────────
+        slate_date_key = "fd_slate_date"
+        log_notes_key  = "fd_log_notes"
+        with st.expander("💾 Save to lineup log"):
+            slate_date = st.date_input(
+                "Slate date", value=datetime.now(EST).date(), key=slate_date_key,
+            )
+            log_notes = st.text_input(
+                "Notes (contest name, stakes…)", value="", key=log_notes_key,
+            )
+            if st.button("Save lineups to log", key="fd_log_btn"):
+                try:
+                    from dfs.lineup_log import log_lineups
+                    row_id = log_lineups(
+                        lineups=lineups,
+                        site="fd",
+                        contest_label=contest.label,
+                        slate_date=str(slate_date),
+                        notes=log_notes,
+                    )
+                    st.success(f"Saved — log row #{row_id}")
+                except Exception as e:
+                    st.error(f"Log failed: {e}")
+
 
 # ─── DK Builder ───────────────────────────────────────────────────────────────
 def _render_dk_builder(board: List[ConsensusRow]):
@@ -560,6 +584,28 @@ def _render_dk_builder(board: List[ConsensusRow]):
             f"dk_lineups_{datetime.now(EST).strftime('%Y%m%d_%H%M')}.csv",
             "text/csv", key="dk_download_csv",
         )
+
+        # ── Lineup log ────────────────────────────────────────────────────────
+        with st.expander("💾 Save to lineup log"):
+            slate_date = st.date_input(
+                "Slate date", value=datetime.now(EST).date(), key="dk_slate_date",
+            )
+            log_notes = st.text_input(
+                "Notes (contest name, stakes…)", value="", key="dk_log_notes",
+            )
+            if st.button("Save lineups to log", key="dk_log_btn"):
+                try:
+                    from dfs.lineup_log import log_lineups
+                    row_id = log_lineups(
+                        lineups=lineups,
+                        site="dk",
+                        contest_label=contest.label,
+                        slate_date=str(slate_date),
+                        notes=log_notes,
+                    )
+                    st.success(f"Saved — log row #{row_id}")
+                except Exception as e:
+                    st.error(f"Log failed: {e}")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
