@@ -144,12 +144,13 @@ def display_dfs_tabs(plays: List[Dict]):
             )
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_fd, tab_dk, tab_stacks, tab_build, tab_dk_build = st.tabs([
+    tab_fd, tab_dk, tab_stacks, tab_build, tab_dk_build, tab_log = st.tabs([
         "🟣 FanDuel Board",
         "🟢 DraftKings Board",
         "🔥 Stack Ranks",
         "🏗️ FD Lineup Builder",
         "🛠️ DK Builder (beta)",
+        "📋 Lineup Log",
     ])
 
     with tab_fd:
@@ -166,6 +167,9 @@ def display_dfs_tabs(plays: List[Dict]):
 
     with tab_dk_build:
         _render_dk_builder(dk_board)
+
+    with tab_log:
+        _render_lineup_log()
 
 
 # ─── Value Board ──────────────────────────────────────────────────────────────
@@ -606,6 +610,93 @@ def _render_dk_builder(board: List[ConsensusRow]):
                     st.success(f"Saved — log row #{row_id}")
                 except Exception as e:
                     st.error(f"Log failed: {e}")
+
+
+# ─── Lineup Log Viewer ────────────────────────────────────────────────────────
+def _render_lineup_log():
+    st.markdown("### 📋 Lineup Log")
+    st.caption("All saved lineups, newest first. Enter contest results to build the backtest dataset.")
+
+    from dfs.lineup_log import get_lineups, record_result
+
+    col_site, col_date, col_refresh = st.columns([1, 2, 1])
+    with col_site:
+        site_filter = st.selectbox("Site", ["all", "fd", "dk"], key="log_site_filter")
+    with col_date:
+        date_filter = st.text_input("Slate date (YYYY-MM-DD)", value="", key="log_date_filter")
+    with col_refresh:
+        st.markdown("&nbsp;", unsafe_allow_html=True)  # spacer
+        refresh = st.button("Refresh", key="log_refresh")
+
+    _ = refresh  # triggers re-run on click
+
+    try:
+        rows = get_lineups(
+            slate_date=date_filter.strip() or None,
+            site=None if site_filter == "all" else site_filter,
+            limit=100,
+        )
+    except Exception as e:
+        st.error(f"Could not load lineup log: {e}")
+        return
+
+    if not rows:
+        st.info("No saved lineups yet. Build lineups and use 'Save to lineup log' to record them.")
+        return
+
+    st.markdown(f"**{len(rows)} record(s)**")
+
+    for row in rows:
+        has_result = row["result_pts"] is not None
+        result_tag = f" · ✅ {row['result_pts']:.1f} pts" if has_result else " · ⏳ pending"
+        header = (
+            f"#{row['id']} · {row['slate_date']} · {row['site'].upper()} · "
+            f"{row['contest_label']} · {row['n_lineups']} lineup(s) · "
+            f"{row['total_proj']:.1f} avg proj{result_tag}"
+        )
+        if row["notes"]:
+            header += f" · {row['notes']}"
+
+        with st.expander(header):
+            # Player tables per lineup
+            lineups_data = row["players_json"]
+            if isinstance(lineups_data, list):
+                for i, lu_players in enumerate(lineups_data, 1):
+                    if lu_players:
+                        st.caption(f"Lineup {i}")
+                        st.dataframe(pd.DataFrame(lu_players), use_container_width=True)
+
+            # Result entry form
+            if not has_result:
+                st.markdown("**Enter contest result**")
+                r_col1, r_col2, r_col3 = st.columns([2, 2, 1])
+                with r_col1:
+                    res_pts = st.number_input(
+                        "Actual pts", min_value=0.0, step=0.1,
+                        key=f"res_pts_{row['id']}",
+                    )
+                with r_col2:
+                    res_rank = st.number_input(
+                        "Rank (optional)", min_value=0, step=1,
+                        key=f"res_rank_{row['id']}",
+                    )
+                with r_col3:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    if st.button("Save", key=f"res_save_{row['id']}"):
+                        try:
+                            record_result(
+                                row_id=row["id"],
+                                result_pts=res_pts,
+                                result_rank=int(res_rank) if res_rank > 0 else None,
+                            )
+                            st.success("Result saved — refresh to update.")
+                        except Exception as e:
+                            st.error(f"Failed: {e}")
+            else:
+                st.markdown(
+                    f"**Result:** {row['result_pts']:.1f} pts"
+                    + (f" · rank #{row['result_rank']}" if row["result_rank"] else "")
+                )
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
