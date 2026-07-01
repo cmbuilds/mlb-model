@@ -81,18 +81,29 @@ def display_dfs_tabs(plays: List[Dict]):
         st.error(f"DK consensus failed: {e}")
         dk_board = []
 
-    # Merge salaries if uploaded
+    # Merge salaries + augment with pitchers from salary CSV
     if fd_salaries and fd_board:
-        from dfs.sources.salaries import merge_salaries_into_board
+        from dfs.sources.salaries import merge_salaries_into_board, pitchers_from_salary_csv
         fd_board, fd_matched = merge_salaries_into_board(fd_board, fd_salaries)
         if fd_matched < len(fd_board) // 2:
             st.warning(f"⚠️ FD salary match rate low: {fd_matched}/{len(fd_board)} players matched by name")
+        # Add pitchers from salary CSV — model produces batter-only plays
+        fd_pitchers = pitchers_from_salary_csv(fd_salaries, site="fd")
+        if fd_pitchers:
+            fd_board = fd_board + fd_pitchers
+            n_conf_p = sum(1 for p in fd_pitchers if p.state.value == "CONFIDENT")
+            st.caption(f"📋 {len(fd_pitchers)} pitcher(s) loaded from FD salary CSV ({n_conf_p} CONFIDENT via site FPPG)")
 
     if dk_salaries and dk_board:
-        from dfs.sources.salaries import merge_salaries_into_board
+        from dfs.sources.salaries import merge_salaries_into_board, pitchers_from_salary_csv
         dk_board, dk_matched = merge_salaries_into_board(dk_board, dk_salaries)
         if dk_matched < len(dk_board) // 2:
             st.warning(f"⚠️ DK salary match rate low: {dk_matched}/{len(dk_board)} players matched by name")
+        dk_pitchers = pitchers_from_salary_csv(dk_salaries, site="dk")
+        if dk_pitchers:
+            dk_board = dk_board + dk_pitchers
+            n_conf_p = sum(1 for p in dk_pitchers if p.state.value == "CONFIDENT")
+            st.caption(f"📋 {len(dk_pitchers)} pitcher(s) loaded from DK salary CSV ({n_conf_p} CONFIDENT via site FPPG)")
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
     tab_fd, tab_dk, tab_stacks, tab_build = st.tabs([

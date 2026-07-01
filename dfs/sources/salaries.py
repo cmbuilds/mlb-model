@@ -17,7 +17,10 @@ import csv
 import io
 import re
 import unicodedata
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from dfs.contracts import ConsensusRow
 
 
 def _norm(name: str) -> str:
@@ -167,3 +170,94 @@ def merge_salaries_into_board(board, salary_rows: List[Dict]) -> List:
             matched += 1
 
     return board, matched
+
+
+# ── Pitcher augmentation ───────────────────────────────────────────────────────
+_PITCHER_POSITIONS = {"P", "SP", "RP"}
+_MIN_PITCHER_FPPG  = 10.0   # below this we flag rather than include as CONFIDENT
+_MIN_PITCHER_SAL   = 5000   # sanity floor; ignore sub-$5K pitchers
+
+
+def pitchers_from_salary_csv(salary_rows: List[Dict], site: str) -> List:
+    """
+    Create ConsensusRow entries for pitchers found in the salary CSV.
+
+    The model produces batter plays only. Pitchers must come from the salary CSV
+    so the optimizer can fill the P/SP roster slot. We use the site's FPPG as the
+    projection and mark source="site_fppg" so the UI shows this is NOT model-derived.
+
+    State = CONFIDENT when salary >= _MIN_PITCHER_SAL and fppg >= _MIN_PITCHER_FPPG.
+    State = FLAGGED when below the threshold (site avg looks unreliable).
+    """
+    from dfs.contracts import ConsensusRow, ConfidenceState, Provenance
+
+    pitcher_pos = "P" if site == "fd" else "SP"
+    rows = []
+
+    for sal in salary_rows:
+        raw_pos = (sal.get("position") or "").strip().upper()
+        if raw_pos not in _PITCHER_POSITIONS:
+            continue
+
+        salary = sal.get("salary") or 0
+        fppg   = float(sal.get("fppg") or sal.get("avg_pts") or 0.0)
+        name   = sal.get("name", "")
+        team   = sal.get("team", "")
+        opp    = sal.get("opponent", "")
+
+        if not name or salary <= 0:
+            continue
+
+        # Parse game string for opponent if not in CSV (DK format: "AWAY@HOME date")
+        if not opp:
+            game_str = sal.get("game", "")
+            if "@" in game_str:
+                parts = game_str.split()[0].split("@")  # "NYY@BOS" → ["NYY","BOS"]
+                if len(parts) == 2:
+                    home, away = parts[1].upper(), parts[0].upper()
+                    opp = home if team == away else away
+
+        is_confident = (salary >= _MIN_PITCHER_SAL and fppg >= _MIN_PITCHER_FPPG)
+        state  = ConfidenceState.CONFIDENT if is_confident else ConfidenceState.FLAGGED
+        reason = "" if is_confident else f"site FPPG {fppg:.1f} below {_MIN_PITCHER_FPPG:.0f}pt threshold"
+
+        consensus_pts   = round(fppg, 1)
+        consensus_value = round(fppg / (salary / 1000), 2) if salary >= 1000 else 0.0
+        ceiling = round(fppg * 1.50, 1)
+        floor   = round(fppg * 0.25, 1)
+        own_pct = round(min(50.0, max(3.0, (fppg / (salary / 1000)) * 3.5)), 1)
+
+        rows.append(ConsensusRow(
+            name=name,
+            team=team,
+            opponent=opp,
+            position=pitcher_pos,
+            site=site,
+            salary=salary,
+            lineup_slot=0,
+            consensus_pts=consensus_pts,
+            consensus_value=consensus_value,
+            model_pts=consensus_pts,
+            model_ceiling=ceiling,
+            model_floor=floor,
+            state=state,
+            source_count=1,
+            sources_used=["site_fppg"],
+            flagged_reason=reason,
+            own_pct=own_pct,
+            own_provenance=Provenance.MODELED,
+            divergence=0.0,
+            divergence_flag=False,
+            bettable=False,
+            batter_hand="R",
+            sp_name=name,
+            sp_hand="?",
+            park=team,
+            implied_total=0.0,
+            game_id=sal.get("game", ""),
+            score=0.0,
+            hr_score=0.0,
+            dq_score=0,
+        ))
+
+    return rows

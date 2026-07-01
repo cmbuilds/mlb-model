@@ -125,3 +125,68 @@ def test_plays_to_fd_empty_raises():
     from dfs.sources.api_external import SourceError
     with pytest.raises(SourceError):
         plays_to_fd_projections([])
+
+
+# ── pitchers_from_salary_csv ──────────────────────────────────────────────────
+from dfs.sources.salaries import pitchers_from_salary_csv
+from dfs.contracts import ConfidenceState, Provenance
+
+_FD_PITCHERS_CSV = """FPPG,Nickname,First Name,Last Name,ID,Position,Team,Salary,Game,Opponent,Weather,Injury Indicator
+38.5,Gerrit Cole,Gerrit,Cole,1001,P,NYY,10400,NYY@BOS,BOS,Clear,
+22.1,Luis Castillo,Luis,Castillo,1002,P,SEA,7200,SEA@LAA,LAA,Clear,
+6.2,Spot Starter,Spot,Starter,1003,P,MIA,4800,MIA@PHI,PHI,Clear,
+18.5,Aaron Judge,Aaron,Judge,2001,OF,NYY,3700,NYY@BOS,BOS,Clear,
+"""
+
+def test_pitchers_from_fd_csv_returns_only_pitchers():
+    salary_rows = parse_fd_salary_csv(_FD_PITCHERS_CSV)
+    pitchers = pitchers_from_salary_csv(salary_rows, site="fd")
+    assert len(pitchers) == 3
+    assert all(p.position == "P" for p in pitchers)
+
+def test_pitchers_confident_above_threshold():
+    salary_rows = parse_fd_salary_csv(_FD_PITCHERS_CSV)
+    pitchers = pitchers_from_salary_csv(salary_rows, site="fd")
+    # Cole (38.5 fppg, $10400) and Castillo (22.1 fppg, $7200) should be CONFIDENT
+    by_name = {p.name: p for p in pitchers}
+    assert by_name["Gerrit Cole"].state == ConfidenceState.CONFIDENT
+    assert by_name["Luis Castillo"].state == ConfidenceState.CONFIDENT
+
+def test_pitcher_flagged_below_threshold():
+    salary_rows = parse_fd_salary_csv(_FD_PITCHERS_CSV)
+    pitchers = pitchers_from_salary_csv(salary_rows, site="fd")
+    by_name = {p.name: p for p in pitchers}
+    # Spot Starter: $4800 (below $5K floor) → FLAGGED
+    assert by_name["Spot Starter"].state == ConfidenceState.FLAGGED
+    assert by_name["Spot Starter"].flagged_reason != ""
+
+def test_pitcher_sources_tagged_site_fppg():
+    salary_rows = parse_fd_salary_csv(_FD_PITCHERS_CSV)
+    pitchers = pitchers_from_salary_csv(salary_rows, site="fd")
+    for p in pitchers:
+        assert p.sources_used == ["site_fppg"]
+        assert p.source_count == 1
+
+def test_pitcher_ownership_modeled():
+    salary_rows = parse_fd_salary_csv(_FD_PITCHERS_CSV)
+    pitchers = pitchers_from_salary_csv(salary_rows, site="fd")
+    for p in pitchers:
+        assert p.own_provenance == Provenance.MODELED
+
+def test_pitcher_opponent_parsed_from_game_string():
+    salary_rows = parse_fd_salary_csv(_FD_PITCHERS_CSV)
+    pitchers = pitchers_from_salary_csv(salary_rows, site="fd")
+    by_name = {p.name: p for p in pitchers}
+    # Cole is NYY, game is "NYY@BOS" — opponent should be BOS
+    assert by_name["Gerrit Cole"].opponent == "BOS"
+
+def test_pitcher_dk_position_is_sp():
+    # DK uses SP not P
+    dk_salary_rows = [
+        {"name": "Gerrit Cole", "position": "SP", "salary": 9800,
+         "fppg": 0.0, "avg_pts": 22.5, "team": "NYY", "opponent": "BOS",
+         "game": "NYY@BOS", "site": "dk"},
+    ]
+    pitchers = pitchers_from_salary_csv(dk_salary_rows, site="dk")
+    assert len(pitchers) == 1
+    assert pitchers[0].position == "SP"

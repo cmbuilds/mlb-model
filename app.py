@@ -510,6 +510,7 @@ else:
             st.session_state.plays = plays
             st.session_state.analysis_date = date_str
             st.session_state.model_ran = True
+            st.session_state["_model_run_ts"] = datetime.utcnow().isoformat()
             if plays:
                 save_picks_to_db(plays, date_str)
                 # ── V1.9: Pre-fetch ump data and run differential for new tabs ──

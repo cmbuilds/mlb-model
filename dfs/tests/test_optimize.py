@@ -113,6 +113,38 @@ def test_build_fd_lineup_has_required_keys():
     assert len(lu["players"]) >= 9
 
 
+# ── Pitcher-augmented board ───────────────────────────────────────────────────
+def test_build_fd_with_pitcher_from_salary_csv():
+    """
+    Verify that pitchers_from_salary_csv + batter board produces a valid lineup.
+    This simulates the real app flow: batter plays → consensus board,
+    then pitchers appended from salary CSV before build.
+    """
+    from dfs.sources.salaries import pitchers_from_salary_csv, parse_fd_salary_csv
+    # Batter-only board (no P)
+    board = [r for r in _full_board() if r.position != "P"]
+    assert all(r.position != "P" for r in board), "sanity: no pitchers in batter board"
+
+    # Simulate salary CSV with 3 pitchers (2 CONFIDENT, 1 FLAGGED)
+    fd_csv = (
+        "FPPG,Nickname,First Name,Last Name,ID,Position,Team,Salary,"
+        "Game,Opponent,Weather,Injury Indicator\n"
+        "35.0,Ace One,Ace,One,501,P,NYY,9800,NYY@BOS,BOS,Clear,\n"
+        "28.5,Ace Two,Ace,Two,502,P,BOS,8200,NYY@BOS,NYY,Clear,\n"
+        "25.0,Ace Three,Ace,Three,503,P,HOU,7600,HOU@TEX,TEX,Clear,\n"
+    )
+    salary_rows = parse_fd_salary_csv(fd_csv)
+    pitchers = pitchers_from_salary_csv(salary_rows, site="fd")
+    assert len(pitchers) == 3
+    assert all(p.state.value == "CONFIDENT" for p in pitchers)
+
+    augmented = board + pitchers
+    lineups = build_fd_lineups(augmented, contest=CONTEST_SINGLE_ENTRY)
+    assert len(lineups) == 1
+    player_positions = [p["position"] for p in lineups[0]["players"]]
+    assert "P" in player_positions, "lineup must contain a pitcher"
+
+
 # ── CSV export ────────────────────────────────────────────────────────────────
 def test_export_fd_csv_creates_file():
     board = _full_board()
