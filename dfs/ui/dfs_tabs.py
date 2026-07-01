@@ -29,11 +29,15 @@ import streamlit as st
 
 from dfs.contracts import ConsensusRow, ConfidenceState, Provenance
 from dfs.consensus import build_consensus_board, compute_stack_scores
+from dfs.sources.api_external import BluecollarDFSProjections, SourceError
 
 EST = pytz.timezone("US/Eastern")
 
 # Freshness threshold: warn if model data is older than this
 STALE_HOURS = 2
+
+# BluecollarDFS cache TTL (seconds) — respect their 200-req/day limit
+_BCDF_CACHE_TTL = 300   # 5 minutes
 
 
 # ─── main entry point ─────────────────────────────────────────────────────────
@@ -68,26 +72,31 @@ def display_dfs_tabs(plays: List[Dict]):
     fd_salaries = _load_salary_csv(fd_file, site="fd")
     dk_salaries = _load_salary_csv(dk_file, site="dk")
 
-    # ── Build consensus boards ────────────────────────────────────────────────
+    # ── External sources (BluecollarDFS) ─────────────────────────────────────
+    bcdf_fd_rows, bcdf_dk_rows = _fetch_bluecollardfs_cached()
+
+    # ── Build consensus boards (model + optional external) ───────────────────
     try:
-        fd_board = build_consensus_board(plays, site="fd")
+        fd_extra = [bcdf_fd_rows] if bcdf_fd_rows else None
+        fd_board = build_consensus_board(plays, extra_sources=fd_extra, site="fd")
     except Exception as e:
         st.error(f"FD consensus failed: {e}")
         fd_board = []
 
     try:
-        dk_board = build_consensus_board(plays, site="dk")
+        dk_extra = [bcdf_dk_rows] if bcdf_dk_rows else None
+        dk_board = build_consensus_board(plays, extra_sources=dk_extra, site="dk")
     except Exception as e:
         st.error(f"DK consensus failed: {e}")
         dk_board = []
 
-    # Merge salaries + augment with pitchers from salary CSV
+    # ── Merge salaries + augment with pitchers from salary CSV ───────────────
+    from dfs.sources.salaries import merge_salaries_into_board, pitchers_from_salary_csv
+
     if fd_salaries and fd_board:
-        from dfs.sources.salaries import merge_salaries_into_board, pitchers_from_salary_csv
         fd_board, fd_matched = merge_salaries_into_board(fd_board, fd_salaries)
         if fd_matched < len(fd_board) // 2:
             st.warning(f"⚠️ FD salary match rate low: {fd_matched}/{len(fd_board)} players matched by name")
-        # Add pitchers from salary CSV — model produces batter-only plays
         fd_pitchers = pitchers_from_salary_csv(fd_salaries, site="fd")
         if fd_pitchers:
             fd_board = fd_board + fd_pitchers
@@ -95,7 +104,6 @@ def display_dfs_tabs(plays: List[Dict]):
             st.caption(f"📋 {len(fd_pitchers)} pitcher(s) loaded from FD salary CSV ({n_conf_p} CONFIDENT via site FPPG)")
 
     if dk_salaries and dk_board:
-        from dfs.sources.salaries import merge_salaries_into_board, pitchers_from_salary_csv
         dk_board, dk_matched = merge_salaries_into_board(dk_board, dk_salaries)
         if dk_matched < len(dk_board) // 2:
             st.warning(f"⚠️ DK salary match rate low: {dk_matched}/{len(dk_board)} players matched by name")
@@ -106,11 +114,12 @@ def display_dfs_tabs(plays: List[Dict]):
             st.caption(f"📋 {len(dk_pitchers)} pitcher(s) loaded from DK salary CSV ({n_conf_p} CONFIDENT via site FPPG)")
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_fd, tab_dk, tab_stacks, tab_build = st.tabs([
+    tab_fd, tab_dk, tab_stacks, tab_build, tab_dk_build = st.tabs([
         "🟣 FanDuel Board",
         "🟢 DraftKings Board",
         "🔥 Stack Ranks",
         "🏗️ FD Lineup Builder",
+        "🛠️ DK Builder (beta)",
     ])
 
     with tab_fd:
@@ -124,6 +133,9 @@ def display_dfs_tabs(plays: List[Dict]):
 
     with tab_build:
         _render_fd_builder(fd_board, plays)
+
+    with tab_dk_build:
+        _render_dk_builder(dk_board)
 
 
 # ─── Value Board ──────────────────────────────────────────────────────────────
@@ -236,12 +248,8 @@ def _render_board(board: List[ConsensusRow], site: str, has_salaries: bool):
 
 
 def _render_dk_board(board: List[ConsensusRow], has_salaries: bool):
-    """DK board — same as FD board but with board-only banner."""
-    st.info(
-        "🟢 **DraftKings — Board Only Tonight.** "
-        "Use this board to manually build your Battery ($40K) and 10×$18 entries. "
-        "DK auto-optimizer activates in D1 after validation."
-    )
+    """DK board — full value board. Use DK Builder tab for auto-builds."""
+    st.caption("Upload DK salary CSV above to see value (pts/$). DK auto-builds are in the DK Builder tab.")
     _render_board(board, site="dk", has_salaries=has_salaries)
 
 
@@ -381,6 +389,91 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
         )
 
 
+# ─── DK Builder ───────────────────────────────────────────────────────────────
+def _render_dk_builder(board: List[ConsensusRow]):
+    st.markdown("### 🛠️ DraftKings Lineup Builder — Beta")
+    st.warning(
+        "⚠️ **DK auto-build is not yet validated on a live slate.** "
+        "Review every generated lineup before submitting. "
+        "The FD builder has more test history — prefer FD until DK is validated."
+    )
+
+    if not board:
+        st.info("No DK board. Upload DK salary CSV and run the model first.")
+        return
+
+    confirmed = st.checkbox(
+        "I understand DK auto-build is beta and I will review lineups before submitting",
+        value=False, key="dk_build_confirmed",
+    )
+    if not confirmed:
+        st.info("Check the box above to unlock the DK builder.")
+        return
+
+    n_conf = sum(1 for r in board if r.state == ConfidenceState.CONFIDENT and r.salary >= 3000)
+    st.metric("CONFIDENT players with salary", n_conf, help="Minimum 10 needed to build")
+
+    if n_conf < 10:
+        st.warning(
+            f"⚠️ Only {n_conf} CONFIDENT players have salaries. "
+            "Upload the DK salary CSV to enable auto-build."
+        )
+        return
+
+    from dfs.optimize import (
+        build_dk_lineups, export_dk_csv,
+        CONTEST_SINGLE_ENTRY, CONTEST_MULTI_ENTRY_GPP,
+    )
+
+    contest_type = st.radio(
+        "Contest type",
+        ["Single entry ($40K Battery)", "Multi-entry GPP (10×$18)"],
+        key="dk_contest_type",
+    )
+
+    with st.expander("⚙️ Manual overrides"):
+        all_names = sorted(r.name for r in board if r.state == ConfidenceState.CONFIDENT and r.salary >= 3000)
+        locked_names = st.multiselect("Lock players", all_names, default=[], key="dk_locked")
+        stack_teams  = sorted(set(r.team for r in board if r.state == ConfidenceState.CONFIDENT))
+        stack_team   = st.selectbox("Force stack team", ["(auto)"] + stack_teams, key="dk_stack_team")
+        stack_team   = None if stack_team == "(auto)" else stack_team
+
+    col_build, _ = st.columns([1, 3])
+    with col_build:
+        build_btn = st.button("⚡ Build DK Lineups", type="primary", key="dk_build_btn")
+
+    if build_btn:
+        contest = CONTEST_MULTI_ENTRY_GPP if "Multi" in contest_type else CONTEST_SINGLE_ENTRY
+        with st.spinner(f"Building {contest.n_lineups} DK lineup(s)…"):
+            try:
+                lineups = build_dk_lineups(
+                    board=board, contest=contest,
+                    locked_names=locked_names or None, stack_team=stack_team,
+                )
+            except Exception as e:
+                st.error(f"❌ DK build failed: {e}")
+                return
+
+        st.success(f"✅ {len(lineups)} lineup(s) built")
+
+        for i, lu in enumerate(lineups, 1):
+            with st.expander(f"Lineup {i} — {lu['total_proj']:.1f} pts projected"):
+                st.dataframe(pd.DataFrame(lu["players"]), use_container_width=True)
+                st.caption(f"Salary used: ${lu['total_salary']:,} / $50,000")
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+            export_dk_csv(lineups, tmp.name)
+            with open(tmp.name, "rb") as f:
+                csv_bytes = f.read()
+        os.unlink(tmp.name)
+
+        st.download_button(
+            "📥 Download DK bulk-upload CSV", csv_bytes,
+            f"dk_lineups_{datetime.now(EST).strftime('%Y%m%d_%H%M')}.csv",
+            "text/csv", key="dk_download_csv",
+        )
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def _state_banner(n_conf, n_flag, n_excl, n_total, has_salaries):
     c1, c2, c3, c4 = st.columns(4)
@@ -405,6 +498,69 @@ def _state_banner(n_conf, n_flag, n_excl, n_total, has_salaries):
             f"⚠️ {n_flag} players FLAGGED (proxy data or unconfirmed lineup). "
             "Only the ✅ CONFIDENT pool is eligible for auto-build."
         )
+
+
+def _fetch_bluecollardfs_cached():
+    """
+    Fetch BluecollarDFS projections for FD and DK if an API key is configured.
+    Uses session state as a 5-minute cache to respect the 200-req/day limit.
+    Returns (fd_rows, dk_rows) — each is a List[ProjectionRow] or None on failure.
+    """
+    with st.sidebar.expander("🔑 External Sources (BluecollarDFS)", expanded=False):
+        api_key = st.text_input(
+            "BluecollarDFS API key", type="password",
+            key="bcdf_api_key",
+            help="Optional. Adds external model projections to consensus (weight 0.5). "
+                 "Get a key at bluecollardfs.com — 200 req/day, cache 5 min.",
+        )
+        fetch_btn = st.button("Fetch Projections", key="bcdf_fetch_btn")
+        bcdf_status = st.empty()
+
+    if not api_key:
+        return None, None
+
+    now = datetime.now(timezone.utc).timestamp()
+    cache_key_ts = "_bcdf_fetched_at"
+    cache_key_fd = "_bcdf_fd_rows"
+    cache_key_dk = "_bcdf_dk_rows"
+
+    last_fetch = st.session_state.get(cache_key_ts, 0)
+    cache_fresh = (now - last_fetch) < _BCDF_CACHE_TTL
+
+    if cache_fresh and not fetch_btn:
+        fd_rows = st.session_state.get(cache_key_fd)
+        dk_rows = st.session_state.get(cache_key_dk)
+        age_s   = int(now - last_fetch)
+        bcdf_status.caption(f"BluecollarDFS: cached ({age_s}s old)")
+        return fd_rows, dk_rows
+
+    src = BluecollarDFSProjections({"api_key": api_key})
+    fd_rows = dk_rows = None
+    import datetime as _dt
+    date_str = _dt.date.today().isoformat()
+
+    for site, key in [("fd", cache_key_fd), ("dk", cache_key_dk)]:
+        try:
+            rows = src.fetch_projections(site=site, date=date_str)
+            st.session_state[key] = rows
+            if site == "fd":
+                fd_rows = rows
+            else:
+                dk_rows = rows
+        except SourceError as e:
+            st.session_state[key] = None
+            bcdf_status.warning(f"BluecollarDFS {site.upper()}: {e}")
+        except Exception as e:
+            st.session_state[key] = None
+            bcdf_status.error(f"BluecollarDFS {site.upper()} fetch failed: {e}")
+
+    st.session_state[cache_key_ts] = now
+    n_fd = len(fd_rows) if fd_rows else 0
+    n_dk = len(dk_rows) if dk_rows else 0
+    if n_fd or n_dk:
+        bcdf_status.success(f"BluecollarDFS: {n_fd} FD + {n_dk} DK rows loaded")
+
+    return fd_rows, dk_rows
 
 
 def _load_salary_csv(uploaded_file, site: str) -> Optional[List[Dict]]:

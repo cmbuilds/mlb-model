@@ -251,6 +251,14 @@ def build_dk_lineups(
     locked   = set(locked_names or [])
     excluded = set(excluded_names or [])
 
+    _game_cache_dk: Dict[frozenset, GameInfo] = {}
+
+    def _game_info_for_dk(team: str, opponent: str) -> GameInfo:
+        key = frozenset({team, opponent})
+        if key not in _game_cache_dk:
+            _game_cache_dk[key] = GameInfo(home_team=opponent, away_team=team, starts_at=None)
+        return _game_cache_dk[key]
+
     players: List[Player] = []
     for row in confident_rows:
         pname = row.name.strip()
@@ -270,6 +278,7 @@ def build_dk_lineups(
             projected_ownership=row.own_pct / 100.0,
             fppg_floor=row.model_floor,
             fppg_ceil=row.model_ceiling,
+            game_info=_game_info_for_dk(row.team, row.opponent or "OPP"),
         )
         players.append(p)
 
