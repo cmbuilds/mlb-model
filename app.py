@@ -14,6 +14,7 @@ from ui.hr_tab          import display_hr_plays
 from ui.k_props_tab     import display_k_props_tab
 from ui.leaderboard     import display_leaderboard
 from ui.moneyline_tab   import display_moneyline_tab
+from dfs.ui.dfs_tabs    import display_dfs_tabs
 
 from mlb_tb_analyzer import (
     display_dk_portfolio_builder,
@@ -485,7 +486,7 @@ else:
     st.caption("Fully automated | HardRock Bet | 1B=1 2B=2 3B=3 HR=4 | FD + DK portfolios | Team stack scores")
 
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
         "📊 O1.5 Leaderboard",
         "🎯 O0.5 Any Hit",
         "⚡ K Props",
@@ -497,6 +498,7 @@ else:
         "🚀 FD Portfolio",
         "⚡ DK Portfolio",
         "📈 Results Tracker",
+        "🃏 DFS",
     ])
 
     # ── RUN MODEL ────────────────────────────────────────
@@ -604,6 +606,9 @@ else:
 
     with tab11:
         display_results_tracker()
+
+    with tab12:
+        display_dfs_tabs(st.session_state.plays if st.session_state.plays else [])
 
 
 if __name__ == "__main__":
