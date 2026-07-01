@@ -6,8 +6,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import pytest
 from dfs.contracts import ConsensusRow, ConfidenceState, Provenance
 from dfs.optimize import (
-    build_fd_lineups, CONTEST_SINGLE_ENTRY, CONTEST_MULTI_ENTRY_GPP,
-    export_fd_csv,
+    build_fd_lineups, build_fd_lineups_diverse, CONTEST_SINGLE_ENTRY, CONTEST_MULTI_ENTRY_GPP,
+    export_fd_csv, allocate_lineups_by_stack, with_n_lineups, check_lineup_diversity,
 )
 import tempfile
 
@@ -146,6 +146,55 @@ def test_build_fd_with_pitcher_from_salary_csv():
 
 
 # ── CSV export ────────────────────────────────────────────────────────────────
+# ── allocate_lineups_by_stack ─────────────────────────────────────────────────
+def test_allocate_sums_to_n():
+    scores = {"NYY": 120.0, "BOS": 110.0, "HOU": 100.0, "LAD": 90.0}
+    alloc = allocate_lineups_by_stack(scores, n_lineups=10)
+    assert sum(alloc.values()) == 10
+
+
+def test_allocate_all_teams_get_at_least_one():
+    scores = {"NYY": 120.0, "BOS": 110.0, "HOU": 100.0}
+    alloc = allocate_lineups_by_stack(scores, n_lineups=10, max_stacks=3)
+    for team in ["NYY", "BOS", "HOU"]:
+        assert alloc.get(team, 0) >= 1
+
+
+def test_allocate_top_team_gets_most():
+    scores = {"NYY": 150.0, "BOS": 100.0, "HOU": 80.0}
+    alloc = allocate_lineups_by_stack(scores, n_lineups=12, max_stacks=3)
+    assert alloc["NYY"] >= alloc["BOS"] >= alloc.get("HOU", 0)
+
+
+def test_allocate_n_less_than_teams():
+    scores = {"NYY": 120.0, "BOS": 110.0, "HOU": 100.0, "LAD": 90.0}
+    alloc = allocate_lineups_by_stack(scores, n_lineups=2, max_stacks=4)
+    assert sum(alloc.values()) == 2
+    assert len(alloc) == 2
+
+
+def test_allocate_empty_scores_returns_empty():
+    assert allocate_lineups_by_stack({}, n_lineups=5) == {}
+
+
+# ── build_fd_lineups_diverse ──────────────────────────────────────────────────
+def test_build_fd_diverse_multi_team_stacks():
+    """Diverse build produces valid lineups split across multiple teams."""
+    board = _full_board()
+    # Use deterministic single-entry clones per team (no randomness) to guarantee
+    # feasibility on the small 20-player test board.
+    from dfs.optimize import ContestConfig
+    det_gpp = ContestConfig(
+        n_lineups=3, max_exposure=1.0, min_teams=3,
+        stack_size=3, randomness=0.0, label="test-gpp",
+    )
+    lineups = build_fd_lineups_diverse(board, contest=det_gpp, max_stacks=3)
+    assert len(lineups) == 3
+    for lu in lineups:
+        assert lu["total_salary"] <= 35_000
+        assert len(lu["players"]) >= 9
+
+
 def test_export_fd_csv_creates_file():
     board = _full_board()
     lineups = build_fd_lineups(board, contest=CONTEST_SINGLE_ENTRY)

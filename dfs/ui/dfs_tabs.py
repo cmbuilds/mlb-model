@@ -390,7 +390,7 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
 
     if build_btn:
         from dfs.optimize import (
-            build_fd_lineups, export_fd_csv,
+            build_fd_lineups, build_fd_lineups_diverse, export_fd_csv,
             CONTEST_SINGLE_ENTRY, CONTEST_MULTI_ENTRY_GPP,
             with_n_lineups, check_lineup_diversity,
         )
@@ -399,12 +399,19 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
 
         with st.spinner(f"Building {contest.n_lineups} FD lineup(s)…"):
             try:
-                lineups = build_fd_lineups(
-                    board=board,
-                    contest=contest,
-                    locked_names=locked_names or None,
-                    stack_team=stack_team,
-                )
+                if is_multi and not stack_team:
+                    # Multi-entry with no forced stack — use diverse build to spread
+                    # lineups across top teams by stack score.
+                    lineups = build_fd_lineups_diverse(
+                        board=board, contest=contest,
+                        locked_names=locked_names or None,
+                    )
+                else:
+                    lineups = build_fd_lineups(
+                        board=board, contest=contest,
+                        locked_names=locked_names or None,
+                        stack_team=stack_team,
+                    )
             except Exception as e:
                 st.error(f"❌ Build failed: {e}")
                 return

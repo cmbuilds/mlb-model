@@ -49,6 +49,102 @@ CONTEST_MULTI_ENTRY_GPP = ContestConfig(
 )
 
 
+def allocate_lineups_by_stack(
+    stack_scores: Dict[str, float],
+    n_lineups: int,
+    max_stacks: int = 4,
+) -> Dict[str, int]:
+    """
+    Distribute n_lineups across top teams by stack score using rank weighting.
+
+    Guarantees: every team in the allocation gets >= 1 lineup.
+    Remaining lineups after floor allocation go to highest-scored teams first.
+    Returns {team: count}.
+    """
+    if not stack_scores or n_lineups <= 0:
+        return {}
+
+    ranked = sorted(stack_scores.items(), key=lambda kv: kv[1], reverse=True)
+    teams  = [t for t, _ in ranked[:max_stacks]]
+
+    n_teams = len(teams)
+    if n_teams == 0:
+        return {}
+
+    # Start with 1 lineup per team, then distribute remainder by rank weight
+    allocation: Dict[str, int] = {t: 1 for t in teams}
+    remaining = n_lineups - n_teams
+    if remaining <= 0:
+        # Fewer lineups than teams — just take the top n_lineups teams
+        return {t: 1 for t in teams[:n_lineups]}
+
+    # Rank weights: 1st gets n_teams points, 2nd gets n_teams-1, …
+    weights = {t: (n_teams - i) for i, t in enumerate(teams)}
+    total_w = sum(weights.values())
+    extras  = {t: round(w / total_w * remaining) for t, w in weights.items()}
+
+    # Rounding may leave 1-2 lineups unallocated — give them to the top team
+    shortfall = remaining - sum(extras.values())
+    if shortfall != 0:
+        extras[teams[0]] = extras.get(teams[0], 0) + shortfall
+
+    for t in teams:
+        allocation[t] += extras.get(t, 0)
+
+    return {t: v for t, v in allocation.items() if v > 0}
+
+
+def build_fd_lineups_diverse(
+    board: List[ConsensusRow],
+    contest: ContestConfig = CONTEST_MULTI_ENTRY_GPP,
+    locked_names: Optional[List[str]] = None,
+    excluded_names: Optional[List[str]] = None,
+    max_stacks: int = 4,
+) -> List[Dict]:
+    """
+    Build multi-entry FD lineups with enforced stack diversity.
+
+    Distributes contest.n_lineups across the top `max_stacks` teams ranked by
+    stack score, then builds each group with that team as the forced stack.
+    Each group's lineups have contest randomness applied so they differ within
+    the same primary-stack correlated universe.
+
+    Returns combined list of lineup dicts.
+    """
+    from dfs.consensus import compute_stack_scores
+
+    if contest.n_lineups <= 1:
+        return build_fd_lineups(board, contest, locked_names, excluded_names)
+
+    hitter_board = [r for r in board if r.position not in ("P", "SP", "RP")]
+    stack_scores = compute_stack_scores(hitter_board)
+
+    allocation = allocate_lineups_by_stack(stack_scores, contest.n_lineups, max_stacks)
+    if not allocation:
+        logger.warning("FD diverse build: no stack scores — falling back to single pool")
+        return build_fd_lineups(board, contest, locked_names, excluded_names)
+
+    logger.info("FD diverse allocation: %s", allocation)
+
+    all_lineups: List[Dict] = []
+    for team, k in allocation.items():
+        sub_contest = with_n_lineups(contest, k)
+        try:
+            chunk = build_fd_lineups(
+                board=board, contest=sub_contest,
+                locked_names=locked_names, excluded_names=excluded_names,
+                stack_team=team,
+            )
+            all_lineups.extend(chunk)
+        except Exception as e:
+            logger.warning("FD diverse: stack %s failed (%s) — skipping", team, e)
+
+    if not all_lineups:
+        raise RuntimeError("FD diverse build: all team stacks failed — check board and salary CSV")
+
+    return all_lineups
+
+
 def with_n_lineups(config: ContestConfig, n: int) -> ContestConfig:
     """Return a copy of config with n_lineups overridden."""
     return ContestConfig(
