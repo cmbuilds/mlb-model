@@ -27,9 +27,18 @@ import pandas as pd
 import pytz
 import streamlit as st
 
+import re
+import unicodedata
+
 from dfs.contracts import ConsensusRow, ConfidenceState, Provenance
 from dfs.consensus import build_consensus_board, compute_stack_scores
 from dfs.sources.api_external import BluecollarDFSProjections, SourceError
+
+
+def _norm_name(name: str) -> str:
+    s = unicodedata.normalize("NFD", str(name))
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
 EST = pytz.timezone("US/Eastern")
 
@@ -97,21 +106,42 @@ def display_dfs_tabs(plays: List[Dict]):
         fd_board, fd_matched = merge_salaries_into_board(fd_board, fd_salaries)
         if fd_matched < len(fd_board) // 2:
             st.warning(f"⚠️ FD salary match rate low: {fd_matched}/{len(fd_board)} players matched by name")
-        fd_pitchers = pitchers_from_salary_csv(fd_salaries, site="fd")
+        # Augment with pitchers: model projections are already in the board if SP stats
+        # are present. Fall back to site FPPG for any pitcher not yet in the board.
+        board_pitcher_names = {_norm_name(r.name) for r in fd_board
+                               if r.position in ("P", "SP", "RP")}
+        fd_pitchers = [r for r in pitchers_from_salary_csv(fd_salaries, site="fd")
+                       if _norm_name(r.name) not in board_pitcher_names]
         if fd_pitchers:
             fd_board = fd_board + fd_pitchers
-            n_conf_p = sum(1 for p in fd_pitchers if p.state.value == "CONFIDENT")
-            st.caption(f"📋 {len(fd_pitchers)} pitcher(s) loaded from FD salary CSV ({n_conf_p} CONFIDENT via site FPPG)")
+            src_label = "model" if board_pitcher_names else "site FPPG"
+            n_model_p = len(board_pitcher_names)
+            n_csv_p   = len(fd_pitchers)
+            st.caption(
+                f"📋 FD pitchers: {n_model_p} model-projected · {n_csv_p} from salary CSV FPPG"
+                if n_model_p else
+                f"📋 {n_csv_p} pitcher(s) from FD salary CSV (no model SP data)"
+            )
+        elif board_pitcher_names:
+            st.caption(f"📋 {len(board_pitcher_names)} FD pitcher(s) model-projected")
 
     if dk_salaries and dk_board:
         dk_board, dk_matched = merge_salaries_into_board(dk_board, dk_salaries)
         if dk_matched < len(dk_board) // 2:
             st.warning(f"⚠️ DK salary match rate low: {dk_matched}/{len(dk_board)} players matched by name")
-        dk_pitchers = pitchers_from_salary_csv(dk_salaries, site="dk")
+        board_pitcher_names = {_norm_name(r.name) for r in dk_board
+                               if r.position in ("P", "SP", "RP")}
+        dk_pitchers = [r for r in pitchers_from_salary_csv(dk_salaries, site="dk")
+                       if _norm_name(r.name) not in board_pitcher_names]
         if dk_pitchers:
             dk_board = dk_board + dk_pitchers
-            n_conf_p = sum(1 for p in dk_pitchers if p.state.value == "CONFIDENT")
-            st.caption(f"📋 {len(dk_pitchers)} pitcher(s) loaded from DK salary CSV ({n_conf_p} CONFIDENT via site FPPG)")
+            n_model_p = len(board_pitcher_names)
+            n_csv_p   = len(dk_pitchers)
+            st.caption(
+                f"📋 DK pitchers: {n_model_p} model-projected · {n_csv_p} from salary CSV FPPG"
+                if n_model_p else
+                f"📋 {n_csv_p} pitcher(s) from DK salary CSV (no model SP data)"
+            )
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
     tab_fd, tab_dk, tab_stacks, tab_build, tab_dk_build = st.tabs([
@@ -369,13 +399,21 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
 
         st.success(f"✅ {len(lineups)} lineup(s) built")
 
+        # ── Exposure report ───────────────────────────────────────────────────
+        if len(lineups) > 1:
+            _render_exposure_report(lineups, cap=35_000, key_prefix="fd")
+
+        # ── Per-lineup display ────────────────────────────────────────────────
         for i, lu in enumerate(lineups, 1):
-            with st.expander(f"Lineup {i} — {lu['total_proj']:.1f} pts projected (ceil: {lu.get('total_ceiling', '?')})"):
+            sal_pct = lu["total_salary"] / 35_000 * 100
+            with st.expander(
+                f"Lineup {i} — {lu['total_proj']:.1f} pts · ${lu['total_salary']:,} "
+                f"({sal_pct:.0f}% of cap) · ceil {lu.get('total_ceiling', '?')}"
+            ):
                 lu_df = pd.DataFrame(lu["players"])
                 st.dataframe(lu_df, use_container_width=True)
-                st.caption(f"Salary used: ${lu['total_salary']:,} / $35,000")
 
-        # Bulk export
+        # ── Bulk export ───────────────────────────────────────────────────────
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
             export_fd_csv(lineups, tmp.name)
             with open(tmp.name, "rb") as f:
@@ -456,10 +494,15 @@ def _render_dk_builder(board: List[ConsensusRow]):
 
         st.success(f"✅ {len(lineups)} lineup(s) built")
 
+        if len(lineups) > 1:
+            _render_exposure_report(lineups, cap=50_000, key_prefix="dk")
+
         for i, lu in enumerate(lineups, 1):
-            with st.expander(f"Lineup {i} — {lu['total_proj']:.1f} pts projected"):
+            sal_pct = lu["total_salary"] / 50_000 * 100
+            with st.expander(
+                f"Lineup {i} — {lu['total_proj']:.1f} pts · ${lu['total_salary']:,} ({sal_pct:.0f}% of cap)"
+            ):
                 st.dataframe(pd.DataFrame(lu["players"]), use_container_width=True)
-                st.caption(f"Salary used: ${lu['total_salary']:,} / $50,000")
 
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
             export_dk_csv(lineups, tmp.name)
@@ -475,6 +518,69 @@ def _render_dk_builder(board: List[ConsensusRow]):
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+def _render_exposure_report(lineups: List[Dict], cap: int, key_prefix: str):
+    """
+    Show player exposure across multi-entry lineups.
+    Highlights over-exposed players (>40%) and under-used salary.
+    """
+    n = len(lineups)
+    from collections import Counter
+
+    player_count: Counter = Counter()
+    team_count:   Counter = Counter()
+    total_salary = 0
+
+    for lu in lineups:
+        seen_in_lu = set()
+        for p in lu["players"]:
+            name = p["name"]
+            if name not in seen_in_lu:
+                player_count[name] += 1
+                team_count[p["team"]] += 1
+                seen_in_lu.add(name)
+        total_salary += lu["total_salary"]
+
+    avg_salary = total_salary // n
+    cap_pct    = avg_salary / cap * 100
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Avg salary used", f"${avg_salary:,}", f"{cap_pct:.0f}% of cap")
+    with col2:
+        unique_players = len(player_count)
+        st.metric("Unique players", unique_players)
+    with col3:
+        max_exp_name, max_exp_ct = player_count.most_common(1)[0]
+        st.metric("Max exposure", f"{max_exp_ct}/{n}", max_exp_name)
+
+    exp_rows = []
+    for name, ct in player_count.most_common():
+        pct = ct / n * 100
+        flag = " ⚠️" if pct > 40 else ""
+        exp_rows.append({"Player": f"{name}{flag}", "Lineups": f"{ct}/{n}", "Exposure": f"{pct:.0f}%"})
+
+    with st.expander(f"📊 Exposure Report ({n} lineups)", expanded=(n > 3)):
+        if cap_pct < 95:
+            st.warning(f"⚠️ Average salary {cap_pct:.0f}% of cap — try to use ≥97%")
+
+        over_exposed = [name for name, ct in player_count.items() if ct / n > 0.40]
+        if over_exposed:
+            st.warning(f"⚠️ Over-exposed (>40%): {', '.join(over_exposed)}")
+
+        st.dataframe(
+            pd.DataFrame(exp_rows),
+            use_container_width=True,
+            hide_index=True,
+            key=f"{key_prefix}_exposure_df",
+        )
+
+        # Team distribution
+        team_rows = [{"Team": t, "Player-Slots": c} for t, c in team_count.most_common()]
+        st.caption("Team distribution across all lineups:")
+        st.dataframe(pd.DataFrame(team_rows), use_container_width=True,
+                     hide_index=True, key=f"{key_prefix}_team_df")
+
+
 def _state_banner(n_conf, n_flag, n_excl, n_total, has_salaries):
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("✅ CONFIDENT", n_conf)

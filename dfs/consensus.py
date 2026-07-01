@@ -82,12 +82,24 @@ def build_consensus_board(
     """
     from dfs.sources.model_proj import plays_to_fd_projections, plays_to_dk_projections
 
-    # Step 1: build model source rows
+    # Step 1: build model source rows (batters + pitchers)
     try:
         if site == "fd":
+            from dfs.sources.model_proj import plays_to_fd_pitcher_projections
             model_rows = plays_to_fd_projections(plays)
+            try:
+                pitcher_rows = plays_to_fd_pitcher_projections(plays)
+                model_rows = model_rows + pitcher_rows
+            except Exception:
+                pass  # no SP data in plays — site FPPG fallback handled in dfs_tabs
         else:
+            from dfs.sources.model_proj import plays_to_dk_pitcher_projections
             model_rows = plays_to_dk_projections(plays)
+            try:
+                pitcher_rows = plays_to_dk_pitcher_projections(plays)
+                model_rows = model_rows + pitcher_rows
+            except Exception:
+                pass
     except Exception as e:
         raise RuntimeError(f"consensus: model source failed — {e}") from e
 

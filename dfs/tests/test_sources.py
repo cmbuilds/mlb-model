@@ -190,3 +190,81 @@ def test_pitcher_dk_position_is_sp():
     pitchers = pitchers_from_salary_csv(dk_salary_rows, site="dk")
     assert len(pitchers) == 1
     assert pitchers[0].position == "SP"
+
+
+# ── fd_rules pitcher projection ───────────────────────────────────────────────
+from dfs.lib.fd_rules import compute_fd_pitcher_projection, FD_SALARY_CAP
+
+def test_fd_pitcher_projection_returns_positive():
+    play = {"_pitcher_k_rate": 0.285, "implied_total": 4.2}
+    result = compute_fd_pitcher_projection(play)
+    assert result is not None
+    assert result["fd_pts"] > 0
+    assert result["ceiling"] > result["fd_pts"]
+    assert result["floor"] >= 0
+
+def test_fd_pitcher_projection_elite_ace():
+    # Gerrit Cole-type: very high K%, elite FIP, weak opposing lineup
+    play = {"_pitcher_k_rate": 0.32, "_pitcher_fip": 2.85,
+            "_pitcher_whip": 0.95, "implied_total": 3.5}
+    result = compute_fd_pitcher_projection(play)
+    assert result is not None
+    assert result["fd_pts"] >= 30.0, "Elite ace should project 30+ FD pts"
+    assert result["win_prob"] >= 0.65
+
+def test_fd_pitcher_projection_bad_matchup():
+    # Mediocre SP vs high-run environment
+    play = {"_pitcher_k_rate": 0.18, "_pitcher_fip": 5.20,
+            "_pitcher_whip": 1.55, "implied_total": 5.8}
+    result = compute_fd_pitcher_projection(play)
+    assert result is not None
+    assert result["fd_pts"] < 25.0
+
+def test_fd_pitcher_projection_missing_inputs_defaults():
+    # Empty dict should use defaults, not crash
+    result = compute_fd_pitcher_projection({})
+    assert result is not None
+    assert result["fd_pts"] > 0
+
+def test_fd_salary_cap():
+    assert FD_SALARY_CAP == 35_000
+
+
+# ── model pitcher projections from plays ──────────────────────────────────────
+def test_plays_to_fd_pitcher_projections_basic():
+    from dfs.sources.model_proj import plays_to_fd_pitcher_projections
+    from dfs.sources.api_external import SourceKind
+    plays = [
+        {
+            "name": "Aaron Judge", "team": "NYY", "opponent": "BOS",
+            "sp_name": "Gerrit Cole", "sp_hand": "R",
+            "implied_total": 4.0,
+            "_pitcher_k_rate": 0.305,
+            "_pitcher_prov": {"k_rate_allowed": "measured", "hard_hit_allowed": "measured"},
+            "batter_position": "OF",
+        },
+        {
+            "name": "Anthony Rizzo", "team": "NYY", "opponent": "BOS",
+            "sp_name": "Gerrit Cole", "sp_hand": "R",
+            "implied_total": 4.0,
+            "_pitcher_k_rate": 0.305,
+            "_pitcher_prov": {"k_rate_allowed": "measured", "hard_hit_allowed": "measured"},
+            "batter_position": "1B",
+        },
+    ]
+    pitcher_rows = plays_to_fd_pitcher_projections(plays)
+    assert len(pitcher_rows) == 1   # one SP (Gerrit Cole) from two batter plays
+    row = pitcher_rows[0]
+    assert row.player == "Gerrit Cole"
+    assert row.position == "P"
+    assert row.site == "fd"
+    assert row.proj_pts > 0
+    assert row.source == "model"
+    assert row.kind == SourceKind.MODEL
+
+def test_plays_to_fd_pitcher_projections_no_sp_raises():
+    from dfs.sources.model_proj import plays_to_fd_pitcher_projections
+    from dfs.sources.api_external import SourceError
+    plays = [{"name": "Judge", "sp_name": "TBD"}]
+    with pytest.raises(SourceError):
+        plays_to_fd_pitcher_projections(plays)

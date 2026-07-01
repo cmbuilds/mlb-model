@@ -103,8 +103,10 @@ def test_all_proxy_returns_zero():
 def test_confident_player_on_measured_data():
     plays = [_play("Aaron Judge")]
     board = build_consensus_board(plays, site="fd")
-    assert len(board) == 1
-    row = board[0]
+    # Board now includes SP pitcher rows in addition to batters
+    batters = [r for r in board if r.position not in ("P", "SP", "RP")]
+    assert len(batters) == 1
+    row = batters[0]
     assert row.state == ConfidenceState.CONFIDENT
     assert row.flagged_reason == ""
     assert row.source_count == 1
@@ -113,9 +115,10 @@ def test_confident_player_on_measured_data():
 def test_flagged_on_proxy_data():
     plays = [_play("Bench Player", all_measured=False)]
     board = build_consensus_board(plays, site="fd")
-    assert len(board) == 1
-    assert board[0].state == ConfidenceState.FLAGGED
-    assert board[0].flagged_reason != ""
+    batters = [r for r in board if r.position not in ("P", "SP", "RP")]
+    assert len(batters) == 1
+    assert batters[0].state == ConfidenceState.FLAGGED
+    assert batters[0].flagged_reason != ""
 
 def test_flagged_on_unconfirmed_lineup():
     plays = [_play("Utility Man", lineup_confirmed=False)]
