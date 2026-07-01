@@ -115,19 +115,34 @@ def build_consensus_board(
                 key = _norm(r.player)
                 extra_index.setdefault(key, []).append(r)
 
-    # Step 3: build plays index for metadata
+    # Step 3: build plays index for metadata (batter-centric: keyed by batter name)
     plays_index: Dict[str, Dict] = {_norm(p.get("name", "")): p for p in plays}
+
+    # Secondary index for pitcher rows: keyed by sp_name (since pitchers don't
+    # have a play dict keyed by their own name — they appear in batter plays).
+    pitcher_plays_index: Dict[str, Dict] = {}
+    for p in plays:
+        sp = p.get("sp_name", "")
+        if sp and sp not in ("TBD", "?", ""):
+            pitcher_plays_index.setdefault(_norm(sp), p)
 
     # Step 4: one ConsensusRow per player that has a model projection
     board: List[ConsensusRow] = []
     for norm_name, model_row in model_index.items():
+        is_pitcher = model_row.position in ("P", "SP", "RP")
+
         play = plays_index.get(norm_name, {})
-        if not play:
-            # Try partial match (handles nickname variants)
+        if not play and not is_pitcher:
+            # Batter: try partial match (handles nickname variants)
             for k, v in plays_index.items():
                 if norm_name in k or k in norm_name:
                     play = v
                     break
+
+        # For pitcher rows, look up via sp_name secondary index
+        pitcher_play: Dict = {}
+        if is_pitcher:
+            pitcher_play = pitcher_plays_index.get(norm_name, {})
 
         # Gather all rows for this player across sources
         all_rows: List[ProjectionRow] = [model_row]
@@ -150,9 +165,18 @@ def build_consensus_board(
         sources_used  = list(dict.fromkeys(r.source for r in eligible_rows))
 
         # Determine state
-        prov = _provenance_from_play(play) if play else Provenance.LEAGUE_AVG
-        lineup_confirmed = play.get("lineup_confirmed", False)
-        bettable = play.get("bettable", False)
+        if is_pitcher and pitcher_play:
+            # Pitcher confirmed status: if they appear in any batter play, the pitcher
+            # is starting. Use _pitcher_prov for provenance.
+            from dfs.sources.model_proj import _pitcher_provenance
+            pit_prov_dict = pitcher_play.get("_pitcher_prov", {})
+            prov = _pitcher_provenance(pit_prov_dict)
+            lineup_confirmed = True   # SP appears in plays → confirmed starter
+            bettable = False
+        else:
+            prov = _provenance_from_play(play) if play else Provenance.LEAGUE_AVG
+            lineup_confirmed = play.get("lineup_confirmed", False)
+            bettable = play.get("bettable", False)
 
         if not lineup_confirmed or prov in (Provenance.PROXY, Provenance.LEAGUE_AVG):
             state = ConfidenceState.FLAGGED

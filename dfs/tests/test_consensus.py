@@ -123,8 +123,11 @@ def test_flagged_on_proxy_data():
 def test_flagged_on_unconfirmed_lineup():
     plays = [_play("Utility Man", lineup_confirmed=False)]
     board = build_consensus_board(plays, site="fd")
-    assert board[0].state == ConfidenceState.FLAGGED
-    assert "lineup" in board[0].flagged_reason
+    # Filter to batters — the sp_name pitcher (Gerrit Cole) appears as CONFIDENT
+    batters = [r for r in board if r.position not in ("P", "SP", "RP")]
+    assert len(batters) == 1
+    assert batters[0].state == ConfidenceState.FLAGGED
+    assert "lineup" in batters[0].flagged_reason
 
 def test_ownership_always_modeled():
     plays = [_play("Aaron Judge")]
