@@ -48,6 +48,41 @@ STADIUM_COORDS: Dict[str, Tuple[float, float, str, bool]] = {
     "MEX": (19.4240, -99.0680, "Estadio Alfredo Harp Helú", False),
 }
 
+# Non-standard abbreviations used in game_pitchers.home_team column
+TEAM_CODE_ALIASES: Dict[str, str] = {
+    "AZ":  "ARI",   # D-backs appear as "AZ" in game_pitchers
+    "ATH": "OAK",   # Athletics appear as "ATH" in game_pitchers
+}
+
+# Compass bearing from home plate to center field (degrees, outdoor parks only).
+# Used to classify wind as out/in/neutral relative to each park's real orientation.
+# Approximate ±30° — sufficient for the 8/12 mph speed gates in _wind_effect_for_park.
+CF_BEARINGS: Dict[str, float] = {
+    "ATL":  335.0,  # Truist Park — CF toward NNW
+    "BAL":   45.0,  # Oriole Park at Camden Yards — CF toward NE
+    "BOS":   20.0,  # Fenway Park — CF toward NNE
+    "CHC":   55.0,  # Wrigley Field — CF toward NE (lake-wind landmark park)
+    "CIN":  355.0,  # Great American Ball Park — CF toward N
+    "CLE":   45.0,  # Progressive Field — CF toward NE
+    "COL":  355.0,  # Coors Field — CF toward N
+    "CWS":  355.0,  # Guaranteed Rate Field — CF toward N
+    "DET":  330.0,  # Comerica Park — CF toward NNW
+    "KC":   220.0,  # Kauffman Stadium — CF toward SW
+    "LAA":  230.0,  # Angel Stadium — CF toward SW
+    "LAD":  175.0,  # Dodger Stadium — CF toward S
+    "MEX":  330.0,  # Estadio Alfredo Harp Helú
+    "MIN":  295.0,  # Target Field — CF toward WNW
+    "NYM":    0.0,  # Citi Field — CF toward N
+    "NYY":  200.0,  # Yankee Stadium (new) — CF toward SSW
+    "OAK":  320.0,  # Oakland Coliseum — CF toward NW
+    "PHI":   45.0,  # Citizens Bank Park — CF toward NE
+    "PIT":  350.0,  # PNC Park — CF toward N (toward Allegheny River)
+    "SD":   335.0,  # Petco Park — CF toward NNW
+    "SF":    15.0,  # Oracle Park — CF toward NNE
+    "STL":  335.0,  # Busch Stadium — CF toward NNW
+    "WSH":  350.0,  # Nationals Park — CF toward N
+}
+
 # Composite TB park factors (3-year rolling Statcast, normalized 1.00 = average)
 PARK_TB_FACTORS: Dict[str, float] = {
     "ARI": 1.05, "ATL": 0.98, "BAL": 1.02, "BOS": 1.04, "CHC": 1.06,
