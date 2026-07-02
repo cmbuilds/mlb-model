@@ -115,3 +115,17 @@ ML_EDGE_LEAN   = 4.0    # ≥4% model edge → Lean (min threshold to flag)
 
 # ── Moneyline: bettable gate ──────────────────────────────────────────────────
 ML_MIN_BATTERS_PER_TEAM = 5   # both teams need ≥5 batters with measured wRC+
+
+# ── Per-market bet-filter cutoffs (backtest-validated, 2026 season) ───────────
+# Only plays at or above each cutoff are surfaced in leaderboard / parlay builder.
+# None = market disabled; set ML_BETTABLE=True when Odds API Business tier active.
+BET_FILTER_CUTOFFS = {
+    "hits_o05": 50,    # +1.6% overall ROI; every bucket ≥50 is green
+    "hr":       60,    # 60-69 and 70-79 buckets profitable
+    "k_prop":   70,    # 70+ hits 73.5% O4.5
+    "tb_o15":   70,    # provisional — only 10 plays at 70+ in backtest (low sample)
+    "ml":       None,  # disabled — gated on Odds API Business tier (implied runs needed)
+}
+
+ML_BETTABLE          = False   # gated on Odds API Business tier
+TB_FILTER_PROVISIONAL = True   # TB 70+ cutoff is provisional pending weather+handedness re-run
