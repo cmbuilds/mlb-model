@@ -205,8 +205,7 @@ def _fetch_handedness(player_ids: List[int]) -> Dict[int, Dict[str, str]]:
     for i in range(0, len(player_ids), BATCH):
         chunk = player_ids[i:i+BATCH]
         url = (f"https://statsapi.mlb.com/api/v1/people"
-               f"?personIds={','.join(str(x) for x in chunk)}"
-               f"&fields=people,id,batSide,pitchHand")
+               f"?personIds={','.join(str(x) for x in chunk)}")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=20) as resp:
