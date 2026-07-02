@@ -4368,9 +4368,12 @@ def build_parlays(
     plays: List[Dict],
     num_legs: int = 3,
     max_same_team: int = 2,
-    min_score: float = 70.0,
+    min_score: Optional[float] = None,
 ) -> List[Dict]:
     """Delegates to markets/tb_o15.py — pure logic lives there."""
+    from config import BET_FILTER_CUTOFFS
+    if min_score is None:
+        min_score = float(BET_FILTER_CUTOFFS.get("tb_o15") or 70.0)
     return _build_parlays_pure(plays, num_legs=num_legs,
                                max_same_team=max_same_team, min_score=min_score)
 
@@ -5829,6 +5832,7 @@ def _parse_fd_csv(file_bytes: bytes) -> Dict:
     bat_col  = next((c for c in df.columns if "batting" in c.lower() or c.lower() == "batting order"), None)
     inj_col  = next((c for c in df.columns if "injury" in c.lower() and "indicator" in c.lower()), None)
     rp_col   = next((c for c in df.columns if "roster" in c.lower()), None)
+    id_col   = next((c for c in df.columns if c.lower() == "id"), None)
 
     if not (name_col and sal_col):
         raise ValueError(f"Could not find Name/Salary columns. Found: {list(df.columns)}")
@@ -5867,6 +5871,7 @@ def _parse_fd_csv(file_bytes: bytes) -> Dict:
             "fppg":        fppg,
             "bat_order":   bat_ord,
             "injured":     injured,
+            "player_id":   str(row[id_col]).strip() if id_col and pd.notna(row[id_col]) and str(row[id_col]).strip() not in ("", "nan") else "",
         }
 
         if game:
@@ -6030,6 +6035,7 @@ def _build_fd_plays_with_salaries(plays: List[Dict], salary_data: Dict,
             "fd_injured":   fd_injured,
             "ownership":    ownership,
             "salary_matched": sal_entry is not None,
+            "fd_player_id": sal_entry.get("player_id", "") if sal_entry else "",
         })
 
     fd_plays.sort(key=lambda x: x["fd_proj"], reverse=True)
@@ -8426,18 +8432,73 @@ def display_fd_portfolio_builder(plays: List[Dict]):
         # Build FD bulk import CSV
         import io as _io_port
         buf = _io_port.StringIO()
-        # FD format header
-        # FD bulk import format: OF slots must map correctly
-        # Internal slots: OF1, OF2, OF3 → CSV columns: OF, OF, OF (same name, different positions)
         buf.write("entry-id,contest-id,contest-name,P,C/1B,2B,3B,SS,OF,OF,OF,UTIL\n")
-        fd_slot_order = ["P","C/1B","2B","3B","SS","OF1","OF2","OF3","UTIL"]
+
+        # Build name→ID lookup from salary pool so export uses FD player IDs (unambiguous)
+        _fd_id_map: Dict[str, str] = {}
+        for _fp in fd_plays:
+            _pid = _fp.get("fd_player_id", "")
+            if _pid:
+                _fd_id_map[_fp["name"]] = _pid
+        for _sp_nm, _sp_ent in sp_sal_data.items():
+            _pid = _sp_ent.get("player_id", "")
+            if _pid:
+                _fd_id_map[_sp_nm] = _pid
+
+        def _fd_slot_val(p: Optional[Dict]) -> str:
+            if p is None:
+                return ""
+            return _fd_id_map.get(p["name"], p.get("name", ""))
+
+        _FD_COL_NAMES = ["P", "C/1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"]
+        _seen_lu_keys: set = set()
+        _dupes_dropped = 0
+        _rows_written  = 0
+
         for lu in lineups:
-            player_by_slot = {p.get("slot",""):p for p in lu["players"]}
-            row_names = []
-            for slot in fd_slot_order:
-                p = player_by_slot.get(slot)
-                row_names.append(p["name"] if p else "")
-            buf.write(f",,Propex GPP,{','.join(row_names)}\n")
+            # Bucket players by slot name — handles 3× "OF" without key collision
+            _slot_buckets: Dict[str, List] = {}
+            for _p in lu["players"]:
+                _slot_buckets.setdefault(_p.get("slot", ""), []).append(_p)
+
+            _ofs = _slot_buckets.get("OF", [])
+            _ordered = [
+                _slot_buckets.get("P",    [None])[0],
+                _slot_buckets.get("C/1B", [None])[0],
+                _slot_buckets.get("2B",   [None])[0],
+                _slot_buckets.get("3B",   [None])[0],
+                _slot_buckets.get("SS",   [None])[0],
+                _ofs[0] if len(_ofs) > 0 else None,
+                _ofs[1] if len(_ofs) > 1 else None,
+                _ofs[2] if len(_ofs) > 2 else None,
+                _slot_buckets.get("UTIL", [None])[0],
+            ]
+
+            # Fail-loud validation gate — never write an incomplete lineup
+            _empty_cols = [_FD_COL_NAMES[i] for i, _p in enumerate(_ordered) if _p is None]
+            if _empty_cols:
+                raise ValueError(
+                    f"FD export: lineup #{lu.get('lineup_index','?')} has empty slots "
+                    f"{_empty_cols}. Slots present: {list(_slot_buckets.keys())}"
+                )
+            _lu_sal = sum(_p.get("fd_salary", _p.get("salary", 0)) for _p in _ordered if _p)
+            if _lu_sal > 35000:
+                raise ValueError(
+                    f"FD export: lineup #{lu.get('lineup_index','?')} exceeds $35,000 cap: ${_lu_sal:,}"
+                )
+
+            # Deduplicate by frozenset of player names
+            _key = frozenset(_p["name"] for _p in _ordered if _p)
+            if _key in _seen_lu_keys:
+                _dupes_dropped += 1
+                continue
+            _seen_lu_keys.add(_key)
+
+            buf.write(f",,Propex GPP,{','.join(_fd_slot_val(_p) for _p in _ordered)}\n")
+            _rows_written += 1
+
+        if _dupes_dropped:
+            st.warning(f"⚠️ Dropped {_dupes_dropped} duplicate lineup(s) — {_rows_written} unique lineups exported.")
 
         csv_str = buf.getvalue()
         st.download_button(
@@ -8549,9 +8610,22 @@ def display_fd_portfolio_builder(plays: List[Dict]):
                         })
                     st.dataframe(pd.DataFrame(lu_rows), use_container_width=True, hide_index=True)
                     # FD import string
-                    slot_order_ = ["P","C/1B","2B","3B","SS","OF1","OF2","OF3","UTIL"]
-                    pbs = {p.get("slot",""):p for p in lu["players"]}
-                    names = ",".join(pbs.get(s,{}).get("name","") for s in slot_order_)
+                    _sb_ = {}
+                    for _p_ in lu["players"]:
+                        _sb_.setdefault(_p_.get("slot", ""), []).append(_p_)
+                    _ofs_ = _sb_.get("OF", [])
+                    _pbs_ord_ = [
+                        _sb_.get("P",    [None])[0],
+                        _sb_.get("C/1B", [None])[0],
+                        _sb_.get("2B",   [None])[0],
+                        _sb_.get("3B",   [None])[0],
+                        _sb_.get("SS",   [None])[0],
+                        _ofs_[0] if len(_ofs_) > 0 else None,
+                        _ofs_[1] if len(_ofs_) > 1 else None,
+                        _ofs_[2] if len(_ofs_) > 2 else None,
+                        _sb_.get("UTIL", [None])[0],
+                    ]
+                    names = ",".join((_p_.get("name", "") if _p_ else "") for _p_ in _pbs_ord_)
                     st.code(names, language=None)
 
         # ── Exposure report ───────────────────────────────────────────────────
