@@ -8455,6 +8455,29 @@ def display_fd_portfolio_builder(plays: List[Dict]):
         _dupes_dropped = 0
         _rows_written  = 0
 
+        # ── STEP 1 DIAGNOSTIC DUMP (temporary — remove after diagnosis) ────
+        if lineups:
+            _diag_lu = lineups[0]
+            with st.expander("🔬 DIAGNOSTIC: Lineup #1 raw player dump", expanded=True):
+                _diag_rows = []
+                for _dp in _diag_lu["players"]:
+                    _diag_rows.append({
+                        "name":          _dp.get("name",""),
+                        "assigned_slot": _dp.get("slot",""),
+                        "fd_position":   _dp.get("fd_position",""),     # first token of CSV Position col
+                        "fd_roster_pos": _dp.get("fd_roster_pos",""),   # CSV Roster Position col
+                        "fd_salary":     _dp.get("fd_salary", _dp.get("salary",0)),
+                        "fd_proj":       round(_dp.get("fd_proj",0),2),
+                        "salary_matched":_dp.get("salary_matched",False),
+                    })
+                import pandas as _pd_diag
+                st.dataframe(_pd_diag.DataFrame(_diag_rows), use_container_width=True, hide_index=True)
+                st.caption(f"Lineup #1 players: {len(_diag_lu['players'])} | "
+                           f"structure: {_diag_lu.get('structure','')} | "
+                           f"primary: {_diag_lu.get('primary_team','')} | "
+                           f"secondary: {_diag_lu.get('secondary_team','')}")
+        # ── END DIAGNOSTIC ─────────────────────────────────────────────────
+
         for lu in lineups:
             # Bucket players by slot name — handles 3× "OF" without key collision
             _slot_buckets: Dict[str, List] = {}
