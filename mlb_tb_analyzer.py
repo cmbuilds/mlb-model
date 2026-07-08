@@ -618,6 +618,7 @@ def _load_from_db(table: str) -> Optional[pd.DataFrame]:
                 f"Dataset is {age_hours:.0f}h old (threshold {_DB_FRESHNESS_HOURS}h). "
                 f"Run: python3 data/fetch_pipeline.py"
             )
+            return None  # refuse stale data — caller falls through to live fetch
         else:
             st.session_state.pop("_db_freshness_warning", None)
         con = sqlite3.connect(_STATS_DB)
