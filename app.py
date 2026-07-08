@@ -22,10 +22,8 @@ from mlb_tb_analyzer import (
     display_fd_hand_builder,
     display_fd_portfolio_builder,
     display_results_tracker,
-    fetch_moneyline_odds,
     fetch_odds,
     fetch_schedule,
-    fetch_team_run_differential,
     fetch_umpire_data,
     init_db,
     run_model,
@@ -518,14 +516,6 @@ else:
                     st.session_state["_ump_data"] = fetch_umpire_data()
                 except Exception:
                     st.session_state["_ump_data"] = {}
-                try:
-                    st.session_state["_run_diffs"] = fetch_team_run_differential(date_str, days=7)
-                except Exception:
-                    st.session_state["_run_diffs"] = {}
-                try:
-                    st.session_state["_ml_odds"] = fetch_moneyline_odds(date_str)
-                except Exception:
-                    st.session_state["_ml_odds"] = {}
                 st.rerun()
             else:
                 st.warning(f"No games or lineups found for {date_str}.")
@@ -561,20 +551,10 @@ else:
         # ── Moneyline ────────────────────────────────────
         if st.session_state.plays:
             _games_for_ml = fetch_schedule(st.session_state.analysis_date or date_str)
-            _ml_odds      = st.session_state.get("_ml_odds", {})
-            _run_diffs    = st.session_state.get("_run_diffs", {})
-            _impl_totals  = {}
-            try:
-                _impl_totals = fetch_odds(st.session_state.analysis_date or date_str)
-            except Exception:
-                pass
             _bp_scores    = st.session_state.get("team_bullpen_scores", {})
             display_moneyline_tab(
                 games=_games_for_ml,
                 plays=st.session_state.plays,
-                ml_odds=_ml_odds,
-                run_diffs=_run_diffs,
-                implied_totals=_impl_totals,
                 team_bullpen_scores=_bp_scores,
             )
         else:

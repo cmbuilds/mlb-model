@@ -200,17 +200,18 @@ def check_bettable_ml(
     away_sp_prov: Dict,
     home_n_batters: int,
     away_n_batters: int,
-    has_odds: bool,
     min_batters: int = 5,
 ) -> Tuple[bool, List[str]]:
     """
-    Bettable gate for moneyline.
+    Data-quality gate for moneyline win probability.
 
     Requires:
     - Both SPs known (not TBD) and matched to real stats
-    - Both SP vulnerability stats measured (k_rate_allowed as proxy)
-    - Both lineups have ≥5 batters with measured wRC+
-    - ML odds present
+    - Both SP vulnerability stats measured (k_rate_allowed)
+    - Both lineups have ≥min_batters batters with measured wRC+
+
+    Market odds are NOT required — the ML tab displays model win%
+    for the user to compare against live odds themselves.
     """
     reasons: List[str] = []
     if home_sp_tbd:
@@ -229,6 +230,4 @@ def check_bettable_ml(
         reasons.append(f"home lineup: only {home_n_batters}/{min_batters} batters with measured wRC+")
     if away_n_batters < min_batters:
         reasons.append(f"away lineup: only {away_n_batters}/{min_batters} batters with measured wRC+")
-    if not has_odds:
-        reasons.append("ML odds not available")
     return (len(reasons) == 0, reasons)

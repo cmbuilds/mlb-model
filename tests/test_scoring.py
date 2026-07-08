@@ -10,8 +10,8 @@ from scoring.final import compute_final_score
 from scoring.hits import compute_hits_batter_score, compute_hits_pitcher_score
 from scoring.hr import compute_hr_score
 from markets.hr import hr_get_tier, hr_score_to_prob, score_one_batter_hr
-from markets.moneyline import ml_market_edge, score_game_ml
-from scoring.moneyline import compute_ml_confidence, compute_win_probability
+from markets.moneyline import score_game_ml
+from scoring.moneyline import compute_win_probability
 from scoring.strikeout import (
     compute_batter_k_propensity, compute_sp_k_score, k_get_tier, k_score_to_prob,
 )
@@ -809,130 +809,70 @@ class TestScoreOneBatterHR:
 # ── Moneyline: pure scoring functions ─────────────────────────────────────────
 
 class TestComputeWinProbability:
-    def _sp(self, vuln=50.0):
-        return {"_sp_vuln": vuln}
-
     def test_balanced_game_has_home_advantage(self):
-        """Equal teams → home wins >50% due to +3.5% home-field boost."""
-        hwp, _ = compute_win_probability(
-            self._sp(50), self._sp(50),
-            100, 100, 42, 42, 0, 0, 0, 0,
-        )
+        """Equal teams → home wins >50% due to HFA baseline (53.5%)."""
+        hwp, _ = compute_win_probability(50.0, 50.0, 100.0, 100.0, 42.0, 42.0)
         assert 0.50 < hwp < 0.60
 
     def test_elite_home_sp_raises_home_prob(self):
         """Elite home SP (low vuln) → higher home win prob than average."""
-        hwp_elite, _ = compute_win_probability(
-            self._sp(20), self._sp(50), 100, 100, 42, 42, 0, 0, 0, 0
-        )
-        hwp_avg, _ = compute_win_probability(
-            self._sp(50), self._sp(50), 100, 100, 42, 42, 0, 0, 0, 0
-        )
+        hwp_elite, _ = compute_win_probability(20.0, 50.0, 100.0, 100.0, 42.0, 42.0)
+        hwp_avg,   _ = compute_win_probability(50.0, 50.0, 100.0, 100.0, 42.0, 42.0)
         assert hwp_elite > hwp_avg
 
     def test_elite_away_sp_lowers_home_prob(self):
         """Elite away SP → lower home win probability."""
-        hwp_elite_away, _ = compute_win_probability(
-            self._sp(50), self._sp(20), 100, 100, 42, 42, 0, 0, 0, 0
-        )
-        hwp_balanced, _ = compute_win_probability(
-            self._sp(50), self._sp(50), 100, 100, 42, 42, 0, 0, 0, 0
-        )
+        hwp_elite_away, _ = compute_win_probability(50.0, 20.0, 100.0, 100.0, 42.0, 42.0)
+        hwp_balanced,   _ = compute_win_probability(50.0, 50.0, 100.0, 100.0, 42.0, 42.0)
         assert hwp_elite_away < hwp_balanced
 
-    def test_vegas_blend_shifts_toward_implied_runs(self):
-        """When home implied runs >> away, win prob shifts toward home."""
-        hwp_v, _ = compute_win_probability(
-            self._sp(50), self._sp(50), 100, 100, 42, 42, 0, 0, 7.0, 3.0
-        )
-        hwp_no_v, _ = compute_win_probability(
-            self._sp(50), self._sp(50), 100, 100, 42, 42, 0, 0, 0, 0
-        )
-        assert hwp_v > hwp_no_v
-
-    def test_run_diff_nudge_capped_at_two_pct(self):
-        """Run-diff nudge is ±0.02 max regardless of extreme inputs."""
-        hwp_h, _ = compute_win_probability(
-            self._sp(50), self._sp(50), 100, 100, 42, 42, 50.0, -50.0, 0, 0
-        )
-        hwp_a, _ = compute_win_probability(
-            self._sp(50), self._sp(50), 100, 100, 42, 42, -50.0, 50.0, 0, 0
-        )
-        assert abs(hwp_h - hwp_a) <= 0.045   # ±0.02 nudge → ≤0.04 delta (+rounding)
+    def test_stronger_home_offense_raises_home_prob(self):
+        """Home lineup wRC+ > away → home win prob increases."""
+        hwp_strong, _ = compute_win_probability(50.0, 50.0, 130.0, 90.0, 42.0, 42.0)
+        hwp_even,   _ = compute_win_probability(50.0, 50.0, 100.0, 100.0, 42.0, 42.0)
+        assert hwp_strong > hwp_even
 
     def test_output_clamped_to_valid_range(self):
-        """Win probability never escapes [0.30, 0.75]."""
-        hwp_dom, _ = compute_win_probability(
-            self._sp(0), self._sp(100), 200, 50, 10, 90, 20, -20, 0, 0
-        )
-        hwp_weak, _ = compute_win_probability(
-            self._sp(100), self._sp(0), 50, 200, 90, 10, -20, 20, 0, 0
-        )
-        assert 0.30 <= hwp_dom  <= 0.75
-        assert 0.30 <= hwp_weak <= 0.75
+        """Win probability never escapes [0.15, 0.85]."""
+        hwp_dom,  _ = compute_win_probability(0.0,   100.0, 200.0, 50.0,  10.0, 90.0)
+        hwp_weak, _ = compute_win_probability(100.0, 0.0,   50.0,  200.0, 90.0, 10.0)
+        assert 0.15 <= hwp_dom  <= 0.85
+        assert 0.15 <= hwp_weak <= 0.85
 
-    def test_label_surfaces_pitcher_quality_and_wrc(self):
-        """Label must mention pitcher quality tier and wRC+."""
-        _, lbl = compute_win_probability(
-            {"_sp_vuln": 20}, {"_sp_vuln": 80},
-            115, 92, 42, 42, 0, 0, 0, 0,
-        )
-        assert "Elite" in lbl
-        assert "wRC+" in lbl
+    def test_probs_complement_to_one(self):
+        """away_win_prob = 1 - home_win_prob."""
+        hwp, _ = compute_win_probability(40.0, 55.0, 110.0, 98.0, 45.0, 38.0)
+        assert abs(hwp + (1.0 - hwp) - 1.0) < 0.001
 
+    def test_drivers_dict_has_required_keys(self):
+        _, d = compute_win_probability(40.0, 60.0, 110.0, 95.0, 42.0, 50.0)
+        for k in ("sp_edge_pts", "off_edge_pts", "bp_edge_pts", "hfa", "raw", "clamped"):
+            assert k in d, f"Missing driver key: {k}"
 
-class TestComputeMlConfidence:
-    def test_zero_edge_still_scores_data_quality(self):
-        """edge=0 → 0 edge-pts but SP/lineup/odds components still contribute."""
-        score = compute_ml_confidence(0.0, "J. Verlander", 9, 40, True)
-        assert 0 < score < 50   # some quality pts; edge not adding anything
-
-    def test_zero_when_negative_edge(self):
-        assert compute_ml_confidence(-3.0, "J. Verlander", 9, 40, True) == 0.0
-
-    def test_zero_when_none_edge(self):
-        assert compute_ml_confidence(None, "J. Verlander", 9, 40, True) == 0.0
-
-    def test_near_max_with_elite_scenario(self):
-        """7%+ edge, elite SP, full lineup, odds → 90+."""
-        score = compute_ml_confidence(7.0, "C. Sale", 9, 25, True)
-        assert score >= 90.0
-
-    def test_no_odds_costs_ten_pts(self):
-        with_odds    = compute_ml_confidence(5.0, "C. Sale", 9, 40, True)
-        without_odds = compute_ml_confidence(5.0, "C. Sale", 9, 40, False)
-        assert abs(with_odds - without_odds - 10.0) < 0.01
-
-    def test_tbd_sp_costs_five_pts(self):
-        known = compute_ml_confidence(5.0, "C. Sale", 9, 40, True)
-        tbd   = compute_ml_confidence(5.0, "TBD",    9, 40, True)
-        assert abs(known - tbd - 5.0) < 0.01
-
-    def test_partial_lineup_lowers_score(self):
-        full = compute_ml_confidence(5.0, "C. Sale", 9, 40, True)
-        half = compute_ml_confidence(5.0, "C. Sale", 4, 40, True)
-        assert full > half
+    def test_sp_edge_larger_than_bp_edge(self):
+        """W_SP=0.40 > W_BP=0.10: same raw stat swing → SP moves prob 4x more."""
+        # Same raw edge on SP vs BP
+        hwp_sp, d_sp = compute_win_probability(30.0, 70.0, 100.0, 100.0, 42.0, 42.0)
+        hwp_bp, d_bp = compute_win_probability(50.0, 50.0, 100.0, 100.0, 30.0, 70.0)
+        assert abs(d_sp["sp_edge_pts"]) > abs(d_bp["bp_edge_pts"])
 
 
 # ── Moneyline: market module ──────────────────────────────────────────────────
 
 class TestScoreGameMl:
-    def _sp(self, vuln=50.0):
-        return {"_sp_vuln": vuln}
+    def _sp_stats(self, k_rate=0.22, era=4.20, whip=1.30):
+        return {"k_rate_allowed": k_rate, "era": era, "whip": whip,
+                "hard_hit_allowed": 0.370, "barrel_allowed": 0.070, "fip": era}
 
     def _score(self, **overrides):
         defaults = dict(
             home_team="NYY", away_team="BOS",
             home_sp_name="G. Cole", away_sp_name="C. Sale",
-            home_sp_id="111", away_sp_id="222",
-            home_sp_stats=self._sp(40), away_sp_stats=self._sp(55),
-            home_off_wrc=108, away_off_wrc=102,
+            home_sp_stats=self._sp_stats(k_rate=0.26, era=3.50),
+            away_sp_stats=self._sp_stats(k_rate=0.24, era=3.80),
+            home_wrc_plus=108.0, away_wrc_plus=102.0,
             home_n_batters=9, away_n_batters=9,
-            home_bp_vuln=42, away_bp_vuln=45,
-            home_run_diff=1.0, away_run_diff=-0.5,
-            home_implied_runs=4.7, away_implied_runs=4.3,
-            home_market_implied=0.52, away_market_implied=0.48,
-            has_odds=True,
+            home_bp_vuln=42.0, away_bp_vuln=45.0,
             home_sp_matched=True, away_sp_matched=True,
             home_sp_prov={"k_rate_allowed": "measured"},
             away_sp_prov={"k_rate_allowed": "measured"},
@@ -942,64 +882,55 @@ class TestScoreGameMl:
 
     def test_returns_required_keys(self):
         r = self._score()
-        for k in ("home_win_prob", "away_win_prob", "pick", "pick_tier",
-                  "bettable", "home_edge_pct", "away_edge_pct",
-                  "home_confidence", "away_confidence", "detail_label"):
+        for k in ("home_win_prob", "away_win_prob", "blocked", "block_reasons",
+                  "bettable", "non_bettable_reasons", "drivers", "data_flags"):
             assert k in r, f"Missing key: {k}"
 
     def test_probs_sum_to_one(self):
         r = self._score()
         assert abs(r["home_win_prob"] + r["away_win_prob"] - 1.0) < 0.001
 
-    def test_bettable_when_all_data_present(self):
+    def test_not_blocked_with_real_sps(self):
         r = self._score()
-        assert r["bettable"] is True
-        assert r["non_bettable_reasons"] == []
+        assert r["blocked"] is False
+        assert r["home_win_prob"] is not None
 
-    def test_not_bettable_without_odds(self):
-        r = self._score(has_odds=False)
-        assert r["bettable"] is False
-        assert any("odds" in reason for reason in r["non_bettable_reasons"])
-
-    def test_not_bettable_tbd_sp(self):
+    def test_blocked_tbd_home_sp(self):
         r = self._score(home_sp_name="TBD")
-        assert r["bettable"] is False
+        assert r["blocked"] is True
+        assert r["home_win_prob"] is None
         assert r["home_sp_tbd"] is True
+
+    def test_blocked_empty_away_sp(self):
+        r = self._score(away_sp_name="")
+        assert r["blocked"] is True
 
     def test_not_bettable_thin_lineup(self):
         r = self._score(home_n_batters=3, away_n_batters=3)
         assert r["bettable"] is False
 
-    def test_pick_has_min_edge_when_selected(self):
-        """Any non-None pick must have edge ≥ 4.0%."""
+    def test_bettable_when_all_data_present(self):
         r = self._score()
-        if r["pick"] is not None:
-            assert r["pick_edge"] >= 4.0
+        assert r["bettable"] is True
+        assert r["non_bettable_reasons"] == []
 
-    def test_no_play_when_edge_below_threshold(self):
-        """When model prob closely matches market, pick_tier should be No Play."""
-        # Market exactly matches model → zero edge → No Play
+    def test_home_field_gives_home_advantage_when_equal(self):
+        """Equal SP/offense/BP → home win prob > 50% from HFA."""
+        sp = self._sp_stats()
         r = self._score(
-            home_market_implied=0.535,   # matches typical balanced home prob
-            away_market_implied=0.465,
+            home_sp_stats=sp, away_sp_stats=sp,
+            home_wrc_plus=100.0, away_wrc_plus=100.0,
+            home_bp_vuln=42.0, away_bp_vuln=42.0,
         )
-        # With near-matched odds, edge might be thin — tier should be Lean or No Play
-        assert r["pick_tier"] in ("➖ No Play", "📊 Lean")
+        assert r["home_win_prob"] > 0.50
 
-    def test_strong_edge_when_massive_underdog(self):
-        """Model strongly favors home but book sets them as heavy underdog → strong edge."""
+    def test_elite_sp_matchup_spreads_probs(self):
+        """Elite home SP vs weak away SP → home prob well above 50%."""
         r = self._score(
-            home_sp_stats=self._sp(15),    # elite home SP
-            away_sp_stats=self._sp(75),    # weak away SP
-            home_off_wrc=130,              # great home offense
-            away_off_wrc=80,
-            home_market_implied=0.35,      # book severely undervalues home
-            away_market_implied=0.65,
+            home_sp_stats=self._sp_stats(k_rate=0.30, era=2.50),
+            away_sp_stats=self._sp_stats(k_rate=0.18, era=5.20),
         )
-        # Home model prob should far exceed 0.35 → strong edge
-        if r["home_edge_pct"] is not None and r["home_edge_pct"] >= 7.0:
-            assert r["pick_tier"] == "🔥 Strong Edge"
-            assert r["pick"] == "NYY"
+        assert r["home_win_prob"] > 0.55
 
 
 # ── check_bettable_ml ─────────────────────────────────────────────────────────
@@ -1012,7 +943,6 @@ class TestCheckBettableMl:
             home_sp_prov={"k_rate_allowed": "measured"},
             away_sp_prov={"k_rate_allowed": "measured"},
             home_n_batters=9, away_n_batters=9,
-            has_odds=True,
         )
         defaults.update(overrides)
         return check_bettable_ml(**defaults)
@@ -1021,11 +951,6 @@ class TestCheckBettableMl:
         ok, reasons = self._gate()
         assert ok is True
         assert reasons == []
-
-    def test_fails_without_odds(self):
-        ok, reasons = self._gate(has_odds=False)
-        assert ok is False
-        assert any("odds" in r for r in reasons)
 
     def test_fails_home_tbd_sp(self):
         ok, reasons = self._gate(home_sp_tbd=True)
@@ -1054,6 +979,6 @@ class TestCheckBettableMl:
 
     def test_multiple_failures_all_listed(self):
         """When multiple gates fail, all reasons are returned."""
-        ok, reasons = self._gate(has_odds=False, home_sp_tbd=True, home_n_batters=2)
+        ok, reasons = self._gate(home_sp_tbd=True, home_n_batters=2, away_n_batters=2)
         assert ok is False
         assert len(reasons) >= 3
