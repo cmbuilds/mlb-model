@@ -4918,7 +4918,7 @@ def fetch_moneyline_odds(date_str: str) -> Dict:
                 if ho is not None:
                     break
             if ho is None:
-                ho, ao = -110, 100
+                continue  # no h2h odds found for this game — exclude cleanly
             hi = _american_to_implied(ho); ai = _american_to_implied(ao)
             tot = hi + ai
             result[f"{an}|{hn}"] = {
