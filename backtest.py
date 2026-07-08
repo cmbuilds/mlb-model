@@ -897,16 +897,12 @@ def run_ml_backtest(season: int = 2026) -> Dict:
         away_off_wrc = sum(away_wrc_vals) / len(away_wrc_vals) if away_wrc_vals else 100.0
 
         home_wp, _ = compute_win_probability(
-            home_sp_stats=home_sp_stats,
-            away_sp_stats=away_sp_stats,
-            home_off_wrc=home_off_wrc,
-            away_off_wrc=away_off_wrc,
-            home_bp_vuln=50.0,
-            away_bp_vuln=50.0,
-            home_run_diff=0.0,
-            away_run_diff=0.0,
-            home_implied_runs=0.0,
-            away_implied_runs=0.0,
+            home_sp_vuln,
+            away_sp_vuln,
+            home_off_wrc,
+            away_off_wrc,
+            50.0,   # home_bp_vuln — no per-game BP data in backtest
+            50.0,   # away_bp_vuln
         )
 
         # Pick the side the model favors and check if it won
