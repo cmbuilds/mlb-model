@@ -2254,23 +2254,29 @@ def check_bettable_tb(batter_prov: dict, pitcher_prov: dict,
 # WEATHER API — Open-Meteo (free, no key required)
 # ============================================================================
 @st.cache_data(ttl=3600)
-def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool) -> Dict:
+def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool,
+                  park_team: str = "") -> Dict:
     """Fetch game-time weather from Open-Meteo. Returns neutral defaults for domes."""
     NEUTRAL = {
         "wind_speed": 0, "wind_direction": 0, "wind_dir_label": "DOME",
         "temperature": 72, "humidity": 50, "is_dome": True,
         "wind_effect": "neutral", "temp_effect": "neutral",
+        "data_source": "dome",
     }
     if is_dome:
         return NEUTRAL
 
     try:
-        game_hour = 19  # default 7pm
+        # Convert UTC game time to ET to match Open-Meteo's America/New_York response
+        game_hour = 19  # default 7 PM ET
         if game_time_utc:
             try:
                 from dateutil import parser as dtparser
                 game_dt = dtparser.parse(game_time_utc)
-                game_hour = game_dt.hour
+                if game_dt.tzinfo is None:
+                    game_dt = game_dt.replace(tzinfo=pytz.UTC)
+                game_dt_et = game_dt.astimezone(pytz.timezone("America/New_York"))
+                game_hour = game_dt_et.hour
             except Exception:
                 pass
 
@@ -2308,7 +2314,8 @@ def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool) -> 
         temperature= safe_idx(hourly.get("temperature_2m", []), target_idx, 70)
         humidity   = safe_idx(hourly.get("relativehumidity_2m", []), target_idx, 50)
 
-        wind_dir_label, wind_effect = classify_wind(float(wind_dir), float(wind_speed))
+        wind_dir_label, wind_effect = classify_wind(float(wind_dir), float(wind_speed),
+                                                    park_team=park_team)
         temp_effect = "suppress" if temperature < 50 else "boost" if temperature > 83 else "neutral"
 
         return {
@@ -2320,28 +2327,15 @@ def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool) -> 
             "is_dome": False,
             "wind_effect": wind_effect,
             "temp_effect": temp_effect,
+            "data_source": "open_meteo",
         }
     except Exception as e:
         return {
-            "wind_speed": 5, "wind_direction": 180, "wind_dir_label": "N/A",
-            "temperature": 70, "humidity": 50, "is_dome": False,
+            "wind_speed": 0, "wind_direction": 0, "wind_dir_label": "UNAVAILABLE",
+            "temperature": 0, "humidity": 0, "is_dome": False,
             "wind_effect": "neutral", "temp_effect": "neutral",
+            "data_source": "unavailable",
         }
-
-def classify_wind(direction: float, speed: float) -> Tuple[str, str]:
-    """Classify wind direction and HR/TB effect. Direction = meteorological degrees."""
-    if speed < 8:
-        return "Calm", "neutral"
-    dirs = ["N","NE","E","SE","S","SW","W","NW"]
-    label = dirs[int((direction + 22.5) / 45) % 8]
-    # SW/S/W blowing OUT toward outfield = HR boost
-    if 157.5 <= direction <= 292.5:
-        effect = "strong_out" if speed >= 12 else "out"
-    elif direction <= 67.5 or direction >= 337.5:
-        effect = "in" if speed >= 10 else "neutral"
-    else:
-        effect = "neutral"
-    return label, effect
 
 # ============================================================================
 # ODDS API — The Odds API (free tier: 500 calls/month)
@@ -4122,7 +4116,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         lat, lon, park_name, is_dome = park_info
         if game.get("neutral_site"):
             log(f"  🌎 Neutral site — using {park_key} park factors ({park_info[2]})", "info")
-        weather = fetch_weather(lat, lon, game.get("game_time", ""), is_dome)
+        weather = fetch_weather(lat, lon, game.get("game_time", ""), is_dome, park_team=park_key)
 
         # Lineups — try confirmed first, fall back to roster per side independently
         lineups = fetch_lineup(game_pk)
