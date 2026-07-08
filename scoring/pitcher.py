@@ -1,7 +1,6 @@
 """scoring/pitcher.py — Pitcher vulnerability sub-score and bullpen scores."""
 
 from typing import Dict, Tuple
-import pandas as pd
 
 
 def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
@@ -51,12 +50,14 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
     return max(0, min(100, blended)), label
 
 
-def compute_team_bullpen_scores(pitching_df: pd.DataFrame) -> Dict[str, float]:
+def compute_team_bullpen_scores(pitching_df) -> Dict[str, float]:
     """
     Build per-team bullpen vulnerability 0–100 from the loaded pitching DataFrame.
     Filters to relievers (GS==0 or GS/G < 30%), groups by team.
     Returns dict keyed by UPPERCASE team abbreviation. Missing teams → 42.0 at scoring time.
     """
+    import pandas as pd  # noqa: PLC0415 — lazy import; pandas not available in all envs
+
     if pitching_df is None or pitching_df.empty:
         return {}
 
