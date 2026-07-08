@@ -5422,12 +5422,27 @@ def _norm_name_dfs(name: str) -> str:
     return re.sub(r"[^a-z]", "", name.lower())
 
 
-def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
+def compute_game_stack_scores(plays: List[Dict], all_plays: List[Dict] = None) -> List[Dict]:
     """
     Rank all games on today's slate by DFS stack value.
     Uses: game O/U + park HR factor + wind bonus + dome penalty.
     Returns list of game dicts sorted best → worst.
+
+    all_plays: unfiltered plays list used ONLY for implied-total lookup.
+    Pass this when 'plays' is salary-filtered so away teams missing from
+    the CSV still contribute their real implied total.
     """
+    # Build implied-total lookup from all_plays — bypasses salary-filter gaps.
+    # Salary-filtered slates drop away-team players entirely; reading implied_total
+    # from only those players produces 0.0 for the absent side.
+    _implied_src = all_plays if all_plays is not None else plays
+    implied_by_team: Dict[str, float] = {}
+    for _p in _implied_src:
+        _t = _p.get("team", "")
+        _v = _p.get("implied_total", 0)
+        if _t and _v:
+            implied_by_team[_t] = _v
+
     games_seen = {}
     for p in plays:
         gid = p.get("game_id", "")
@@ -5489,16 +5504,8 @@ def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
         # Derive teams properly
         home_team = g["home_team"]
         away_team = g["away_team"]
-        # Fix: identify home/away from players
-        home_players = [p for p in g["players"] if p.get("park") == p.get("team")]
-        away_players = [p for p in g["players"] if p.get("park") != p.get("team")]
-        if not home_players:
-            home_players = [p for p in g["players"] if p.get("team") == home_team]
-        if not away_players:
-            away_players = [p for p in g["players"] if p.get("team") != home_team]
-
-        home_implied = home_players[0].get("implied_total", 0) if home_players else 0
-        away_implied = away_players[0].get("implied_total", 0) if away_players else 0
+        home_implied = implied_by_team.get(home_team, 0)
+        away_implied = implied_by_team.get(away_team, 0)
 
         results.append({
             "game_id": gid,
@@ -6490,9 +6497,9 @@ def display_fd_command_center(plays: List[Dict]):
         st.caption("Games ranked by run environment — O/U + park factor + wind. Stack the #1 or #2 game.")
         # Filter to DK slate teams only
         dk_slate_teams = set(p.get("team","") for p in dk_plays if p.get("dk_salary",0) > 0)
-        dk_slate_raw   = [p for p in (st.session_state.get("plays") or plays)
-                          if p.get("team","") in dk_slate_teams]
-        game_stacks = compute_game_stack_scores(dk_slate_raw if dk_slate_raw else plays)
+        _all_dk_plays  = st.session_state.get("plays") or plays
+        dk_slate_raw   = [p for p in _all_dk_plays if p.get("team","") in dk_slate_teams]
+        game_stacks = compute_game_stack_scores(dk_slate_raw if dk_slate_raw else plays, all_plays=_all_dk_plays)
         if game_stacks:
             gs_rows = []
             for i, gs in enumerate(game_stacks[:12]):
@@ -6512,8 +6519,8 @@ def display_fd_command_center(plays: List[Dict]):
                     "":          label,
                     "Game":      game_str,
                     "O/U":       f"{gs['game_total']:.1f}" if gs.get('game_total') else "— (no odds)",
-                    "Home Impl": f"{home_imp:.1f}R",
-                    "Away Impl": f"{away_imp:.1f}R",
+                    "Home Impl": f"{home_imp:.1f}R" if home_imp > 0 else "—",
+                    "Away Impl": f"{away_imp:.1f}R" if away_imp > 0 else "—",
                     "Park":      park_str,
                     "Wind":      wind_str,
                     "Score":     f"{gs.get('stack_score',0):.1f}",
@@ -7363,9 +7370,9 @@ def display_fd_hand_builder(plays: List[Dict]):
         st.markdown("### 🔗 Top Stacks — Where to Build Your Core")
         st.caption("Ranked by implied total + park factor + wind. Stack 5 batters from your #1 game.")
         dk_slate_tms   = set(p.get("dk_team", p.get("team","")) for p in dk_plays if p.get("dk_salary",0) > 0)
-        dk_slate_raws  = [p for p in (st.session_state.get("plays") or plays)
-                          if p.get("team","") in dk_slate_tms]
-        game_stacks = compute_game_stack_scores(dk_slate_raws if dk_slate_raws else plays)
+        _all_dk_plays2 = st.session_state.get("plays") or plays
+        dk_slate_raws  = [p for p in _all_dk_plays2 if p.get("team","") in dk_slate_tms]
+        game_stacks = compute_game_stack_scores(dk_slate_raws if dk_slate_raws else plays, all_plays=_all_dk_plays2)
         top3_games  = game_stacks[:3] if game_stacks else []
         if top3_games:
             gcols = st.columns(3)
