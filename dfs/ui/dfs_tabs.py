@@ -420,6 +420,9 @@ def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
                 st.error(f"❌ Build failed: {e}")
                 return
 
+        if not lineups:
+            st.error("❌ 0 lineups built — optimizer returned empty (infeasible). Upload salary CSV and verify player positions are populated.")
+            return
         st.success(f"✅ {len(lineups)} lineup(s) built")
 
         # ── Uniqueness check ──────────────────────────────────────────────────
@@ -558,6 +561,9 @@ def _render_dk_builder(board: List[ConsensusRow]):
                 st.error(f"❌ DK build failed: {e}")
                 return
 
+        if not lineups:
+            st.error("❌ 0 lineups built — optimizer returned empty (infeasible). Upload salary CSV and verify player positions are populated.")
+            return
         st.success(f"✅ {len(lineups)} lineup(s) built")
 
         if len(lineups) > 1:

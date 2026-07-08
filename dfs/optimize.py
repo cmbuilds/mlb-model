@@ -182,7 +182,7 @@ def check_lineup_diversity(lineups: List[Dict], warn_threshold: int = 7) -> List
 _FD_POS_MAP = {
     "SP": "P", "RP": "P",
     "OF": "OF", "LF": "OF", "CF": "OF", "RF": "OF",
-    "DH": "C",   # rare; DH sometimes plays C/1B slot
+    "DH": "1B",  # DH fills FD's C/1B flex slot; 1B is correct, not C
 }
 
 def _fd_pos(pos: str) -> List[str]:
@@ -309,8 +309,8 @@ def build_fd_lineups(
 
 
 def export_fd_csv(lineups: List[Dict], filepath: str) -> None:
-    """Export lineups to FanDuel bulk-import CSV format."""
-    fd_slots = ["P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"]
+    """Export lineups to FanDuel bulk-import CSV format (9-player, C/1B flex slot)."""
+    fd_slots = ["P", "C/1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"]
 
     with open(filepath, "w", newline="") as f:
         writer = csv.writer(f)
@@ -325,6 +325,7 @@ def export_fd_csv(lineups: List[Dict], filepath: str) -> None:
             pos_cursors = {k: 0 for k in by_pos}
             for slot in fd_slots:
                 avail = [k for k in by_pos if k == slot or
+                          (slot == "C/1B" and k in ("C", "1B")) or
                           (slot == "OF" and k in ("LF","CF","RF")) or
                           (slot == "UTIL" and k != "P")]
                 placed = False
@@ -425,9 +426,10 @@ def build_dk_lineups(
         except Exception:
             pass
 
+    n_teams = len(set(r.team for r in confident_rows if r.position not in ("SP", "RP", "P")))
     if stack_team:
         opt.add_stack(TeamStack(contest.stack_size, for_teams=[stack_team]))
-    elif contest.stack_size >= 3:
+    elif contest.stack_size >= 3 and n_teams >= 2:
         opt.add_stack(TeamStack(contest.stack_size))
 
     if contest.randomness > 0:

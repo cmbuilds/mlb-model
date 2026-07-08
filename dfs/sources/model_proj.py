@@ -76,7 +76,7 @@ def plays_to_fd_projections(plays: List[Dict]) -> List[ProjectionRow]:
         rows.append(ProjectionRow(
             player=name,
             team=p.get("team", ""),
-            position=p.get("batter_position", "OF"),
+            position=p.get("batter_position") or "OF",
             site="fd",
             proj_pts=float(fd_pts),
             source=SOURCE_ID,
@@ -114,7 +114,7 @@ def plays_to_dk_projections(plays: List[Dict]) -> List[ProjectionRow]:
         rows.append(ProjectionRow(
             player=name,
             team=p.get("team", ""),
-            position=p.get("batter_position", "OF"),
+            position=p.get("batter_position") or "OF",
             site="dk",
             proj_pts=float(dk_pts),
             source=SOURCE_ID,
