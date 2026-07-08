@@ -4055,15 +4055,19 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
     # ── 2. ODDS ───────────────────────────────────────────
     log("Fetching Vegas lines...", "run")
-    implied_totals = {}
-    prop_odds = {}
+    implied_totals: dict = {}
+    implied_source: str  = "none"
+    prop_odds: dict = {}
+
+    # Primary: The Odds API (requires API key in secrets.toml)
     try:
         implied_totals = fetch_odds(date_str)
     except Exception:
         pass
+
     if implied_totals:
-        log(f"Live odds loaded for {len(implied_totals)} teams ✅", "ok")
-        # Also fetch prop-specific odds for precise edge calculation
+        implied_source = "odds_api"
+        log(f"Live odds loaded for {len(implied_totals)} teams (Odds API) ✅", "ok")
         try:
             prop_odds = fetch_prop_odds(date_str)
             if prop_odds:
@@ -4071,7 +4075,31 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         except Exception:
             pass
     else:
-        log("⚠️ No Odds API key — Vegas signal (8% weight) zeroed out. Add key in sidebar for full model.", "warn")
+        # Fallback: RotoGrinders scrape (no API key required)
+        log("No Odds API key — trying RotoGrinders scrape for implied totals...", "info")
+        try:
+            from data.rotogrinders import fetch_rg_implied_totals
+            rg_data = fetch_rg_implied_totals()
+            if rg_data:
+                implied_totals = rg_data
+                implied_source = "rotogrinders_scrape"
+                log(
+                    f"Implied totals from RotoGrinders: {len(rg_data)} teams ✅ "
+                    f"(provenance: rotogrinders_scrape)",
+                    "ok"
+                )
+            else:
+                implied_source = "none"
+                log(
+                    "⚠️ RotoGrinders fetch returned no data — Vegas signal zeroed out. "
+                    "Both Odds API key and RotoGrinders unavailable.",
+                    "warn"
+                )
+        except Exception as _rg_err:
+            implied_source = "none"
+            log(f"⚠️ RotoGrinders scrape failed ({_rg_err}) — Vegas signal zeroed out.", "warn")
+
+    st.session_state["_implied_source"] = implied_source
 
     # ── 3. PROCESS EACH GAME ─────────────────────────────
     total_batters = 0
@@ -4324,10 +4352,15 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 team_bullpen_scores=team_bullpen_scores,
                 proxy_mode=_proxy_mode,
             )
-            # game_total requires both sides' implied — set it here in the orchestrator
-            result["game_total"] = round(
-                implied_totals.get(home_team, 4.7) + implied_totals.get(away_team, 4.3), 1
+            # game_total: only set when BOTH sides have real odds — never fabricate.
+            _ht_impl = implied_totals.get(home_team)
+            _at_impl = implied_totals.get(away_team)
+            result["game_total"] = (
+                round(_ht_impl + _at_impl, 1)
+                if (_ht_impl is not None and _at_impl is not None)
+                else None
             )
+            result["implied_source"] = implied_source
             results.append(result)
             total_batters += 1
 
@@ -5407,7 +5440,7 @@ def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
                 "game_id": gid,
                 "home_team": home,
                 "away_team": away,
-                "game_total": p.get("game_total", 9.0),
+                "game_total": p.get("game_total"),   # None when no odds
                 "park": home,
                 "is_dome": p.get("is_dome", False),
                 "wind_speed": p.get("wind_speed", 0),
@@ -5419,7 +5452,7 @@ def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
 
     results = []
     for gid, g in games_seen.items():
-        game_total = g["game_total"]
+        game_total = g["game_total"]  # may be None
         park = g["park"]
         park_hr = PARK_HR_FACTORS.get(park, 1.0)
         wind_effect = g["wind_effect"]
@@ -5447,7 +5480,11 @@ def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
             elif temp > 80:
                 temp_adj = 1
 
-        stack_score = round(game_total + park_bonus + wind_bonus + temp_adj, 1)
+        # game_total is None when no odds — omit it from score rather than fabricate
+        stack_score = round(
+            (game_total if game_total is not None else 0)
+            + park_bonus + wind_bonus + temp_adj, 1
+        )
 
         # Derive teams properly
         home_team = g["home_team"]
@@ -5467,7 +5504,7 @@ def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
             "game_id": gid,
             "home_team": home_team,
             "away_team": away_team,
-            "game_total": game_total,
+            "game_total": game_total,   # None = no odds
             "park": park,
             "park_hr": park_hr,
             "park_bonus": park_bonus,
@@ -5574,7 +5611,7 @@ def get_ranked_team_stacks(plays: List[Dict], min_players: int = 3) -> List[Dict
                 "game_id": gid,
                 "home_team": home,
                 "away_team": away,
-                "game_total": p.get("game_total",9.0),
+                "game_total": p.get("game_total"),   # None when no odds
                 "park": home,
                 "is_dome": p.get("is_dome",False),
                 "wind_effect": p.get("wind_effect","neutral"),
@@ -6474,7 +6511,7 @@ def display_fd_command_center(plays: List[Dict]):
                 gs_rows.append({
                     "":          label,
                     "Game":      game_str,
-                    "O/U":       f"{gs.get('game_total',0):.1f}",
+                    "O/U":       f"{gs['game_total']:.1f}" if gs.get('game_total') else "— (no odds)",
                     "Home Impl": f"{home_imp:.1f}R",
                     "Away Impl": f"{away_imp:.1f}R",
                     "Park":      park_str,
@@ -6704,6 +6741,7 @@ def display_fd_command_center(plays: List[Dict]):
             }.get(we,"→ Neutral")
 
             impl_str = f"{impl:.1f}R" if impl > 0.5 else "— R"
+            ou_str   = f"{sd['game_total']:.1f}" if sd.get("game_total") else "— (no odds)"
             hot_flag = "🔥 " if sd["streaking_count"] >= 2 else ""
 
             # st.expander does not render HTML — use plain text only
@@ -6711,7 +6749,7 @@ def display_fd_command_center(plays: List[Dict]):
             label_plain = (
                 f"{hot_flag}{team} (@ {opp})  |  "
                 f"{badge} · Score {score:.0f}  |  "
-                f"Impl {impl_str} · O/U {sd['game_total']:.1f} · "
+                f"Impl {impl_str} · O/U {ou_str} · "
                 f"Park {park_hr:.2f}x · {wind_str}"
             )
 
@@ -7138,7 +7176,7 @@ def display_fd_command_center(plays: List[Dict]):
                 "avg_own": avg_own,
                 "value_score": value_score,
                 "players": team_plays[:4],
-                "game_total": g.get("game_total", 8.5),
+                "game_total": g.get("game_total"),   # None when no odds
             })
 
     # Sort by value score, exclude the top 2 primary stacks (those are in Top Game Stacks)
@@ -7156,13 +7194,15 @@ def display_fd_command_center(plays: List[Dict]):
         vcols = st.columns(3)
         for vcol, vs in zip(vcols, value_stacks):
             with vcol:
+                _vs_ou = f"{vs['game_total']:.1f}" if vs.get("game_total") else "— (no odds)"
+                _vs_impl = f"{vs['implied']:.1f}R" if vs.get("implied", 0) > 0.5 else "— R"
                 st.markdown(
                     f"<div style='background:#0d1a0d;border:1px solid #00cc66;"
                     f"border-radius:10px;padding:12px 14px;margin-bottom:8px'>"
                     f"<div style='color:#00cc66;font-size:0.7rem;font-weight:700'>💰 VALUE STACK</div>"
                     f"<div style='color:#00ff88;font-size:1.3rem;font-weight:800'>{vs['team']}</div>"
-                    f"<div style='color:#9090a8;font-size:0.75rem'>{vs['game']} | O/U {vs['game_total']:.1f} | "
-                    f"Impl {vs['implied']:.1f}R</div>"
+                    f"<div style='color:#9090a8;font-size:0.75rem'>{vs['game']} | O/U {_vs_ou} | "
+                    f"Impl {_vs_impl}</div>"
                     f"<div style='color:#aaa;font-size:0.72rem;margin-top:6px'>"
                     f"Avg proj {vs['avg_proj']:.1f}pts · Avg sal ${vs['avg_sal']:,.0f} · "
                     f"Avg own {vs['avg_own']:.0f}%</div>"
@@ -7345,10 +7385,12 @@ def display_fd_hand_builder(plays: List[Dict]):
                     key=lambda x: x["dk_proj"], reverse=True
                 )[:5]
                 with col:
+                    _dk_ou   = f"{gs['game_total']:.1f}" if gs.get("game_total") else "— (no odds)"
+                    _dk_impl = f"{max(home_imp,away_imp):.1f}R" if max(home_imp,away_imp) > 0.5 else "— R"
                     st.markdown(
                         f"<div style='color:{clr};font-size:0.7rem;font-weight:700'>{lbl}</div>"
                         f"<div style='color:#00ff88;font-size:1.4rem;font-weight:800'>{best_team}</div>"
-                        f"<div style='color:#9090a8;font-size:0.75rem'>{away_t}@{home_t} | O/U {gs.get('game_total',0):.1f} | Impl {max(home_imp,away_imp):.1f}R</div>",
+                        f"<div style='color:#9090a8;font-size:0.75rem'>{away_t}@{home_t} | O/U {_dk_ou} | Impl {_dk_impl}</div>",
                         unsafe_allow_html=True
                     )
                     for p in top_team_plays:
@@ -7491,11 +7533,12 @@ def display_fd_hand_builder(plays: List[Dict]):
                 key=lambda x: x.get("fd_proj",0), reverse=True
             )[:4]
 
-            impl_str = f"{team_impl:.1f}" if team_impl > 0.5 else "—"
+            impl_str  = f"{team_impl:.1f}" if team_impl > 0.5 else "—"
+            _fd_ou    = f"{sd['game_total']:.1f}" if sd.get("game_total") else "— (no odds)"
             st.markdown(
                 f"<div style='color:{rank_colors[i]};font-weight:900;font-size:13px'>{rank_labels[i]}</div>"
                 f"<div style='color:#00ff88;font-size:22px;font-weight:900'>{stack_team}</div>"
-                f"<div style='color:#9090a8;font-size:12px'>vs {vs_team} | O/U {sd.get('game_total',0):.1f} | "
+                f"<div style='color:#9090a8;font-size:12px'>vs {vs_team} | O/U {_fd_ou} | "
                 f"Impl {impl_str}R | Park {park_hr:.2f}x | {wind_str}</div>",
                 unsafe_allow_html=True
             )
