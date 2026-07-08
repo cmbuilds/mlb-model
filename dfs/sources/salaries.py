@@ -141,11 +141,16 @@ def parse_dk_salary_csv(content: str) -> List[Dict]:
 # ── Salary merger ──────────────────────────────────────────────────────────────
 def merge_salaries_into_board(board, salary_rows: List[Dict]) -> List:
     """
-    Enrich ConsensusRow objects with salary from the uploaded CSV.
+    Enrich ConsensusRow objects with salary and position from the uploaded CSV.
     Matches on normalised name. Unmatched rows keep salary=0.
-    Returns the board in-place (mutates salary field).
+    Position is always taken from the salary CSV when matched — the DFS site's
+    player listing is authoritative (MLB API can return '' or wrong defaults).
+    Returns the board in-place (mutates salary and position fields).
     """
     salary_map = {r["norm"]: r for r in salary_rows}
+
+    # Positions that are flex/slot designations, not player positions — skip these.
+    _SKIP_POS = {"UTIL", "FLEX", ""}
 
     matched = 0
     for row in board:
@@ -158,15 +163,16 @@ def merge_salaries_into_board(board, salary_rows: List[Dict]) -> List:
                     sal_row = v
                     break
         if sal_row:
-            object.__setattr__(row, "salary", sal_row["salary"]) if hasattr(row, "__dataclass_fields__") else setattr(row, "salary", sal_row["salary"])
+            row.salary = sal_row["salary"]
+            # Copy position from salary CSV — overrides MLB API value which can be
+            # empty or generic (e.g., '' defaulted to 'OF' makes optimizer infeasible).
+            csv_pos = (sal_row.get("position") or "").strip().upper()
+            if csv_pos not in _SKIP_POS:
+                row.position = csv_pos
             # recalculate value
             sal = sal_row["salary"]
             if sal >= 1000:
-                cv = round(row.consensus_pts / (sal / 1000), 2)
-                try:
-                    object.__setattr__(row, "consensus_value", cv)
-                except AttributeError:
-                    row.consensus_value = cv
+                row.consensus_value = round(row.consensus_pts / (sal / 1000), 2)
             matched += 1
 
     return board, matched

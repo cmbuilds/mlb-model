@@ -4,7 +4,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pytest
-from dfs.sources.salaries import parse_fd_salary_csv, parse_dk_salary_csv
+from dfs.sources.salaries import parse_fd_salary_csv, parse_dk_salary_csv, merge_salaries_into_board
 from dfs.sources.api_external import SourceError, BluecollarDFSProjections, SourceKind
 from dfs.lib.dk_rules import compute_dk_projection, dk_salary_csv_to_players, DK_SALARY_CAP
 
@@ -268,3 +268,74 @@ def test_plays_to_fd_pitcher_projections_no_sp_raises():
     plays = [{"name": "Judge", "sp_name": "TBD"}]
     with pytest.raises(SourceError):
         plays_to_fd_pitcher_projections(plays)
+
+
+# ── merge_salaries_into_board: position copy ──────────────────────────────────
+def _make_consensus_row(name, position, team="NYY"):
+    from dfs.contracts import ConsensusRow, ConfidenceState, Provenance
+    return ConsensusRow(
+        name=name, team=team, opponent="BOS",
+        position=position, site="fd", salary=0, lineup_slot=3,
+        consensus_pts=15.0, consensus_value=0.0,
+        model_pts=15.0, model_ceiling=20.0, model_floor=6.0,
+        state=ConfidenceState.CONFIDENT,
+        source_count=1, sources_used=["model"],
+        flagged_reason="",
+        own_pct=10.0, own_provenance=Provenance.MODELED,
+        divergence=0.0, divergence_flag=False,
+        bettable=False, batter_hand="R",
+        sp_name="Gerrit Cole", sp_hand="R",
+        park="NYY", implied_total=4.5, game_id="nyyvsb",
+        score=70.0, hr_score=55.0, dq_score=0,
+    )
+
+def test_merge_copies_position_from_csv():
+    """Salary CSV's position overwrites the model's default 'OF' for infielders."""
+    board = [
+        _make_consensus_row("Anthony Rizzo", "OF"),   # MLB API defaulted wrong
+        _make_consensus_row("Gleyber Torres", "OF"),  # same
+        _make_consensus_row("Aaron Judge", "OF"),      # correct already
+    ]
+    salary_rows = [
+        {"name": "Anthony Rizzo",  "norm": "anthonyrizzo",  "position": "1B", "salary": 3400, "site": "fd"},
+        {"name": "Gleyber Torres", "norm": "gleyber torres".replace(" ",""), "position": "2B", "salary": 3200, "site": "fd"},
+        {"name": "Aaron Judge",    "norm": "aaronjudge",    "position": "OF", "salary": 3700, "site": "fd"},
+    ]
+    # fix norm values
+    import re, unicodedata
+    def _norm(n):
+        s = unicodedata.normalize("NFD", n)
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+    for r in salary_rows:
+        r["norm"] = _norm(r["name"])
+
+    board, matched = merge_salaries_into_board(board, salary_rows)
+
+    assert matched == 3
+    rizzo  = next(r for r in board if r.name == "Anthony Rizzo")
+    torres = next(r for r in board if r.name == "Gleyber Torres")
+    judge  = next(r for r in board if r.name == "Aaron Judge")
+
+    assert rizzo.position  == "1B",  "Position must be updated from salary CSV"
+    assert torres.position == "2B",  "Position must be updated from salary CSV"
+    assert judge.position  == "OF"   # unchanged — was already correct
+    assert rizzo.salary    == 3400
+    assert rizzo.consensus_value > 0
+
+def test_merge_skips_util_position():
+    """'UTIL' from salary CSV must not overwrite a real position."""
+    board = [_make_consensus_row("DJ LeMahieu", "1B")]
+    salary_rows = [{"name": "DJ LeMahieu", "norm": "djlemahieu", "position": "UTIL", "salary": 3100, "site": "fd"}]
+    import re, unicodedata
+    def _norm(n):
+        s = unicodedata.normalize("NFD", n)
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+    for r in salary_rows:
+        r["norm"] = _norm(r["name"])
+
+    board, matched = merge_salaries_into_board(board, salary_rows)
+    dj = board[0]
+    assert dj.salary == 3100
+    assert dj.position == "1B"  # UTIL must not overwrite real position
