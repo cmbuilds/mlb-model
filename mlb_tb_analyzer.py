@@ -8853,7 +8853,7 @@ def _dk_pos_eligible(roster_pos_str: str, slot: str) -> bool:
     return slot.upper() in eligible
 
 
-def _dk_name_match(name: str, salary_data: Dict) -> Dict:
+def _dk_name_match(name: str, salary_data: Dict, player_team: str = "") -> Dict:
     """Fuzzy name match for DK salary dict. Same logic as _fd_name_match."""
     if not salary_data:
         return {}
@@ -8874,10 +8874,14 @@ def _dk_name_match(name: str, salary_data: Dict) -> Dict:
             k_parts = k.split()
             if len(k_parts) >= 2 and k_parts[0] == first and k_parts[-1] == last:
                 return v
-    # Last name only fallback
+    # Last name only fallback — require same team to prevent cross-player collision
     if parts:
         last = parts[-1]
-        matches = [v for k, v in salary_data.items() if k.split()[-1] == last]
+        matches = [
+            v for k, v in salary_data.items()
+            if k.split()[-1] == last
+            and (not player_team or v.get("team", "") == player_team)
+        ]
         if len(matches) == 1:
             return matches[0]
     return {}
@@ -9007,7 +9011,7 @@ def _build_dk_plays_with_salaries(plays: List[Dict], salary_data: Dict, sp_salar
     """
     dk_plays = []
     for p in plays:
-        sal = _dk_name_match(p["name"], salary_data)
+        sal = _dk_name_match(p["name"], salary_data, player_team=p.get("team", ""))
         if not sal:
             continue
         proj_data = _compute_dk_hitter_proj(p, sal)
