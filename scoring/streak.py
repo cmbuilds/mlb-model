@@ -107,11 +107,13 @@ def compute_bvp_score(bvp: Dict, batter_slg: float = 0.398) -> Tuple[float, str,
     return score, label, flag
 
 
-def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[float, str]:
+def compute_tto_bonus(lineup_slot, sp_ip_estimate: float = 6.0) -> Tuple[float, str]:
     """
     Times Through Order bonus 0–15. Research-backed: 3rd TTO +20 wOBA.
     Estimate TTO from lineup slot and typical SP workload.
     """
+    if lineup_slot is None:
+        return 0.0, "slot unknown"
     if lineup_slot <= 3:
         return 0.60 * 25, "3rd TTO boost (+20 wOBA)"
     elif lineup_slot <= 6:

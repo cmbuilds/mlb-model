@@ -39,8 +39,10 @@ def compute_platoon_score(batter_hand: str, pitcher_hand: str) -> Tuple[float, s
     return 50.0, "RHB vs RHP (neutral)"
 
 
-def compute_lineup_score(lineup_slot: int) -> Tuple[float, str]:
+def compute_lineup_score(lineup_slot) -> Tuple[float, str]:
     """Sub-score 0–100 for lineup position expected PA."""
+    if lineup_slot is None:
+        return 50.0, "slot unknown"
     pa_by_slot = {1: 4.8, 2: 4.7, 3: 4.6, 4: 4.5, 5: 4.3,
                   6: 4.2, 7: 4.1, 8: 3.9, 9: 3.8}
     expected_pa = pa_by_slot.get(lineup_slot, 4.2)

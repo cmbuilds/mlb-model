@@ -2623,24 +2623,26 @@ def compute_platoon_score(batter_hand: str, pitcher_hand: str) -> Tuple[float, s
         return 50.0, "RHB vs RHP (neutral)"
 
 
-def compute_lineup_score(lineup_slot: int) -> Tuple[float, str]:
+def compute_lineup_score(lineup_slot) -> Tuple[float, str]:
     """
     Compute lineup position sub-score based on expected PA.
     Slots 1-4 get most PAs; slot 9 gets least.
     """
+    if lineup_slot is None:
+        return 50.0, "slot unknown"
     # Expected PA per game by lineup slot (research-based)
-    pa_by_slot = {1: 4.8, 2: 4.7, 3: 4.6, 4: 4.5, 5: 4.3, 
+    pa_by_slot = {1: 4.8, 2: 4.7, 3: 4.6, 4: 4.5, 5: 4.3,
                   6: 4.2, 7: 4.1, 8: 3.9, 9: 3.8}
-    
+
     expected_pa = pa_by_slot.get(lineup_slot, 4.2)
-    
+
     # Normalize: min 3.8=20, max 4.8=100
     score = (expected_pa - 3.8) / (4.8 - 3.8) * 80 + 20
-    
+
     slot_labels = {1: "Leadoff", 2: "2-Hole", 3: "3-Hole", 4: "Cleanup",
                    5: "5th", 6: "6th", 7: "7th", 8: "8th", 9: "9th"}
     bonus = " ⭐" if lineup_slot <= 4 else ""
-    
+
     return score, f"#{lineup_slot} {slot_labels.get(lineup_slot, str(lineup_slot))}{bonus} ({expected_pa:.1f} PA/g)"
 
 
@@ -3132,17 +3134,19 @@ def compute_weather_score(weather: Dict) -> Tuple[float, str]:
     return max(0, min(100, score)), " | ".join(notes)
 
 
-def compute_tto_bonus(lineup_slot: int, sp_ip_estimate: float = 6.0) -> Tuple[float, str]:
+def compute_tto_bonus(lineup_slot, sp_ip_estimate: float = 6.0) -> Tuple[float, str]:
     """
     Times Through Order (TTO) bonus.
     Research-backed: 2nd TTO +8 wOBA, 3rd TTO +17-20 wOBA vs 1st TTO.
     Estimate TTO based on lineup slot and typical SP innings.
-    
+
     Typical SP: 6 IP = 18 batters faced = ~2 times through
     Slot 1-3: likely 3 TTO (top order faces SP most)
     Slot 4-6: likely 2-3 TTO
     Slot 7-9: likely 2 TTO
     """
+    if lineup_slot is None:
+        return 0.0, "slot unknown"
     # Estimate TTO based on lineup position and typical SP workload
     if lineup_slot <= 3:
         # Top of order: 3 PA = 3rd TTO territory
@@ -4941,8 +4945,9 @@ def compute_pp_projection(statcast: Dict, pitcher_statcast: Dict,
     proj_triples = proj_xbh * 0.05
     proj_bb      = bb_rate * est_pa
     proj_sb      = sb_rate * est_pa
-    rbi_rate     = 0.32 if lineup_slot <= 4 else 0.22
-    run_rate     = 0.38 if lineup_slot <= 3 else (0.28 if lineup_slot <= 6 else 0.20)
+    _slot_pp = lineup_slot or 5
+    rbi_rate     = 0.32 if _slot_pp <= 4 else 0.22
+    run_rate     = 0.38 if _slot_pp <= 3 else (0.28 if _slot_pp <= 6 else 0.20)
     if implied_total > 0:
         rbi_rate *= implied_total / 4.5
         run_rate *= implied_total / 4.5
@@ -5061,8 +5066,9 @@ def compute_fd_projection(statcast: Dict, pitcher_statcast: Dict,
     proj_outs    = outs_per_pa * est_pa
 
     # RBI and Runs — function of team context and lineup slot
-    rbi_rate = 0.32 if lineup_slot <= 4 else 0.22
-    run_rate = 0.38 if lineup_slot <= 3 else 0.28 if lineup_slot <= 6 else 0.20
+    _slot_fd = lineup_slot or 5
+    rbi_rate = 0.32 if _slot_fd <= 4 else 0.22
+    run_rate = 0.38 if _slot_fd <= 3 else 0.28 if _slot_fd <= 6 else 0.20
     if implied_total > 0:
         rbi_rate *= (implied_total / 4.5)
         run_rate *= (implied_total / 4.5)
@@ -5127,9 +5133,9 @@ def compute_ownership_projection(
     elif implied_total < 3.5:
         own *= 0.70
 
-    if lineup_slot <= 2:
+    if lineup_slot and lineup_slot <= 2:
         own *= 1.20  # leadoff/2-hole = more ownership
-    elif lineup_slot >= 7:
+    elif lineup_slot and lineup_slot >= 7:
         own *= 0.80
 
     if barrel_rate > 0.15:
@@ -5394,13 +5400,13 @@ def compute_team_stack_score(team: str, game: Dict, plays: List[Dict]) -> Dict:
     """
     team_players = [p for p in plays if p.get("team") == team
                     and p.get("game_id") == game["game_id"]
-                    and p.get("lineup_slot", 10) <= 9]
+                    and (p.get("lineup_slot") or 10) <= 9]
 
     if not team_players:
         return {"team": team, "stack_score": 0, "players": [], "components": {}}
 
     # Sort by lineup slot for proper stack ordering
-    team_players.sort(key=lambda x: x.get("lineup_slot", 9))
+    team_players.sort(key=lambda x: x.get("lineup_slot") or 9)
 
     # 1. Implied total (0-40 pts)
     implied = team_players[0].get("implied_total", 4.5)
@@ -5420,7 +5426,7 @@ def compute_team_stack_score(team: str, game: Dict, plays: List[Dict]) -> Dict:
     streaking = sum(
         1 for p in team_players
         if p.get("sub_streak", 50) >= 65
-        and p.get("lineup_slot", 10) <= 7
+        and (p.get("lineup_slot") or 10) <= 7
     )
     streak_bonus = {0: 0, 1: 5, 2: 10}.get(min(streaking, 2), 15)
     streak_score = min(15, streak_bonus)
@@ -5660,7 +5666,7 @@ def build_dfs_lineup(
         base = p.get("score", 0)
         hr_bonus = p.get("hr_score", 0) * 0.3
         # Differentiate lineup 2/3 by deprioritizing chalk
-        chalk_penalty = 5 if lineup_num > 0 and p.get("lineup_slot", 5) <= 2 else 0
+        chalk_penalty = 5 if lineup_num > 0 and (p.get("lineup_slot") or 10) <= 2 else 0
         return base + hr_bonus - chalk_penalty
 
     primary_pool.sort(key=gpp_sort, reverse=True)
@@ -8883,7 +8889,7 @@ def _build_dk_plays_with_salaries(plays: List[Dict], salary_data: Dict, sp_salar
             "dk_team":     sal.get("team", p["team"]),
         }
         # Estimated ownership (same formula as FD, DK field is larger so scale down)
-        slot   = p.get("lineup_slot", 5)
+        slot   = p.get("lineup_slot") or 5
         score  = p.get("score", 50)
         salary = sal["salary"]
         own_base = max(5, min(55,
