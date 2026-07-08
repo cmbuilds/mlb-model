@@ -1,20 +1,48 @@
 """scoring/weather.py — Wind classification and weather sub-score."""
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 
-def classify_wind(direction: float, speed: float) -> Tuple[str, str]:
-    """Classify wind: returns (direction_label, effect). Effect: strong_out/out/in/neutral."""
+def classify_wind(
+    direction: float, speed: float, park_team: Optional[str] = None
+) -> Tuple[str, str]:
+    """Classify wind: returns (direction_label, effect). Effect: strong_out/out/in/neutral.
+
+    When park_team is supplied, wind effect is relative to that park's CF bearing
+    from lib.constants.CF_BEARINGS (fail-safe: falls back to fixed range if absent).
+    """
     if speed < 8:
         return "Calm", "neutral"
     dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
     label = dirs[int((direction + 22.5) / 45) % 8]
-    if 157.5 <= direction <= 292.5:
-        effect = "strong_out" if speed >= 12 else "out"
-    elif direction <= 67.5 or direction >= 337.5:
-        effect = "in" if speed >= 10 else "neutral"
+
+    cf_bearing: Optional[float] = None
+    if park_team:
+        try:
+            from lib.constants import CF_BEARINGS
+            cf_bearing = CF_BEARINGS.get(park_team)
+        except Exception:
+            cf_bearing = None
+
+    if cf_bearing is not None:
+        # Wind "out" = blowing toward CF (from home plate direction = cf_bearing ± 45°)
+        # Wind "in"  = blowing from CF toward home plate (opposite direction ± 45°)
+        diff = (direction - cf_bearing + 360) % 360
+        if diff <= 45 or diff >= 315:
+            effect = "strong_out" if speed >= 12 else "out"
+        elif 135 <= diff <= 225:
+            effect = "in" if speed >= 10 else "neutral"
+        else:
+            effect = "neutral"
     else:
-        effect = "neutral"
+        # Park-agnostic fallback (used only when park_team is absent or not in CF_BEARINGS)
+        if 157.5 <= direction <= 292.5:
+            effect = "strong_out" if speed >= 12 else "out"
+        elif direction <= 67.5 or direction >= 337.5:
+            effect = "in" if speed >= 10 else "neutral"
+        else:
+            effect = "neutral"
+
     return label, effect
 
 

@@ -1,7 +1,6 @@
 """scoring/pitcher.py — Pitcher vulnerability sub-score and bullpen scores."""
 
 from typing import Dict, Tuple
-import pandas as pd
 
 
 def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
@@ -51,12 +50,62 @@ def compute_pitcher_score(statcast: Dict, fg_stats: Dict = None,
     return max(0, min(100, blended)), label
 
 
-def compute_team_bullpen_scores(pitching_df: pd.DataFrame) -> Dict[str, float]:
+def compute_sp_vuln_pure(statcast: Dict) -> Tuple[float, str]:
+    """
+    Pure SP vulnerability score 0–100, WITHOUT bullpen blend.
+
+    Use this for the ML win-probability model where SP and bullpen are
+    weighted independently. compute_pitcher_score blends SP+BP; this returns
+    the SP component alone so the caller can apply separate SP/BP weights.
+
+    Same stat inputs and scaling as compute_pitcher_score; no bullpen term.
+    """
+    def f(key, default):
+        try: return float(statcast.get(key, default))
+        except Exception: return float(default)
+
+    k_rate   = f("k_rate_allowed",   0.220)
+    hard_hit = f("hard_hit_allowed", 0.370)
+    barrel   = f("barrel_allowed",   0.070)
+    era      = f("era",              4.20)
+    fip      = f("fip",              4.20)
+    whip     = f("whip",             1.30)
+
+    k_vuln      = max(0, min(100, 50 - (k_rate   - 0.220) / 0.050 * 25))
+    hh_vuln     = max(0, min(100, 50 + (hard_hit - 0.370) / 0.055 * 25))
+    barrel_vuln = max(0, min(100, 50 + (barrel   - 0.070) / 0.030 * 25))
+    era_use     = fip if fip > 0 else era
+    era_vuln    = max(0, min(100, 50 + (era_use  - 4.20)  / 0.80  * 25))
+    whip_vuln   = max(0, min(100, 50 + (whip     - 1.30)  / 0.20  * 25))
+
+    HH_IS_DEFAULT     = abs(hard_hit - 0.360) < 0.003
+    BARREL_IS_DEFAULT = abs(barrel   - 0.070) < 0.003
+
+    if HH_IS_DEFAULT and BARREL_IS_DEFAULT:
+        sp_score = k_vuln * 0.50 + era_vuln * 0.35 + whip_vuln * 0.15
+    else:
+        sp_score = (
+            k_vuln      * 0.40 +
+            hh_vuln     * 0.28 +
+            era_vuln    * 0.18 +
+            barrel_vuln * 0.09 +
+            whip_vuln   * 0.05
+        )
+
+    mode_tag = "FIP-only" if (HH_IS_DEFAULT and BARREL_IS_DEFAULT) else "full"
+    label = (f"K%: {k_rate*100:.0f}% | WHIP: {whip:.2f} | FIP: {era_use:.2f} "
+             f"| mode: {mode_tag} [pure SP, no BP blend]")
+    return max(0, min(100, sp_score)), label
+
+
+def compute_team_bullpen_scores(pitching_df) -> Dict[str, float]:
     """
     Build per-team bullpen vulnerability 0–100 from the loaded pitching DataFrame.
     Filters to relievers (GS==0 or GS/G < 30%), groups by team.
     Returns dict keyed by UPPERCASE team abbreviation. Missing teams → 42.0 at scoring time.
     """
+    import pandas as pd  # noqa: PLC0415 — lazy import; pandas not available in all envs
+
     if pitching_df is None or pitching_df.empty:
         return {}
 

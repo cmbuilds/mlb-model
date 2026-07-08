@@ -357,7 +357,7 @@ class TestProvenanceFunctions:
         # Keys must match what check_bettable_tb actually reads (see provenance.py)
         bat = {k: "measured" for k in ("k_rate", "slg_proxy", "woba", "hard_hit_rate")}
         pit = {}  # pitcher_matched=True is what matters for gate; no prov keys checked
-        ok, reasons = check_bettable_tb(bat, pit, True, True, True, True, True)
+        ok, reasons = check_bettable_tb(bat, pit, True, True, True, True, True, batter_pa=200)
         assert ok, f"All measured should be bettable, reasons: {reasons}"
         assert reasons == []
 

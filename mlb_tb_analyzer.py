@@ -618,6 +618,7 @@ def _load_from_db(table: str) -> Optional[pd.DataFrame]:
                 f"Dataset is {age_hours:.0f}h old (threshold {_DB_FRESHNESS_HOURS}h). "
                 f"Run: python3 data/fetch_pipeline.py"
             )
+            return None  # refuse stale data — caller falls through to live fetch
         else:
             st.session_state.pop("_db_freshness_warning", None)
         con = sqlite3.connect(_STATS_DB)
@@ -2253,23 +2254,29 @@ def check_bettable_tb(batter_prov: dict, pitcher_prov: dict,
 # WEATHER API — Open-Meteo (free, no key required)
 # ============================================================================
 @st.cache_data(ttl=3600)
-def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool) -> Dict:
+def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool,
+                  park_team: str = "") -> Dict:
     """Fetch game-time weather from Open-Meteo. Returns neutral defaults for domes."""
     NEUTRAL = {
         "wind_speed": 0, "wind_direction": 0, "wind_dir_label": "DOME",
         "temperature": 72, "humidity": 50, "is_dome": True,
         "wind_effect": "neutral", "temp_effect": "neutral",
+        "data_source": "dome",
     }
     if is_dome:
         return NEUTRAL
 
     try:
-        game_hour = 19  # default 7pm
+        # Convert UTC game time to ET to match Open-Meteo's America/New_York response
+        game_hour = 19  # default 7 PM ET
         if game_time_utc:
             try:
                 from dateutil import parser as dtparser
                 game_dt = dtparser.parse(game_time_utc)
-                game_hour = game_dt.hour
+                if game_dt.tzinfo is None:
+                    game_dt = game_dt.replace(tzinfo=pytz.UTC)
+                game_dt_et = game_dt.astimezone(pytz.timezone("America/New_York"))
+                game_hour = game_dt_et.hour
             except Exception:
                 pass
 
@@ -2307,7 +2314,8 @@ def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool) -> 
         temperature= safe_idx(hourly.get("temperature_2m", []), target_idx, 70)
         humidity   = safe_idx(hourly.get("relativehumidity_2m", []), target_idx, 50)
 
-        wind_dir_label, wind_effect = classify_wind(float(wind_dir), float(wind_speed))
+        wind_dir_label, wind_effect = classify_wind(float(wind_dir), float(wind_speed),
+                                                    park_team=park_team)
         temp_effect = "suppress" if temperature < 50 else "boost" if temperature > 83 else "neutral"
 
         return {
@@ -2319,28 +2327,15 @@ def fetch_weather(lat: float, lon: float, game_time_utc: str, is_dome: bool) -> 
             "is_dome": False,
             "wind_effect": wind_effect,
             "temp_effect": temp_effect,
+            "data_source": "open_meteo",
         }
     except Exception as e:
         return {
-            "wind_speed": 5, "wind_direction": 180, "wind_dir_label": "N/A",
-            "temperature": 70, "humidity": 50, "is_dome": False,
+            "wind_speed": 0, "wind_direction": 0, "wind_dir_label": "UNAVAILABLE",
+            "temperature": 0, "humidity": 0, "is_dome": False,
             "wind_effect": "neutral", "temp_effect": "neutral",
+            "data_source": "unavailable",
         }
-
-def classify_wind(direction: float, speed: float) -> Tuple[str, str]:
-    """Classify wind direction and HR/TB effect. Direction = meteorological degrees."""
-    if speed < 8:
-        return "Calm", "neutral"
-    dirs = ["N","NE","E","SE","S","SW","W","NW"]
-    label = dirs[int((direction + 22.5) / 45) % 8]
-    # SW/S/W blowing OUT toward outfield = HR boost
-    if 157.5 <= direction <= 292.5:
-        effect = "strong_out" if speed >= 12 else "out"
-    elif direction <= 67.5 or direction >= 337.5:
-        effect = "in" if speed >= 10 else "neutral"
-    else:
-        effect = "neutral"
-    return label, effect
 
 # ============================================================================
 # ODDS API — The Odds API (free tier: 500 calls/month)
@@ -3821,7 +3816,7 @@ def fetch_team_roster(team_id: int) -> List[Dict]:
                 batters.append({
                     "player_id": pid,
                     "name": p["person"]["fullName"],
-                    "lineup_slot": 5,
+                    "lineup_slot": None,  # unknown — not yet in a confirmed lineup
                     "batter_hand": bat_hand or "R",
                     "position": pos_abbr,
                     "lineup_confirmed": False,
@@ -4055,15 +4050,19 @@ def run_model(date_str: str, status_container) -> List[Dict]:
 
     # ── 2. ODDS ───────────────────────────────────────────
     log("Fetching Vegas lines...", "run")
-    implied_totals = {}
-    prop_odds = {}
+    implied_totals: dict = {}
+    implied_source: str  = "none"
+    prop_odds: dict = {}
+
+    # Primary: The Odds API (requires API key in secrets.toml)
     try:
         implied_totals = fetch_odds(date_str)
     except Exception:
         pass
+
     if implied_totals:
-        log(f"Live odds loaded for {len(implied_totals)} teams ✅", "ok")
-        # Also fetch prop-specific odds for precise edge calculation
+        implied_source = "odds_api"
+        log(f"Live odds loaded for {len(implied_totals)} teams (Odds API) ✅", "ok")
         try:
             prop_odds = fetch_prop_odds(date_str)
             if prop_odds:
@@ -4071,7 +4070,31 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         except Exception:
             pass
     else:
-        log("⚠️ No Odds API key — Vegas signal (8% weight) zeroed out. Add key in sidebar for full model.", "warn")
+        # Fallback: RotoGrinders scrape (no API key required)
+        log("No Odds API key — trying RotoGrinders scrape for implied totals...", "info")
+        try:
+            from data.rotogrinders import fetch_rg_implied_totals
+            rg_data = fetch_rg_implied_totals()
+            if rg_data:
+                implied_totals = rg_data
+                implied_source = "rotogrinders_scrape"
+                log(
+                    f"Implied totals from RotoGrinders: {len(rg_data)} teams ✅ "
+                    f"(provenance: rotogrinders_scrape)",
+                    "ok"
+                )
+            else:
+                implied_source = "none"
+                log(
+                    "⚠️ RotoGrinders fetch returned no data — Vegas signal zeroed out. "
+                    "Both Odds API key and RotoGrinders unavailable.",
+                    "warn"
+                )
+        except Exception as _rg_err:
+            implied_source = "none"
+            log(f"⚠️ RotoGrinders scrape failed ({_rg_err}) — Vegas signal zeroed out.", "warn")
+
+    st.session_state["_implied_source"] = implied_source
 
     # ── 3. PROCESS EACH GAME ─────────────────────────────
     total_batters = 0
@@ -4093,7 +4116,7 @@ def run_model(date_str: str, status_container) -> List[Dict]:
         lat, lon, park_name, is_dome = park_info
         if game.get("neutral_site"):
             log(f"  🌎 Neutral site — using {park_key} park factors ({park_info[2]})", "info")
-        weather = fetch_weather(lat, lon, game.get("game_time", ""), is_dome)
+        weather = fetch_weather(lat, lon, game.get("game_time", ""), is_dome, park_team=park_key)
 
         # Lineups — try confirmed first, fall back to roster per side independently
         lineups = fetch_lineup(game_pk)
@@ -4324,10 +4347,15 @@ def run_model(date_str: str, status_container) -> List[Dict]:
                 team_bullpen_scores=team_bullpen_scores,
                 proxy_mode=_proxy_mode,
             )
-            # game_total requires both sides' implied — set it here in the orchestrator
-            result["game_total"] = round(
-                implied_totals.get(home_team, 4.7) + implied_totals.get(away_team, 4.3), 1
+            # game_total: only set when BOTH sides have real odds — never fabricate.
+            _ht_impl = implied_totals.get(home_team)
+            _at_impl = implied_totals.get(away_team)
+            result["game_total"] = (
+                round(_ht_impl + _at_impl, 1)
+                if (_ht_impl is not None and _at_impl is not None)
+                else None
             )
+            result["implied_source"] = implied_source
             results.append(result)
             total_batters += 1
 
@@ -4368,9 +4396,12 @@ def build_parlays(
     plays: List[Dict],
     num_legs: int = 3,
     max_same_team: int = 2,
-    min_score: float = 70.0,
+    min_score: Optional[float] = None,
 ) -> List[Dict]:
     """Delegates to markets/tb_o15.py — pure logic lives there."""
+    from config import BET_FILTER_CUTOFFS
+    if min_score is None:
+        min_score = float(BET_FILTER_CUTOFFS.get("tb_o15") or 70.0)
     return _build_parlays_pure(plays, num_legs=num_legs,
                                max_same_team=max_same_team, min_score=min_score)
 
@@ -4812,145 +4843,6 @@ def compute_hits_score_for_player(
 # HOT STREAKS TAB — Top 10 batters by recent form / hit streak
 # ============================================================================
 # ============================================================================
-# MONEYLINE MODEL HELPERS
-# ============================================================================
-
-@st.cache_data(ttl=3600)
-def fetch_team_run_differential(date_str: str, days: int = 7) -> Dict[str, float]:
-    """Last N days team run differential. Returns {team_abbr: avg_run_diff/game}."""
-    result = {}
-    try:
-        from datetime import datetime as _dt, timedelta as _td
-        end_dt   = _dt.strptime(date_str, "%Y-%m-%d")
-        start_dt = end_dt - _td(days=days)
-        url = (f"https://statsapi.mlb.com/api/v1/schedule"
-               f"?sportId=1&startDate={start_dt.strftime('%Y-%m-%d')}&endDate={date_str}"
-               f"&hydrate=linescore,team")
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return {}
-        trf = {}; tra = {}; tg = {}
-        for de in r.json().get("dates", []):
-            for g in de.get("games", []):
-                if g.get("status", {}).get("abstractGameState") != "Final":
-                    continue
-                ls = g.get("linescore", {})
-                hr = int(ls.get("teams", {}).get("home", {}).get("runs", 0) or 0)
-                ar = int(ls.get("teams", {}).get("away", {}).get("runs", 0) or 0)
-                ha = g["teams"]["home"]["team"].get("abbreviation", "")
-                aa = g["teams"]["away"]["team"].get("abbreviation", "")
-                ha = TEAM_ABB_MAP.get(g["teams"]["home"]["team"].get("name", ""), ha)
-                aa = TEAM_ABB_MAP.get(g["teams"]["away"]["team"].get("name", ""), aa)
-                for ab, rf, ra in [(ha, hr, ar), (aa, ar, hr)]:
-                    if ab:
-                        trf[ab] = trf.get(ab, 0) + rf
-                        tra[ab] = tra.get(ab, 0) + ra
-                        tg[ab]  = tg.get(ab, 0) + 1
-        for ab, g in tg.items():
-            if g > 0:
-                result[ab] = round((trf[ab] - tra[ab]) / g, 2)
-    except Exception:
-        pass
-    return result
-
-
-def _american_to_implied(odds: float) -> float:
-    if odds < 0:
-        return abs(odds) / (abs(odds) + 100.0)
-    return 100.0 / (odds + 100.0)
-
-
-def fetch_moneyline_odds(date_str: str) -> Dict:
-    """Pull h2h moneyline from Odds API. Returns {'away|home': {...}} vig-removed."""
-    result = {}
-    try:
-        api_key = st.secrets.get("odds_api", {}).get("api_key", "")
-        if not api_key:
-            return {}
-        r = requests.get("https://api.the-odds-api.com/v4/sports/baseball_mlb/odds",
-                         params={"apiKey": api_key, "regions": "us",
-                                 "markets": "h2h", "oddsFormat": "american"}, timeout=12)
-        if r.status_code != 200:
-            return {}
-        for game in r.json():
-            hn = game.get("home_team", ""); an = game.get("away_team", "")
-            ho = ao = None
-            for bm in game.get("bookmakers", []):
-                for mkt in bm.get("markets", []):
-                    if mkt.get("key") == "h2h":
-                        for oc in mkt.get("outcomes", []):
-                            if oc.get("name", "").lower() in hn.lower():
-                                ho = float(oc.get("price", -110))
-                            elif oc.get("name", "").lower() in an.lower():
-                                ao = float(oc.get("price", 100))
-                        break
-                if ho is not None:
-                    break
-            if ho is None:
-                ho, ao = -110, 100
-            hi = _american_to_implied(ho); ai = _american_to_implied(ao)
-            tot = hi + ai
-            result[f"{an}|{hn}"] = {
-                "home_odds": ho, "away_odds": ao,
-                "home_implied": round(hi / tot, 4) if tot > 0 else 0.5,
-                "away_implied": round(ai / tot, 4) if tot > 0 else 0.5,
-            }
-    except Exception:
-        pass
-    return result
-
-
-def compute_team_offense_score(plays: List[Dict], team: str) -> Tuple[float, int]:
-    """Aggregate wRC+ for a team's confirmed lineup. Returns (avg_wrc_plus, n_batters)."""
-    tp = [p for p in plays if p.get("team", "") == team]
-    vals = [p.get("wrc_plus", 100.0) for p in tp if p.get("wrc_plus", 100.0) > 0]
-    return (round(sum(vals) / len(vals), 1), len(vals)) if vals else (100.0, 0)
-
-
-def compute_win_probability(
-    home_sp_stats: Dict, away_sp_stats: Dict,
-    home_off_wrc: float, away_off_wrc: float,
-    home_bp_vuln: float, away_bp_vuln: float,
-    home_run_diff: float, away_run_diff: float,
-    home_implied_runs: float, away_implied_runs: float,
-) -> Tuple[float, str]:
-    """Log5-style win probability. Returns (home_win_prob 0-1, label)."""
-    home_off = max(0.5, home_off_wrc / 100.0)
-    away_off = max(0.5, away_off_wrc / 100.0)
-    hpv = float(home_sp_stats.get("_sp_vuln", 50.0)) * 0.60 + home_bp_vuln * 0.40
-    apv = float(away_sp_stats.get("_sp_vuln", 50.0)) * 0.60 + away_bp_vuln * 0.40
-    # Pitcher factor: scales how many runs the OPPOSING offense scores.
-    # High vulnerability = opponent scores more. Low vulnerability = opponent scores less.
-    # Scale: vuln 0 → 0.0 factor, vuln 50 → 1.0 (avg), vuln 100 → 2.0
-    # PHI scores against Severino (away pitcher = apv):  high apv = PHI scores more
-    # OAK scores against Sanchez  (home pitcher = hpv):  high hpv = OAK scores more
-    h_pit_factor = max(0.10, apv / 50.0)   # away pitcher vuln → home offense multiplier
-    a_pit_factor = max(0.10, hpv / 50.0)   # home pitcher vuln → away offense multiplier
-    hs  = home_off * h_pit_factor * 1.035  # home team scoring (home field +3.5%)
-    aws = away_off * a_pit_factor           # away team scoring
-    tot = hs + aws
-    if tot <= 0:
-        return 0.52, "Log5 zero — home-field default"
-    raw = hs / tot
-    nudge = max(-0.02, min(0.02, (home_run_diff - away_run_diff) * 0.01))
-    if home_implied_runs > 0 and away_implied_runs > 0:
-        ti = home_implied_runs + away_implied_runs
-        vwp = home_implied_runs / ti if ti > 0 else 0.52
-        final = raw * 0.70 + vwp * 0.30 + nudge
-    else:
-        final = raw + nudge
-    final = max(0.30, min(0.75, final))
-    pqh = "Elite" if hpv < 30 else "Good" if hpv < 45 else "Average" if hpv < 58 else "Weak"
-    pqa = "Elite" if apv < 30 else "Good" if apv < 45 else "Average" if apv < 58 else "Weak"
-    label = (f"Home pit: {pqh} (v={hpv:.0f}) | Away pit: {pqa} (v={apv:.0f}) | "
-             f"H wRC+: {home_off_wrc:.0f} | A wRC+: {away_off_wrc:.0f} | "
-             f"7d RD H/A: {home_run_diff:+.1f}/{away_run_diff:+.1f}")
-    return round(final, 4), label
-
-
-# ============================================================================
-# MONEYLINE TAB — Professional ML picker with ranked confidence cards
-# ============================================================================
 # ============================================================================
 # MAIN APP
 # ============================================================================
@@ -5386,12 +5278,27 @@ def _norm_name_dfs(name: str) -> str:
     return re.sub(r"[^a-z]", "", name.lower())
 
 
-def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
+def compute_game_stack_scores(plays: List[Dict], all_plays: List[Dict] = None) -> List[Dict]:
     """
     Rank all games on today's slate by DFS stack value.
     Uses: game O/U + park HR factor + wind bonus + dome penalty.
     Returns list of game dicts sorted best → worst.
+
+    all_plays: unfiltered plays list used ONLY for implied-total lookup.
+    Pass this when 'plays' is salary-filtered so away teams missing from
+    the CSV still contribute their real implied total.
     """
+    # Build implied-total lookup from all_plays — bypasses salary-filter gaps.
+    # Salary-filtered slates drop away-team players entirely; reading implied_total
+    # from only those players produces 0.0 for the absent side.
+    _implied_src = all_plays if all_plays is not None else plays
+    implied_by_team: Dict[str, float] = {}
+    for _p in _implied_src:
+        _t = _p.get("team", "")
+        _v = _p.get("implied_total", 0)
+        if _t and _v:
+            implied_by_team[_t] = _v
+
     games_seen = {}
     for p in plays:
         gid = p.get("game_id", "")
@@ -5404,7 +5311,7 @@ def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
                 "game_id": gid,
                 "home_team": home,
                 "away_team": away,
-                "game_total": p.get("game_total", 9.0),
+                "game_total": p.get("game_total"),   # None when no odds
                 "park": home,
                 "is_dome": p.get("is_dome", False),
                 "wind_speed": p.get("wind_speed", 0),
@@ -5416,7 +5323,7 @@ def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
 
     results = []
     for gid, g in games_seen.items():
-        game_total = g["game_total"]
+        game_total = g["game_total"]  # may be None
         park = g["park"]
         park_hr = PARK_HR_FACTORS.get(park, 1.0)
         wind_effect = g["wind_effect"]
@@ -5444,27 +5351,23 @@ def compute_game_stack_scores(plays: List[Dict]) -> List[Dict]:
             elif temp > 80:
                 temp_adj = 1
 
-        stack_score = round(game_total + park_bonus + wind_bonus + temp_adj, 1)
+        # game_total is None when no odds — omit it from score rather than fabricate
+        stack_score = round(
+            (game_total if game_total is not None else 0)
+            + park_bonus + wind_bonus + temp_adj, 1
+        )
 
         # Derive teams properly
         home_team = g["home_team"]
         away_team = g["away_team"]
-        # Fix: identify home/away from players
-        home_players = [p for p in g["players"] if p.get("park") == p.get("team")]
-        away_players = [p for p in g["players"] if p.get("park") != p.get("team")]
-        if not home_players:
-            home_players = [p for p in g["players"] if p.get("team") == home_team]
-        if not away_players:
-            away_players = [p for p in g["players"] if p.get("team") != home_team]
-
-        home_implied = home_players[0].get("implied_total", 0) if home_players else 0
-        away_implied = away_players[0].get("implied_total", 0) if away_players else 0
+        home_implied = implied_by_team.get(home_team, 0)
+        away_implied = implied_by_team.get(away_team, 0)
 
         results.append({
             "game_id": gid,
             "home_team": home_team,
             "away_team": away_team,
-            "game_total": game_total,
+            "game_total": game_total,   # None = no odds
             "park": park,
             "park_hr": park_hr,
             "park_bonus": park_bonus,
@@ -5571,7 +5474,7 @@ def get_ranked_team_stacks(plays: List[Dict], min_players: int = 3) -> List[Dict
                 "game_id": gid,
                 "home_team": home,
                 "away_team": away,
-                "game_total": p.get("game_total",9.0),
+                "game_total": p.get("game_total"),   # None when no odds
                 "park": home,
                 "is_dome": p.get("is_dome",False),
                 "wind_effect": p.get("wind_effect","neutral"),
@@ -5829,6 +5732,7 @@ def _parse_fd_csv(file_bytes: bytes) -> Dict:
     bat_col  = next((c for c in df.columns if "batting" in c.lower() or c.lower() == "batting order"), None)
     inj_col  = next((c for c in df.columns if "injury" in c.lower() and "indicator" in c.lower()), None)
     rp_col   = next((c for c in df.columns if "roster" in c.lower()), None)
+    id_col   = next((c for c in df.columns if c.lower() == "id"), None)
 
     if not (name_col and sal_col):
         raise ValueError(f"Could not find Name/Salary columns. Found: {list(df.columns)}")
@@ -5867,6 +5771,7 @@ def _parse_fd_csv(file_bytes: bytes) -> Dict:
             "fppg":        fppg,
             "bat_order":   bat_ord,
             "injured":     injured,
+            "player_id":   str(row[id_col]).strip() if id_col and pd.notna(row[id_col]) and str(row[id_col]).strip() not in ("", "nan") else "",
         }
 
         if game:
@@ -6030,6 +5935,7 @@ def _build_fd_plays_with_salaries(plays: List[Dict], salary_data: Dict,
             "fd_injured":   fd_injured,
             "ownership":    ownership,
             "salary_matched": sal_entry is not None,
+            "fd_player_id": sal_entry.get("player_id", "") if sal_entry else "",
         })
 
     fd_plays.sort(key=lambda x: x["fd_proj"], reverse=True)
@@ -6447,9 +6353,9 @@ def display_fd_command_center(plays: List[Dict]):
         st.caption("Games ranked by run environment — O/U + park factor + wind. Stack the #1 or #2 game.")
         # Filter to DK slate teams only
         dk_slate_teams = set(p.get("team","") for p in dk_plays if p.get("dk_salary",0) > 0)
-        dk_slate_raw   = [p for p in (st.session_state.get("plays") or plays)
-                          if p.get("team","") in dk_slate_teams]
-        game_stacks = compute_game_stack_scores(dk_slate_raw if dk_slate_raw else plays)
+        _all_dk_plays  = st.session_state.get("plays") or plays
+        dk_slate_raw   = [p for p in _all_dk_plays if p.get("team","") in dk_slate_teams]
+        game_stacks = compute_game_stack_scores(dk_slate_raw if dk_slate_raw else plays, all_plays=_all_dk_plays)
         if game_stacks:
             gs_rows = []
             for i, gs in enumerate(game_stacks[:12]):
@@ -6468,9 +6374,9 @@ def display_fd_command_center(plays: List[Dict]):
                 gs_rows.append({
                     "":          label,
                     "Game":      game_str,
-                    "O/U":       f"{gs.get('game_total',0):.1f}",
-                    "Home Impl": f"{home_imp:.1f}R",
-                    "Away Impl": f"{away_imp:.1f}R",
+                    "O/U":       f"{gs['game_total']:.1f}" if gs.get('game_total') else "— (no odds)",
+                    "Home Impl": f"{home_imp:.1f}R" if home_imp > 0 else "—",
+                    "Away Impl": f"{away_imp:.1f}R" if away_imp > 0 else "—",
                     "Park":      park_str,
                     "Wind":      wind_str,
                     "Score":     f"{gs.get('stack_score',0):.1f}",
@@ -6698,6 +6604,7 @@ def display_fd_command_center(plays: List[Dict]):
             }.get(we,"→ Neutral")
 
             impl_str = f"{impl:.1f}R" if impl > 0.5 else "— R"
+            ou_str   = f"{sd['game_total']:.1f}" if sd.get("game_total") else "— (no odds)"
             hot_flag = "🔥 " if sd["streaking_count"] >= 2 else ""
 
             # st.expander does not render HTML — use plain text only
@@ -6705,7 +6612,7 @@ def display_fd_command_center(plays: List[Dict]):
             label_plain = (
                 f"{hot_flag}{team} (@ {opp})  |  "
                 f"{badge} · Score {score:.0f}  |  "
-                f"Impl {impl_str} · O/U {sd['game_total']:.1f} · "
+                f"Impl {impl_str} · O/U {ou_str} · "
                 f"Park {park_hr:.2f}x · {wind_str}"
             )
 
@@ -7132,7 +7039,7 @@ def display_fd_command_center(plays: List[Dict]):
                 "avg_own": avg_own,
                 "value_score": value_score,
                 "players": team_plays[:4],
-                "game_total": g.get("game_total", 8.5),
+                "game_total": g.get("game_total"),   # None when no odds
             })
 
     # Sort by value score, exclude the top 2 primary stacks (those are in Top Game Stacks)
@@ -7150,13 +7057,15 @@ def display_fd_command_center(plays: List[Dict]):
         vcols = st.columns(3)
         for vcol, vs in zip(vcols, value_stacks):
             with vcol:
+                _vs_ou = f"{vs['game_total']:.1f}" if vs.get("game_total") else "— (no odds)"
+                _vs_impl = f"{vs['implied']:.1f}R" if vs.get("implied", 0) > 0.5 else "— R"
                 st.markdown(
                     f"<div style='background:#0d1a0d;border:1px solid #00cc66;"
                     f"border-radius:10px;padding:12px 14px;margin-bottom:8px'>"
                     f"<div style='color:#00cc66;font-size:0.7rem;font-weight:700'>💰 VALUE STACK</div>"
                     f"<div style='color:#00ff88;font-size:1.3rem;font-weight:800'>{vs['team']}</div>"
-                    f"<div style='color:#9090a8;font-size:0.75rem'>{vs['game']} | O/U {vs['game_total']:.1f} | "
-                    f"Impl {vs['implied']:.1f}R</div>"
+                    f"<div style='color:#9090a8;font-size:0.75rem'>{vs['game']} | O/U {_vs_ou} | "
+                    f"Impl {_vs_impl}</div>"
                     f"<div style='color:#aaa;font-size:0.72rem;margin-top:6px'>"
                     f"Avg proj {vs['avg_proj']:.1f}pts · Avg sal ${vs['avg_sal']:,.0f} · "
                     f"Avg own {vs['avg_own']:.0f}%</div>"
@@ -7317,9 +7226,9 @@ def display_fd_hand_builder(plays: List[Dict]):
         st.markdown("### 🔗 Top Stacks — Where to Build Your Core")
         st.caption("Ranked by implied total + park factor + wind. Stack 5 batters from your #1 game.")
         dk_slate_tms   = set(p.get("dk_team", p.get("team","")) for p in dk_plays if p.get("dk_salary",0) > 0)
-        dk_slate_raws  = [p for p in (st.session_state.get("plays") or plays)
-                          if p.get("team","") in dk_slate_tms]
-        game_stacks = compute_game_stack_scores(dk_slate_raws if dk_slate_raws else plays)
+        _all_dk_plays2 = st.session_state.get("plays") or plays
+        dk_slate_raws  = [p for p in _all_dk_plays2 if p.get("team","") in dk_slate_tms]
+        game_stacks = compute_game_stack_scores(dk_slate_raws if dk_slate_raws else plays, all_plays=_all_dk_plays2)
         top3_games  = game_stacks[:3] if game_stacks else []
         if top3_games:
             gcols = st.columns(3)
@@ -7339,10 +7248,12 @@ def display_fd_hand_builder(plays: List[Dict]):
                     key=lambda x: x["dk_proj"], reverse=True
                 )[:5]
                 with col:
+                    _dk_ou   = f"{gs['game_total']:.1f}" if gs.get("game_total") else "— (no odds)"
+                    _dk_impl = f"{max(home_imp,away_imp):.1f}R" if max(home_imp,away_imp) > 0.5 else "— R"
                     st.markdown(
                         f"<div style='color:{clr};font-size:0.7rem;font-weight:700'>{lbl}</div>"
                         f"<div style='color:#00ff88;font-size:1.4rem;font-weight:800'>{best_team}</div>"
-                        f"<div style='color:#9090a8;font-size:0.75rem'>{away_t}@{home_t} | O/U {gs.get('game_total',0):.1f} | Impl {max(home_imp,away_imp):.1f}R</div>",
+                        f"<div style='color:#9090a8;font-size:0.75rem'>{away_t}@{home_t} | O/U {_dk_ou} | Impl {_dk_impl}</div>",
                         unsafe_allow_html=True
                     )
                     for p in top_team_plays:
@@ -7485,11 +7396,12 @@ def display_fd_hand_builder(plays: List[Dict]):
                 key=lambda x: x.get("fd_proj",0), reverse=True
             )[:4]
 
-            impl_str = f"{team_impl:.1f}" if team_impl > 0.5 else "—"
+            impl_str  = f"{team_impl:.1f}" if team_impl > 0.5 else "—"
+            _fd_ou    = f"{sd['game_total']:.1f}" if sd.get("game_total") else "— (no odds)"
             st.markdown(
                 f"<div style='color:{rank_colors[i]};font-weight:900;font-size:13px'>{rank_labels[i]}</div>"
                 f"<div style='color:#00ff88;font-size:22px;font-weight:900'>{stack_team}</div>"
-                f"<div style='color:#9090a8;font-size:12px'>vs {vs_team} | O/U {sd.get('game_total',0):.1f} | "
+                f"<div style='color:#9090a8;font-size:12px'>vs {vs_team} | O/U {_fd_ou} | "
                 f"Impl {impl_str}R | Park {park_hr:.2f}x | {wind_str}</div>",
                 unsafe_allow_html=True
             )
@@ -8426,18 +8338,96 @@ def display_fd_portfolio_builder(plays: List[Dict]):
         # Build FD bulk import CSV
         import io as _io_port
         buf = _io_port.StringIO()
-        # FD format header
-        # FD bulk import format: OF slots must map correctly
-        # Internal slots: OF1, OF2, OF3 → CSV columns: OF, OF, OF (same name, different positions)
         buf.write("entry-id,contest-id,contest-name,P,C/1B,2B,3B,SS,OF,OF,OF,UTIL\n")
-        fd_slot_order = ["P","C/1B","2B","3B","SS","OF1","OF2","OF3","UTIL"]
+
+        # Build name→ID lookup from salary pool so export uses FD player IDs (unambiguous)
+        _fd_id_map: Dict[str, str] = {}
+        for _fp in fd_plays:
+            _pid = _fp.get("fd_player_id", "")
+            if _pid:
+                _fd_id_map[_fp["name"]] = _pid
+        for _sp_nm, _sp_ent in sp_sal_data.items():
+            _pid = _sp_ent.get("player_id", "")
+            if _pid:
+                _fd_id_map[_sp_nm] = _pid
+
+        def _fd_slot_val(p: Optional[Dict]) -> str:
+            if p is None:
+                return ""
+            return _fd_id_map.get(p["name"], p.get("name", ""))
+
+        _FD_COL_NAMES = ["P", "C/1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"]
+        _seen_lu_keys: set = set()
+        _dupes_dropped = 0
+        _rows_written  = 0
+
+        # ── STEP 1 DIAGNOSTIC DUMP (temporary — remove after diagnosis) ────
+        if lineups:
+            _diag_lu = lineups[0]
+            with st.expander("🔬 DIAGNOSTIC: Lineup #1 raw player dump", expanded=True):
+                _diag_rows = []
+                for _dp in _diag_lu["players"]:
+                    _diag_rows.append({
+                        "name":          _dp.get("name",""),
+                        "assigned_slot": _dp.get("slot",""),
+                        "fd_position":   _dp.get("fd_position",""),     # first token of CSV Position col
+                        "fd_roster_pos": _dp.get("fd_roster_pos",""),   # CSV Roster Position col
+                        "fd_salary":     _dp.get("fd_salary", _dp.get("salary",0)),
+                        "fd_proj":       round(_dp.get("fd_proj",0),2),
+                        "salary_matched":_dp.get("salary_matched",False),
+                    })
+                import pandas as _pd_diag
+                st.dataframe(_pd_diag.DataFrame(_diag_rows), use_container_width=True, hide_index=True)
+                st.caption(f"Lineup #1 players: {len(_diag_lu['players'])} | "
+                           f"structure: {_diag_lu.get('structure','')} | "
+                           f"primary: {_diag_lu.get('primary_team','')} | "
+                           f"secondary: {_diag_lu.get('secondary_team','')}")
+        # ── END DIAGNOSTIC ─────────────────────────────────────────────────
+
         for lu in lineups:
-            player_by_slot = {p.get("slot",""):p for p in lu["players"]}
-            row_names = []
-            for slot in fd_slot_order:
-                p = player_by_slot.get(slot)
-                row_names.append(p["name"] if p else "")
-            buf.write(f",,Propex GPP,{','.join(row_names)}\n")
+            # Bucket players by slot name — handles 3× "OF" without key collision
+            _slot_buckets: Dict[str, List] = {}
+            for _p in lu["players"]:
+                _slot_buckets.setdefault(_p.get("slot", ""), []).append(_p)
+
+            _ofs = _slot_buckets.get("OF", [])
+            _ordered = [
+                _slot_buckets.get("P",    [None])[0],
+                _slot_buckets.get("C/1B", [None])[0],
+                _slot_buckets.get("2B",   [None])[0],
+                _slot_buckets.get("3B",   [None])[0],
+                _slot_buckets.get("SS",   [None])[0],
+                _ofs[0] if len(_ofs) > 0 else None,
+                _ofs[1] if len(_ofs) > 1 else None,
+                _ofs[2] if len(_ofs) > 2 else None,
+                _slot_buckets.get("UTIL", [None])[0],
+            ]
+
+            # Fail-loud validation gate — never write an incomplete lineup
+            _empty_cols = [_FD_COL_NAMES[i] for i, _p in enumerate(_ordered) if _p is None]
+            if _empty_cols:
+                raise ValueError(
+                    f"FD export: lineup #{lu.get('lineup_index','?')} has empty slots "
+                    f"{_empty_cols}. Slots present: {list(_slot_buckets.keys())}"
+                )
+            _lu_sal = sum(_p.get("fd_salary", _p.get("salary", 0)) for _p in _ordered if _p)
+            if _lu_sal > 35000:
+                raise ValueError(
+                    f"FD export: lineup #{lu.get('lineup_index','?')} exceeds $35,000 cap: ${_lu_sal:,}"
+                )
+
+            # Deduplicate by frozenset of player names
+            _key = frozenset(_p["name"] for _p in _ordered if _p)
+            if _key in _seen_lu_keys:
+                _dupes_dropped += 1
+                continue
+            _seen_lu_keys.add(_key)
+
+            buf.write(f",,Propex GPP,{','.join(_fd_slot_val(_p) for _p in _ordered)}\n")
+            _rows_written += 1
+
+        if _dupes_dropped:
+            st.warning(f"⚠️ Dropped {_dupes_dropped} duplicate lineup(s) — {_rows_written} unique lineups exported.")
 
         csv_str = buf.getvalue()
         st.download_button(
@@ -8549,9 +8539,22 @@ def display_fd_portfolio_builder(plays: List[Dict]):
                         })
                     st.dataframe(pd.DataFrame(lu_rows), use_container_width=True, hide_index=True)
                     # FD import string
-                    slot_order_ = ["P","C/1B","2B","3B","SS","OF1","OF2","OF3","UTIL"]
-                    pbs = {p.get("slot",""):p for p in lu["players"]}
-                    names = ",".join(pbs.get(s,{}).get("name","") for s in slot_order_)
+                    _sb_ = {}
+                    for _p_ in lu["players"]:
+                        _sb_.setdefault(_p_.get("slot", ""), []).append(_p_)
+                    _ofs_ = _sb_.get("OF", [])
+                    _pbs_ord_ = [
+                        _sb_.get("P",    [None])[0],
+                        _sb_.get("C/1B", [None])[0],
+                        _sb_.get("2B",   [None])[0],
+                        _sb_.get("3B",   [None])[0],
+                        _sb_.get("SS",   [None])[0],
+                        _ofs_[0] if len(_ofs_) > 0 else None,
+                        _ofs_[1] if len(_ofs_) > 1 else None,
+                        _ofs_[2] if len(_ofs_) > 2 else None,
+                        _sb_.get("UTIL", [None])[0],
+                    ]
+                    names = ",".join((_p_.get("name", "") if _p_ else "") for _p_ in _pbs_ord_)
                     st.code(names, language=None)
 
         # ── Exposure report ───────────────────────────────────────────────────
@@ -8706,7 +8709,7 @@ def _dk_pos_eligible(roster_pos_str: str, slot: str) -> bool:
     return slot.upper() in eligible
 
 
-def _dk_name_match(name: str, salary_data: Dict) -> Dict:
+def _dk_name_match(name: str, salary_data: Dict, player_team: str = "") -> Dict:
     """Fuzzy name match for DK salary dict. Same logic as _fd_name_match."""
     if not salary_data:
         return {}
@@ -8727,10 +8730,14 @@ def _dk_name_match(name: str, salary_data: Dict) -> Dict:
             k_parts = k.split()
             if len(k_parts) >= 2 and k_parts[0] == first and k_parts[-1] == last:
                 return v
-    # Last name only fallback
+    # Last name only fallback — require same team to prevent cross-player collision
     if parts:
         last = parts[-1]
-        matches = [v for k, v in salary_data.items() if k.split()[-1] == last]
+        matches = [
+            v for k, v in salary_data.items()
+            if k.split()[-1] == last
+            and (not player_team or v.get("team", "") == player_team)
+        ]
         if len(matches) == 1:
             return matches[0]
     return {}
@@ -8860,7 +8867,7 @@ def _build_dk_plays_with_salaries(plays: List[Dict], salary_data: Dict, sp_salar
     """
     dk_plays = []
     for p in plays:
-        sal = _dk_name_match(p["name"], salary_data)
+        sal = _dk_name_match(p["name"], salary_data, player_team=p.get("team", ""))
         if not sal:
             continue
         proj_data = _compute_dk_hitter_proj(p, sal)

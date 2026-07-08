@@ -1,0 +1,890 @@
+"""
+dfs/ui/dfs_tabs.py — platform-agnostic DFS board + FD builder UI.
+
+Thin Streamlit renderer — no scoring math here.
+Three logical sections:
+  1. Consensus Value Board (both sites)
+  2. Stack Command Center
+  3. FD Lineup Builder (auto-build from CONFIDENT pool)
+  DK board is rendered alongside FD board — DK auto-build is D1.
+
+Provenance display rules (non-negotiable):
+  - FLAGGED rows are greyed with reason shown.
+  - Ownership always shows "(modeled)" suffix until D2 external source.
+  - Source count shown per row ("1 src" tonight).
+  - Data freshness warning if plays are stale.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import tempfile
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+import pandas as pd
+import pytz
+import streamlit as st
+
+import re
+import unicodedata
+
+from dfs.contracts import ConsensusRow, ConfidenceState, Provenance
+from dfs.consensus import build_consensus_board, compute_stack_scores
+from dfs.sources.api_external import BluecollarDFSProjections, SourceError
+
+
+def _norm_name(name: str) -> str:
+    s = unicodedata.normalize("NFD", str(name))
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+EST = pytz.timezone("US/Eastern")
+
+# Freshness threshold: warn if model data is older than this
+STALE_HOURS = 2
+
+# BluecollarDFS cache TTL (seconds) — respect their 200-req/day limit
+_BCDF_CACHE_TTL = 300   # 5 minutes
+
+
+# ─── main entry point ─────────────────────────────────────────────────────────
+def display_dfs_tabs(plays: List[Dict]):
+    """
+    Render the DFS section. Called from app.py with the current plays list.
+    plays must be the output of run_model() (list of per-player score dicts).
+    """
+    if not plays:
+        st.info("No model output yet. Run the model first, then return here.")
+        return
+
+    st.title("🎯 DFS Command Center")
+
+    # ── Freshness guard ───────────────────────────────────────────────────────
+    _freshness_warning(plays)
+
+    # ── Salary CSV upload (both sites) ────────────────────────────────────────
+    st.markdown("### 💰 Load Salaries")
+    sal_col1, sal_col2 = st.columns(2)
+    with sal_col1:
+        fd_file = st.file_uploader(
+            "FanDuel salary CSV", type=["csv"], key="fd_salary_csv",
+            help="Download from FanDuel lineup tool → Export CSV"
+        )
+    with sal_col2:
+        dk_file = st.file_uploader(
+            "DraftKings salary CSV", type=["csv"], key="dk_salary_csv",
+            help="Download from DraftKings lineup tool → Export CSV"
+        )
+
+    fd_salaries = _load_salary_csv(fd_file, site="fd")
+    dk_salaries = _load_salary_csv(dk_file, site="dk")
+
+    # ── External sources (BluecollarDFS) ─────────────────────────────────────
+    bcdf_fd_rows, bcdf_dk_rows = _fetch_bluecollardfs_cached()
+
+    # ── Build consensus boards (model + optional external) ───────────────────
+    try:
+        fd_extra = [bcdf_fd_rows] if bcdf_fd_rows else None
+        fd_board = build_consensus_board(plays, extra_sources=fd_extra, site="fd")
+    except Exception as e:
+        st.error(f"FD consensus failed: {e}")
+        fd_board = []
+
+    try:
+        dk_extra = [bcdf_dk_rows] if bcdf_dk_rows else None
+        dk_board = build_consensus_board(plays, extra_sources=dk_extra, site="dk")
+    except Exception as e:
+        st.error(f"DK consensus failed: {e}")
+        dk_board = []
+
+    # ── Merge salaries + augment with pitchers from salary CSV ───────────────
+    from dfs.sources.salaries import merge_salaries_into_board, pitchers_from_salary_csv
+
+    if fd_salaries and fd_board:
+        fd_board, fd_matched = merge_salaries_into_board(fd_board, fd_salaries)
+        if fd_matched < len(fd_board) // 2:
+            st.warning(f"⚠️ FD salary match rate low: {fd_matched}/{len(fd_board)} players matched by name")
+        # Augment with pitchers: model projections are already in the board if SP stats
+        # are present. Fall back to site FPPG for any pitcher not yet in the board.
+        board_pitcher_names = {_norm_name(r.name) for r in fd_board
+                               if r.position in ("P", "SP", "RP")}
+        fd_pitchers = [r for r in pitchers_from_salary_csv(fd_salaries, site="fd")
+                       if _norm_name(r.name) not in board_pitcher_names]
+        if fd_pitchers:
+            fd_board = fd_board + fd_pitchers
+            src_label = "model" if board_pitcher_names else "site FPPG"
+            n_model_p = len(board_pitcher_names)
+            n_csv_p   = len(fd_pitchers)
+            st.caption(
+                f"📋 FD pitchers: {n_model_p} model-projected · {n_csv_p} from salary CSV FPPG"
+                if n_model_p else
+                f"📋 {n_csv_p} pitcher(s) from FD salary CSV (no model SP data)"
+            )
+        elif board_pitcher_names:
+            st.caption(f"📋 {len(board_pitcher_names)} FD pitcher(s) model-projected")
+
+    if dk_salaries and dk_board:
+        dk_board, dk_matched = merge_salaries_into_board(dk_board, dk_salaries)
+        if dk_matched < len(dk_board) // 2:
+            st.warning(f"⚠️ DK salary match rate low: {dk_matched}/{len(dk_board)} players matched by name")
+        board_pitcher_names = {_norm_name(r.name) for r in dk_board
+                               if r.position in ("P", "SP", "RP")}
+        dk_pitchers = [r for r in pitchers_from_salary_csv(dk_salaries, site="dk")
+                       if _norm_name(r.name) not in board_pitcher_names]
+        if dk_pitchers:
+            dk_board = dk_board + dk_pitchers
+            n_model_p = len(board_pitcher_names)
+            n_csv_p   = len(dk_pitchers)
+            st.caption(
+                f"📋 DK pitchers: {n_model_p} model-projected · {n_csv_p} from salary CSV FPPG"
+                if n_model_p else
+                f"📋 {n_csv_p} pitcher(s) from DK salary CSV (no model SP data)"
+            )
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab_fd, tab_dk, tab_stacks, tab_build, tab_dk_build, tab_log = st.tabs([
+        "🟣 FanDuel Board",
+        "🟢 DraftKings Board",
+        "🔥 Stack Ranks",
+        "🏗️ FD Lineup Builder",
+        "🛠️ DK Builder (beta)",
+        "📋 Lineup Log",
+    ])
+
+    with tab_fd:
+        _render_board(fd_board, site="fd", has_salaries=bool(fd_salaries))
+
+    with tab_dk:
+        _render_dk_board(dk_board, has_salaries=bool(dk_salaries))
+
+    with tab_stacks:
+        _render_stacks(fd_board or dk_board, plays)
+
+    with tab_build:
+        _render_fd_builder(fd_board, plays)
+
+    with tab_dk_build:
+        _render_dk_builder(dk_board)
+
+    with tab_log:
+        _render_lineup_log()
+
+
+# ─── Value Board ──────────────────────────────────────────────────────────────
+def _render_board(board: List[ConsensusRow], site: str, has_salaries: bool):
+    site_label = "FanDuel" if site == "fd" else "DraftKings"
+    cap = 35000 if site == "fd" else 50000
+    currency_label = f"${cap//1000}K cap"
+
+    if not board:
+        st.info(f"No {site_label} projections yet. Run the model first.")
+        return
+
+    n_conf  = sum(1 for r in board if r.state == ConfidenceState.CONFIDENT)
+    n_flag  = sum(1 for r in board if r.state == ConfidenceState.FLAGGED)
+    n_excl  = sum(1 for r in board if r.state == ConfidenceState.EXCLUDED)
+    n_total = len(board)
+
+    _state_banner(n_conf, n_flag, n_excl, n_total, has_salaries)
+
+    # Filters
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        show_flagged = st.checkbox("Show FLAGGED players", value=True, key=f"{site}_show_flagged")
+    with f2:
+        pos_filter = st.multiselect(
+            "Position", sorted(set(r.position for r in board)),
+            default=[], key=f"{site}_pos_filter"
+        )
+    with f3:
+        min_pts = st.slider("Min projected pts", 0.0, 50.0, 8.0, 0.5, key=f"{site}_min_pts")
+
+    filtered = board
+    if not show_flagged:
+        filtered = [r for r in filtered if r.state != ConfidenceState.FLAGGED]
+    if pos_filter:
+        filtered = [r for r in filtered if r.position in pos_filter]
+    filtered = [r for r in filtered if r.consensus_pts >= min_pts]
+
+    # Build table
+    rows = []
+    for r in filtered:
+        state_icon = {"CONFIDENT": "✅", "FLAGGED": "⚠️", "EXCLUDED": "❌"}.get(r.state.value, "?")
+        value_str  = f"{r.consensus_value:.2f}" if r.salary >= 1000 else "—"
+        own_str    = f"{r.own_pct:.1f}% (modeled)"
+        src_str    = f"{r.source_count} src"
+        flag_str   = f" ← {r.flagged_reason}" if r.flagged_reason else ""
+
+        rows.append({
+            "State":    f"{state_icon} {r.state.value}{flag_str}",
+            "Player":   r.name,
+            "Pos":      r.position,
+            "Team":     r.team,
+            "Vs":       r.opponent,
+            "Salary":   f"${r.salary:,}" if r.salary > 0 else "—",
+            "Proj Pts": f"{r.consensus_pts:.1f}",
+            "Ceiling":  f"{r.model_ceiling:.1f}",
+            "Floor":    f"{r.model_floor:.1f}",
+            "Value":    value_str,
+            "Own%":     own_str,
+            "Slot":     f"#{r.lineup_slot}" if r.lineup_slot else "?",
+            "SP":       r.sp_name[:18],
+            "TB Score": f"{r.score:.0f}",
+            "DQ":       f"{r.dq_score}%",
+            "Sources":  src_str,
+        })
+
+    if rows:
+        df = pd.DataFrame(rows)
+
+        def _state_color(val):
+            v = str(val)
+            if "CONFIDENT" in v or "✅" in v: return "color: #00ff88; font-weight: bold"
+            if "FLAGGED"   in v or "⚠️" in v: return "color: #888888; font-style: italic"
+            if "EXCLUDED"  in v or "❌" in v: return "color: #555555"
+            return ""
+
+        def _pts_color(val):
+            try:
+                v = float(str(val))
+                if v >= 30:  return "color: #00ff88; font-weight: bold"
+                if v >= 22:  return "color: #ffdd00; font-weight: bold"
+                if v >= 15:  return "color: #ff8800"
+                return "color: #888888"
+            except Exception: return ""
+
+        def _val_color(val):
+            try:
+                v = float(str(val))
+                if v >= 4.0: return "color: #00ff88; font-weight: bold"
+                if v >= 3.0: return "color: #ffdd00"
+                if v >= 2.0: return "color: #ff8800"
+                return "color: #888888"
+            except Exception: return ""
+
+        styled = (df.style
+                  .map(_state_color, subset=["State"])
+                  .map(_pts_color,   subset=["Proj Pts", "Ceiling"])
+                  .map(_val_color,   subset=["Value"]))
+        st.dataframe(styled, use_container_width=True, height=520)
+
+        # CSV export
+        csv_bytes = df.to_csv(index=False).encode()
+        st.download_button(
+            f"📥 Export {site_label} Board CSV", csv_bytes,
+            f"dfs_{site}_board_{datetime.now(EST).strftime('%Y%m%d_%H%M')}.csv",
+            "text/csv", key=f"{site}_export_csv",
+        )
+    else:
+        st.info("No players match the current filters.")
+
+
+def _render_dk_board(board: List[ConsensusRow], has_salaries: bool):
+    """DK board — full value board. Use DK Builder tab for auto-builds."""
+    st.caption("Upload DK salary CSV above to see value (pts/$). DK auto-builds are in the DK Builder tab.")
+    _render_board(board, site="dk", has_salaries=has_salaries)
+
+
+# ─── Stack Center ─────────────────────────────────────────────────────────────
+def _render_stacks(board: List[ConsensusRow], plays: List[Dict]):
+    st.markdown("### 🔥 Stack Ranks — by consensus ceiling")
+    st.caption(
+        "Team stack score = sum of top-4 hitters' model ceiling + implied-total bonus. "
+        "Ownership is modeled — use as a leverage signal, not field truth."
+    )
+
+    if not board:
+        st.info("No consensus data yet.")
+        return
+
+    stack_scores = compute_stack_scores(board)
+
+    rows = []
+    for team, score in list(stack_scores.items())[:15]:
+        team_rows = sorted(
+            [r for r in board if r.team == team and r.state != ConfidenceState.EXCLUDED],
+            key=lambda r: r.consensus_pts, reverse=True
+        )
+        top4 = team_rows[:4]
+        implied = next((r.implied_total for r in team_rows if r.implied_total > 0), 0.0)
+        park    = next((r.park for r in team_rows), "")
+        conf_pct = round(sum(1 for r in top4 if r.state == ConfidenceState.CONFIDENT) / max(len(top4), 1) * 100)
+        own_avg  = round(sum(r.own_pct for r in top4) / max(len(top4), 1), 1)
+
+        rows.append({
+            "Team":        team,
+            "Stack Score": f"{score:.1f}",
+            "Imp. Total":  f"{implied:.1f}" if implied else "—",
+            "Park":        park,
+            "Top Hitters": " · ".join(f"{r.name} ({r.consensus_pts:.1f})" for r in top4),
+            "CONF%":       f"{conf_pct}%",
+            "Own% (mdl)":  f"{own_avg:.1f}%",
+        })
+
+    if rows:
+        df = pd.DataFrame(rows)
+
+        def _stack_color(val):
+            try:
+                v = float(str(val))
+                if v >= 80: return "color: #00ff88; font-weight: bold"
+                if v >= 60: return "color: #ffdd00"
+                return "color: #ff8800"
+            except Exception: return ""
+
+        styled = df.style.map(_stack_color, subset=["Stack Score"])
+        st.dataframe(styled, use_container_width=True, height=380)
+    else:
+        st.info("No stack data.")
+
+
+# ─── FD Lineup Builder ────────────────────────────────────────────────────────
+def _render_fd_builder(board: List[ConsensusRow], plays: List[Dict]):
+    st.markdown("### 🏗️ FanDuel Lineup Builder")
+    st.caption(
+        "Auto-builds from the CONFIDENT pool only. FLAGGED players appear in the "
+        "board above but are excluded here — manually add them via lineup tool if desired."
+    )
+
+    if not board:
+        st.info("No FD consensus board yet. Upload FD salary CSV and run the model.")
+        return
+
+    n_conf = sum(1 for r in board if r.state == ConfidenceState.CONFIDENT and r.salary >= 1000)
+    st.metric("CONFIDENT players with salary", n_conf, help="Minimum 10 needed to build")
+
+    if n_conf < 10:
+        st.warning(
+            f"⚠️ Only {n_conf} CONFIDENT players have salaries loaded. "
+            "Upload the FD salary CSV to enable auto-build."
+        )
+        return
+
+    # Contest type
+    contest_type = st.radio(
+        "Contest type",
+        ["Single entry ($40K Battery)", "Multi-entry GPP (Deuces Wild $300K / 10×$18)"],
+        key="fd_contest_type",
+    )
+    is_multi = "Multi" in contest_type
+
+    # n_lineups override for multi-entry
+    if is_multi:
+        n_lineups_override = st.number_input(
+            "Number of lineups", min_value=2, max_value=150, value=10, step=1,
+            key="fd_n_lineups",
+            help="FD Deuces Wild: enter up to 150. 10×$18 DK: typically 10.",
+        )
+    else:
+        n_lineups_override = 1
+
+    # Optional manual overrides
+    with st.expander("⚙️ Manual overrides"):
+        all_names = sorted(r.name for r in board if r.state == ConfidenceState.CONFIDENT and r.salary >= 1000)
+        locked_names  = st.multiselect("Lock players", all_names, default=[], key="fd_locked")
+        stack_teams   = sorted(set(r.team for r in board if r.state == ConfidenceState.CONFIDENT))
+        stack_team    = st.selectbox("Force stack team", ["(auto)"] + stack_teams, key="fd_stack_team")
+        stack_team    = None if stack_team == "(auto)" else stack_team
+
+    col_build, _ = st.columns([1, 3])
+    with col_build:
+        build_btn = st.button("⚡ Build Lineups", type="primary", key="fd_build_btn")
+
+    if build_btn:
+        from dfs.optimize import (
+            build_fd_lineups, build_fd_lineups_diverse, export_fd_csv,
+            CONTEST_SINGLE_ENTRY, CONTEST_MULTI_ENTRY_GPP,
+            with_n_lineups, check_lineup_diversity,
+        )
+        base_contest = CONTEST_MULTI_ENTRY_GPP if is_multi else CONTEST_SINGLE_ENTRY
+        contest = with_n_lineups(base_contest, n_lineups_override)
+
+        with st.spinner(f"Building {contest.n_lineups} FD lineup(s)…"):
+            try:
+                if is_multi and not stack_team:
+                    # Multi-entry with no forced stack — use diverse build to spread
+                    # lineups across top teams by stack score.
+                    lineups = build_fd_lineups_diverse(
+                        board=board, contest=contest,
+                        locked_names=locked_names or None,
+                    )
+                else:
+                    lineups = build_fd_lineups(
+                        board=board, contest=contest,
+                        locked_names=locked_names or None,
+                        stack_team=stack_team,
+                    )
+            except Exception as e:
+                st.error(f"❌ Build failed: {e}")
+                return
+
+        st.success(f"✅ {len(lineups)} lineup(s) built")
+
+        # ── Uniqueness check ──────────────────────────────────────────────────
+        if len(lineups) > 1:
+            div_warnings = check_lineup_diversity(lineups, warn_threshold=7)
+            if div_warnings:
+                with st.expander(f"⚠️ {len(div_warnings)} similar lineup pair(s) detected"):
+                    for w in div_warnings:
+                        st.caption(w)
+
+        # ── Exposure report ───────────────────────────────────────────────────
+        if len(lineups) > 1:
+            _render_exposure_report(lineups, cap=35_000, key_prefix="fd")
+
+        # ── Per-lineup display ────────────────────────────────────────────────
+        for i, lu in enumerate(lineups, 1):
+            sal_pct = lu["total_salary"] / 35_000 * 100
+            with st.expander(
+                f"Lineup {i} — {lu['total_proj']:.1f} pts · ${lu['total_salary']:,} "
+                f"({sal_pct:.0f}% of cap) · ceil {lu.get('total_ceiling', '?')}"
+            ):
+                lu_df = pd.DataFrame(lu["players"])
+                st.dataframe(lu_df, use_container_width=True)
+
+        # ── Bulk export ───────────────────────────────────────────────────────
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+            export_fd_csv(lineups, tmp.name)
+            with open(tmp.name, "rb") as f:
+                csv_bytes = f.read()
+        os.unlink(tmp.name)
+
+        st.download_button(
+            "📥 Download FD bulk-import CSV", csv_bytes,
+            f"fd_lineups_{datetime.now(EST).strftime('%Y%m%d_%H%M')}.csv",
+            "text/csv", key="fd_download_csv",
+        )
+
+        # ── Lineup log ────────────────────────────────────────────────────────
+        slate_date_key = "fd_slate_date"
+        log_notes_key  = "fd_log_notes"
+        with st.expander("💾 Save to lineup log"):
+            slate_date = st.date_input(
+                "Slate date", value=datetime.now(EST).date(), key=slate_date_key,
+            )
+            log_notes = st.text_input(
+                "Notes (contest name, stakes…)", value="", key=log_notes_key,
+            )
+            if st.button("Save lineups to log", key="fd_log_btn"):
+                try:
+                    from dfs.lineup_log import log_lineups
+                    row_id = log_lineups(
+                        lineups=lineups,
+                        site="fd",
+                        contest_label=contest.label,
+                        slate_date=str(slate_date),
+                        notes=log_notes,
+                    )
+                    st.success(f"Saved — log row #{row_id}")
+                except Exception as e:
+                    st.error(f"Log failed: {e}")
+
+
+# ─── DK Builder ───────────────────────────────────────────────────────────────
+def _render_dk_builder(board: List[ConsensusRow]):
+    st.markdown("### 🛠️ DraftKings Lineup Builder — Beta")
+    st.warning(
+        "⚠️ **DK auto-build is not yet validated on a live slate.** "
+        "Review every generated lineup before submitting. "
+        "The FD builder has more test history — prefer FD until DK is validated."
+    )
+
+    if not board:
+        st.info("No DK board. Upload DK salary CSV and run the model first.")
+        return
+
+    confirmed = st.checkbox(
+        "I understand DK auto-build is beta and I will review lineups before submitting",
+        value=False, key="dk_build_confirmed",
+    )
+    if not confirmed:
+        st.info("Check the box above to unlock the DK builder.")
+        return
+
+    n_conf = sum(1 for r in board if r.state == ConfidenceState.CONFIDENT and r.salary >= 3000)
+    st.metric("CONFIDENT players with salary", n_conf, help="Minimum 10 needed to build")
+
+    if n_conf < 10:
+        st.warning(
+            f"⚠️ Only {n_conf} CONFIDENT players have salaries. "
+            "Upload the DK salary CSV to enable auto-build."
+        )
+        return
+
+    from dfs.optimize import (
+        build_dk_lineups, export_dk_csv,
+        CONTEST_SINGLE_ENTRY, CONTEST_MULTI_ENTRY_GPP,
+        with_n_lineups, check_lineup_diversity,
+    )
+
+    contest_type = st.radio(
+        "Contest type",
+        ["Single entry ($40K Battery)", "Multi-entry GPP (10×$18)"],
+        key="dk_contest_type",
+    )
+    is_multi_dk = "Multi" in contest_type
+
+    if is_multi_dk:
+        n_lineups_dk = st.number_input(
+            "Number of lineups", min_value=2, max_value=150, value=10, step=1,
+            key="dk_n_lineups",
+        )
+    else:
+        n_lineups_dk = 1
+
+    with st.expander("⚙️ Manual overrides"):
+        all_names = sorted(r.name for r in board if r.state == ConfidenceState.CONFIDENT and r.salary >= 3000)
+        locked_names = st.multiselect("Lock players", all_names, default=[], key="dk_locked")
+        stack_teams  = sorted(set(r.team for r in board if r.state == ConfidenceState.CONFIDENT))
+        stack_team   = st.selectbox("Force stack team", ["(auto)"] + stack_teams, key="dk_stack_team")
+        stack_team   = None if stack_team == "(auto)" else stack_team
+
+    col_build, _ = st.columns([1, 3])
+    with col_build:
+        build_btn = st.button("⚡ Build DK Lineups", type="primary", key="dk_build_btn")
+
+    if build_btn:
+        base = CONTEST_MULTI_ENTRY_GPP if is_multi_dk else CONTEST_SINGLE_ENTRY
+        contest = with_n_lineups(base, n_lineups_dk)
+        with st.spinner(f"Building {contest.n_lineups} DK lineup(s)…"):
+            try:
+                lineups = build_dk_lineups(
+                    board=board, contest=contest,
+                    locked_names=locked_names or None, stack_team=stack_team,
+                )
+            except Exception as e:
+                st.error(f"❌ DK build failed: {e}")
+                return
+
+        st.success(f"✅ {len(lineups)} lineup(s) built")
+
+        if len(lineups) > 1:
+            div_warnings = check_lineup_diversity(lineups, warn_threshold=7)
+            if div_warnings:
+                with st.expander(f"⚠️ {len(div_warnings)} similar lineup pair(s)"):
+                    for w in div_warnings:
+                        st.caption(w)
+
+        if len(lineups) > 1:
+            _render_exposure_report(lineups, cap=50_000, key_prefix="dk")
+
+        for i, lu in enumerate(lineups, 1):
+            sal_pct = lu["total_salary"] / 50_000 * 100
+            with st.expander(
+                f"Lineup {i} — {lu['total_proj']:.1f} pts · ${lu['total_salary']:,} ({sal_pct:.0f}% of cap)"
+            ):
+                st.dataframe(pd.DataFrame(lu["players"]), use_container_width=True)
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+            export_dk_csv(lineups, tmp.name)
+            with open(tmp.name, "rb") as f:
+                csv_bytes = f.read()
+        os.unlink(tmp.name)
+
+        st.download_button(
+            "📥 Download DK bulk-upload CSV", csv_bytes,
+            f"dk_lineups_{datetime.now(EST).strftime('%Y%m%d_%H%M')}.csv",
+            "text/csv", key="dk_download_csv",
+        )
+
+        # ── Lineup log ────────────────────────────────────────────────────────
+        with st.expander("💾 Save to lineup log"):
+            slate_date = st.date_input(
+                "Slate date", value=datetime.now(EST).date(), key="dk_slate_date",
+            )
+            log_notes = st.text_input(
+                "Notes (contest name, stakes…)", value="", key="dk_log_notes",
+            )
+            if st.button("Save lineups to log", key="dk_log_btn"):
+                try:
+                    from dfs.lineup_log import log_lineups
+                    row_id = log_lineups(
+                        lineups=lineups,
+                        site="dk",
+                        contest_label=contest.label,
+                        slate_date=str(slate_date),
+                        notes=log_notes,
+                    )
+                    st.success(f"Saved — log row #{row_id}")
+                except Exception as e:
+                    st.error(f"Log failed: {e}")
+
+
+# ─── Lineup Log Viewer ────────────────────────────────────────────────────────
+def _render_lineup_log():
+    st.markdown("### 📋 Lineup Log")
+    st.caption("All saved lineups, newest first. Enter contest results to build the backtest dataset.")
+
+    from dfs.lineup_log import get_lineups, record_result
+
+    col_site, col_date, col_refresh = st.columns([1, 2, 1])
+    with col_site:
+        site_filter = st.selectbox("Site", ["all", "fd", "dk"], key="log_site_filter")
+    with col_date:
+        date_filter = st.text_input("Slate date (YYYY-MM-DD)", value="", key="log_date_filter")
+    with col_refresh:
+        st.markdown("&nbsp;", unsafe_allow_html=True)  # spacer
+        refresh = st.button("Refresh", key="log_refresh")
+
+    _ = refresh  # triggers re-run on click
+
+    try:
+        rows = get_lineups(
+            slate_date=date_filter.strip() or None,
+            site=None if site_filter == "all" else site_filter,
+            limit=100,
+        )
+    except Exception as e:
+        st.error(f"Could not load lineup log: {e}")
+        return
+
+    if not rows:
+        st.info("No saved lineups yet. Build lineups and use 'Save to lineup log' to record them.")
+        return
+
+    st.markdown(f"**{len(rows)} record(s)**")
+
+    for row in rows:
+        has_result = row["result_pts"] is not None
+        result_tag = f" · ✅ {row['result_pts']:.1f} pts" if has_result else " · ⏳ pending"
+        header = (
+            f"#{row['id']} · {row['slate_date']} · {row['site'].upper()} · "
+            f"{row['contest_label']} · {row['n_lineups']} lineup(s) · "
+            f"{row['total_proj']:.1f} avg proj{result_tag}"
+        )
+        if row["notes"]:
+            header += f" · {row['notes']}"
+
+        with st.expander(header):
+            # Player tables per lineup
+            lineups_data = row["players_json"]
+            if isinstance(lineups_data, list):
+                for i, lu_players in enumerate(lineups_data, 1):
+                    if lu_players:
+                        st.caption(f"Lineup {i}")
+                        st.dataframe(pd.DataFrame(lu_players), use_container_width=True)
+
+            # Result entry form
+            if not has_result:
+                st.markdown("**Enter contest result**")
+                r_col1, r_col2, r_col3 = st.columns([2, 2, 1])
+                with r_col1:
+                    res_pts = st.number_input(
+                        "Actual pts", min_value=0.0, step=0.1,
+                        key=f"res_pts_{row['id']}",
+                    )
+                with r_col2:
+                    res_rank = st.number_input(
+                        "Rank (optional)", min_value=0, step=1,
+                        key=f"res_rank_{row['id']}",
+                    )
+                with r_col3:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    if st.button("Save", key=f"res_save_{row['id']}"):
+                        try:
+                            record_result(
+                                row_id=row["id"],
+                                result_pts=res_pts,
+                                result_rank=int(res_rank) if res_rank > 0 else None,
+                            )
+                            st.success("Result saved — refresh to update.")
+                        except Exception as e:
+                            st.error(f"Failed: {e}")
+            else:
+                st.markdown(
+                    f"**Result:** {row['result_pts']:.1f} pts"
+                    + (f" · rank #{row['result_rank']}" if row["result_rank"] else "")
+                )
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def _render_exposure_report(lineups: List[Dict], cap: int, key_prefix: str):
+    """
+    Show player exposure across multi-entry lineups.
+    Highlights over-exposed players (>40%) and under-used salary.
+    """
+    n = len(lineups)
+    from collections import Counter
+
+    player_count: Counter = Counter()
+    team_count:   Counter = Counter()
+    total_salary = 0
+
+    for lu in lineups:
+        seen_in_lu = set()
+        for p in lu["players"]:
+            name = p["name"]
+            if name not in seen_in_lu:
+                player_count[name] += 1
+                team_count[p["team"]] += 1
+                seen_in_lu.add(name)
+        total_salary += lu["total_salary"]
+
+    avg_salary = total_salary // n
+    cap_pct    = avg_salary / cap * 100
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Avg salary used", f"${avg_salary:,}", f"{cap_pct:.0f}% of cap")
+    with col2:
+        unique_players = len(player_count)
+        st.metric("Unique players", unique_players)
+    with col3:
+        max_exp_name, max_exp_ct = player_count.most_common(1)[0]
+        st.metric("Max exposure", f"{max_exp_ct}/{n}", max_exp_name)
+
+    exp_rows = []
+    for name, ct in player_count.most_common():
+        pct = ct / n * 100
+        flag = " ⚠️" if pct > 40 else ""
+        exp_rows.append({"Player": f"{name}{flag}", "Lineups": f"{ct}/{n}", "Exposure": f"{pct:.0f}%"})
+
+    with st.expander(f"📊 Exposure Report ({n} lineups)", expanded=(n > 3)):
+        if cap_pct < 95:
+            st.warning(f"⚠️ Average salary {cap_pct:.0f}% of cap — try to use ≥97%")
+
+        over_exposed = [name for name, ct in player_count.items() if ct / n > 0.40]
+        if over_exposed:
+            st.warning(f"⚠️ Over-exposed (>40%): {', '.join(over_exposed)}")
+
+        st.dataframe(
+            pd.DataFrame(exp_rows),
+            use_container_width=True,
+            hide_index=True,
+            key=f"{key_prefix}_exposure_df",
+        )
+
+        # Team distribution
+        team_rows = [{"Team": t, "Player-Slots": c} for t, c in team_count.most_common()]
+        st.caption("Team distribution across all lineups:")
+        st.dataframe(pd.DataFrame(team_rows), use_container_width=True,
+                     hide_index=True, key=f"{key_prefix}_team_df")
+
+
+def _state_banner(n_conf, n_flag, n_excl, n_total, has_salaries):
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("✅ CONFIDENT", n_conf)
+    with c2: st.metric("⚠️ FLAGGED", n_flag)
+    with c3: st.metric("❌ EXCLUDED", n_excl)
+    with c4: st.metric("Total Batters", n_total)
+
+    if not has_salaries:
+        st.info(
+            "💡 Upload a salary CSV above to see value (pts/salary) and enable auto-build. "
+            "Board is usable without it — download and manually build."
+        )
+
+    if n_conf == 0:
+        st.error(
+            "❌ No CONFIDENT players. Every player is on proxy/unconfirmed data — "
+            "DO NOT auto-build. Check lineup confirmation status and re-run the model."
+        )
+    elif n_conf < n_total * 0.5:
+        st.warning(
+            f"⚠️ {n_flag} players FLAGGED (proxy data or unconfirmed lineup). "
+            "Only the ✅ CONFIDENT pool is eligible for auto-build."
+        )
+
+
+def _fetch_bluecollardfs_cached():
+    """
+    Fetch BluecollarDFS projections for FD and DK if an API key is configured.
+    Uses session state as a 5-minute cache to respect the 200-req/day limit.
+    Returns (fd_rows, dk_rows) — each is a List[ProjectionRow] or None on failure.
+    """
+    with st.sidebar.expander("🔑 External Sources (BluecollarDFS)", expanded=False):
+        api_key = st.text_input(
+            "BluecollarDFS API key", type="password",
+            key="bcdf_api_key",
+            help="Optional. Adds external model projections to consensus (weight 0.5). "
+                 "Get a key at bluecollardfs.com — 200 req/day, cache 5 min.",
+        )
+        fetch_btn = st.button("Fetch Projections", key="bcdf_fetch_btn")
+        bcdf_status = st.empty()
+
+    if not api_key:
+        return None, None
+
+    now = datetime.now(timezone.utc).timestamp()
+    cache_key_ts = "_bcdf_fetched_at"
+    cache_key_fd = "_bcdf_fd_rows"
+    cache_key_dk = "_bcdf_dk_rows"
+
+    last_fetch = st.session_state.get(cache_key_ts, 0)
+    cache_fresh = (now - last_fetch) < _BCDF_CACHE_TTL
+
+    if cache_fresh and not fetch_btn:
+        fd_rows = st.session_state.get(cache_key_fd)
+        dk_rows = st.session_state.get(cache_key_dk)
+        age_s   = int(now - last_fetch)
+        bcdf_status.caption(f"BluecollarDFS: cached ({age_s}s old)")
+        return fd_rows, dk_rows
+
+    src = BluecollarDFSProjections({"api_key": api_key})
+    fd_rows = dk_rows = None
+    import datetime as _dt
+    date_str = _dt.date.today().isoformat()
+
+    for site, key in [("fd", cache_key_fd), ("dk", cache_key_dk)]:
+        try:
+            rows = src.fetch_projections(site=site, date=date_str)
+            st.session_state[key] = rows
+            if site == "fd":
+                fd_rows = rows
+            else:
+                dk_rows = rows
+        except SourceError as e:
+            st.session_state[key] = None
+            bcdf_status.warning(f"BluecollarDFS {site.upper()}: {e}")
+        except Exception as e:
+            st.session_state[key] = None
+            bcdf_status.error(f"BluecollarDFS {site.upper()} fetch failed: {e}")
+
+    st.session_state[cache_key_ts] = now
+    n_fd = len(fd_rows) if fd_rows else 0
+    n_dk = len(dk_rows) if dk_rows else 0
+    if n_fd or n_dk:
+        bcdf_status.success(f"BluecollarDFS: {n_fd} FD + {n_dk} DK rows loaded")
+
+    return fd_rows, dk_rows
+
+
+def _load_salary_csv(uploaded_file, site: str) -> Optional[List[Dict]]:
+    if uploaded_file is None:
+        return None
+    content = uploaded_file.read().decode("utf-8", errors="replace")
+    try:
+        if site == "fd":
+            from dfs.sources.salaries import parse_fd_salary_csv
+            return parse_fd_salary_csv(content)
+        else:
+            from dfs.sources.salaries import parse_dk_salary_csv
+            return parse_dk_salary_csv(content)
+    except Exception as e:
+        st.error(f"❌ Failed to parse {site.upper()} salary CSV: {e}")
+        return None
+
+
+def _freshness_warning(plays: List[Dict]):
+    """Warn if model data looks stale (no game time available to check, use session state)."""
+    import streamlit as st
+    run_ts = st.session_state.get("_model_run_ts")
+    if run_ts is None:
+        st.warning(
+            "⏰ Model run timestamp unknown. Re-run the model to ensure fresh projections "
+            "before lock. Stale data = stale projections."
+        )
+        return
+    try:
+        now_utc  = datetime.now(timezone.utc)
+        run_dt   = datetime.fromisoformat(run_ts).replace(tzinfo=timezone.utc)
+        age_hrs  = (now_utc - run_dt).total_seconds() / 3600
+        if age_hrs > STALE_HOURS:
+            st.warning(
+                f"⏰ **Model data is {age_hrs:.1f}h old** — rerun before lock "
+                f"(>{STALE_HOURS}h threshold). Lineups and SPs may have changed."
+            )
+    except Exception:
+        pass

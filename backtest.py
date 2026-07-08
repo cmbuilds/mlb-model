@@ -178,18 +178,194 @@ _LEAGUE_AVG_PITCHER = {
 }
 
 
+def _ensure_weather_cache(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_weather_cache (
+            stadium   TEXT NOT NULL,
+            game_date TEXT NOT NULL,
+            wind_speed  REAL NOT NULL,
+            wind_dir    REAL NOT NULL,
+            temperature REAL NOT NULL,
+            fetched_at  TEXT,
+            PRIMARY KEY (stadium, game_date)
+        )
+    """)
+    conn.commit()
+
+
+def _prefetch_stadium_weather(
+    stadium: str, lat: float, lon: float,
+    start_date: str, end_date: str,
+    conn: sqlite3.Connection,
+) -> int:
+    """Fetch full-season daily weather for one outdoor stadium. Returns rows stored.
+    Never caches null rows. Skips silently if data is already cached for this range."""
+    import urllib.request, json as _json, datetime as _dt
+
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM backtest_weather_cache "
+        "WHERE stadium = ? AND game_date BETWEEN ? AND ?",
+        (stadium, start_date, end_date),
+    ).fetchone()[0]
+    start_d   = _dt.date.fromisoformat(start_date)
+    end_d     = _dt.date.fromisoformat(end_date)
+    expected  = (end_d - start_d).days + 1
+    if existing >= expected:
+        log.info(f"Weather cache hit: {stadium} ({existing} dates)")
+        return existing
+
+    url = (
+        "https://archive-api.open-meteo.com/v1/archive"
+        f"?latitude={lat}&longitude={lon}"
+        f"&start_date={start_date}&end_date={end_date}"
+        "&daily=wind_speed_10m_max,wind_direction_10m_dominant,temperature_2m_max"
+        "&wind_speed_unit=mph&temperature_unit=fahrenheit&timezone=auto"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = _json.loads(resp.read().decode())
+    except Exception as exc:
+        log.warning(f"Open-Meteo archive fetch failed for {stadium}: {exc}")
+        return 0
+
+    daily  = data.get("daily", {})
+    times  = daily.get("time", [])
+    speeds = daily.get("wind_speed_10m_max", [])
+    dirs   = daily.get("wind_direction_10m_dominant", [])
+    temps  = daily.get("temperature_2m_max", [])
+
+    if not times:
+        log.warning(f"Open-Meteo returned empty data for {stadium}")
+        return 0
+
+    fetched_at = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stored = 0
+    for i, date_str in enumerate(times):
+        ws = speeds[i] if i < len(speeds) else None
+        wd = dirs[i]   if i < len(dirs)   else None
+        tp = temps[i]  if i < len(temps)  else None
+        if ws is None or wd is None or tp is None:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO backtest_weather_cache "
+            "(stadium, game_date, wind_speed, wind_dir, temperature, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (stadium, date_str, ws, wd, tp, fetched_at),
+        )
+        stored += 1
+    conn.commit()
+    log.info(f"Cached {stored} weather dates for {stadium}")
+    return stored
+
+
+def _wind_effect_for_park(wind_from_deg: float, speed: float, cf_bearing: float) -> str:
+    """Classify wind effect relative to a park's CF bearing.
+    wind_from_deg: meteorological convention (direction wind is blowing FROM).
+    Returns: strong_out / out / in / neutral."""
+    if speed < 8:
+        return "neutral"
+    wind_toward = (wind_from_deg + 180) % 360
+    diff = abs((wind_toward - cf_bearing + 180) % 360 - 180)
+    if diff <= 60:
+        return "strong_out" if speed >= 12 else "out"
+    if diff >= 120:
+        return "in"
+    return "neutral"
+
+
+def _build_backtest_weather(
+    home_team: str, game_date: str, conn: sqlite3.Connection
+) -> Optional[Dict]:
+    """Return a weather dict for one backtest game, or None if data unavailable.
+    Domes return a legitimate neutral dict. Outdoor parks with no cached data → None (fail loud)."""
+    from lib.constants import STADIUM_COORDS, CF_BEARINGS, TEAM_CODE_ALIASES
+    from scoring.weather import classify_wind
+
+    team = TEAM_CODE_ALIASES.get(home_team.upper(), home_team.upper())
+    info = STADIUM_COORDS.get(team)
+    if not info:
+        return None
+
+    lat, lon, park_name, is_dome = info
+    if is_dome:
+        return {"is_dome": True, "wind_speed": 0, "temperature": 72}
+
+    row = conn.execute(
+        "SELECT wind_speed, wind_dir, temperature FROM backtest_weather_cache "
+        "WHERE stadium = ? AND game_date = ?",
+        (team, game_date),
+    ).fetchone()
+    if not row:
+        return None
+
+    wind_speed, wind_dir, temperature = row
+    cf_bearing = CF_BEARINGS.get(team)
+    if cf_bearing is None:
+        wind_effect = "neutral"
+        dir_label   = "?"
+    else:
+        wind_effect = _wind_effect_for_park(wind_dir, wind_speed, cf_bearing)
+        dir_label, _ = classify_wind(wind_dir, wind_speed)
+
+    return {
+        "is_dome":       False,
+        "wind_speed":    round(wind_speed, 1),
+        "wind_dir":      round(wind_dir, 0),
+        "wind_dir_label": dir_label,
+        "wind_effect":   wind_effect,
+        "temperature":   round(temperature, 0),
+    }
+
+
+def _fetch_handedness(player_ids: List[int]) -> Dict[int, Dict[str, str]]:
+    """
+    Batch-fetch bat_side / pitch_hand from MLBAM People API.
+    Returns {mlbam_id: {"bat_side": "R"|"L"|"S", "pitch_hand": "R"|"L"}}.
+    Falls back gracefully on network failure (callers default to "R").
+    """
+    import urllib.request
+    import json as _json
+    result: Dict[int, Dict[str, str]] = {}
+    if not player_ids:
+        return result
+    BATCH = 100
+    for i in range(0, len(player_ids), BATCH):
+        chunk = player_ids[i:i+BATCH]
+        url = (f"https://statsapi.mlb.com/api/v1/people"
+               f"?personIds={','.join(str(x) for x in chunk)}")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = _json.loads(resp.read().decode())
+            for person in data.get("people", []):
+                pid = person.get("id")
+                if pid:
+                    result[int(pid)] = {
+                        "bat_side":   person.get("batSide",   {}).get("code", "R"),
+                        "pitch_hand": person.get("pitchHand", {}).get("code", "R"),
+                    }
+        except Exception as exc:
+            log.warning(f"Handedness batch {i // BATCH} failed: {exc}")
+    return result
+
+
 def _score_one(market: str, result: Dict, batter_input: Dict, pitcher_input: Dict,
-               sp_id_used: str, proxy_mode: bool) -> Optional[Dict]:
+               sp_id_used: str, proxy_mode: bool,
+               batter_hand: str = "R", sp_hand: str = "R",
+               hand_real: bool = False,
+               weather: Optional[Dict] = None) -> Optional[Dict]:
     """Score a single player-game for the given market. Returns None on failure."""
+    _weather = weather if weather is not None else {"is_dome": True}
     common = dict(
         name=str(result.get("player_name", "")),
         player_id=str(result.get("player_id", "")),
         team=str(result.get("team", "")),
         opponent=str(result.get("opponent", "")),
         game_pk=str(result.get("game_pk", 0)),
-        batter_hand="R",
-        hand_real=False,
-        sp_hand="R",
+        batter_hand=batter_hand,
+        hand_real=hand_real,
+        sp_hand=sp_hand,
         sp_name="",
         sp_id=sp_id_used,
         lineup_slot=int(result.get("lineup_slot", 5) or 5),
@@ -207,7 +383,7 @@ def _score_one(market: str, result: Dict, batter_input: Dict, pitcher_input: Dic
                 **common,
                 recent_form={},
                 bvp_data={},
-                weather={"is_dome": True},
+                weather=_weather,
                 implied=0.0,
                 prop_implied=None,
                 team_bullpen_scores={},
@@ -225,7 +401,7 @@ def _score_one(market: str, result: Dict, batter_input: Dict, pitcher_input: Dic
             from markets.hr import score_one_batter_hr
             return score_one_batter_hr(
                 **common,
-                weather={"is_dome": True},
+                weather=_weather,
                 implied=0.0,
                 prop_implied=None,
                 team_bullpen_scores={},
@@ -250,6 +426,37 @@ def run_backtest(
     if not batter_stats or not game_results:
         return {}
 
+    # Open weather connection and pre-fetch outdoor stadiums for the season date range
+    weather_conn = sqlite3.connect(DB_PATH)
+    _ensure_weather_cache(weather_conn)
+    game_dates = sorted({r["game_date"] for r in game_results if r.get("game_date")})
+    if game_dates:
+        from lib.constants import STADIUM_COORDS, TEAM_CODE_ALIASES
+        season_start, season_end = game_dates[0], game_dates[-1]
+        outdoor_teams: Dict[str, tuple] = {}
+        for gp in game_pitchers.values():
+            ht = gp.get("home_team", "")
+            if not ht:
+                continue
+            code = TEAM_CODE_ALIASES.get(ht.upper(), ht.upper())
+            if code not in outdoor_teams:
+                info = STADIUM_COORDS.get(code)
+                if info and not info[3]:
+                    outdoor_teams[code] = (info[0], info[1])
+        log.info(f"Pre-fetching weather for {len(outdoor_teams)} outdoor stadiums "
+                 f"({season_start} → {season_end})")
+        for code, (lat, lon) in sorted(outdoor_teams.items()):
+            _prefetch_stadium_weather(code, lat, lon, season_start, season_end, weather_conn)
+
+    # Batch-fetch real batter/SP handedness from MLBAM People API
+    all_batter_ids = list({int(r["player_id"]) for r in game_results if r.get("player_id")})
+    all_sp_ids = list({int(v) for gp in game_pitchers.values()
+                       for k in ("home_sp_id", "away_sp_id") if (v := gp.get(k))})
+    log.info(f"Fetching handedness for {len(all_batter_ids)} batters + {len(all_sp_ids)} SPs...")
+    handedness = _fetch_handedness(all_batter_ids + all_sp_ids)
+    hand_hit = len(handedness)
+    log.info(f"Got handedness for {hand_hit}/{len(all_batter_ids)+len(all_sp_ids)} players")
+
     # Outcome column per market
     outcome_col = {"tb_o15": "hit_o15", "hits_o05": "hit_o05", "hr": "hit_hr"}.get(market, "hit_o15")
 
@@ -262,6 +469,7 @@ def run_backtest(
     scored = 0
     unmatched = 0
     proxy_count = 0
+    weather_unknown = 0
 
     for result in game_results:
         pid = result.get("player_id")
@@ -275,10 +483,23 @@ def run_backtest(
 
         batter_input = _stat_row_to_scoring_input(stat_row)
 
-        game_pk = int(result.get("game_pk", 0))
+        # Real batter handedness (fall back to "R" if MLBAM fetch missed this player)
+        batter_hand_info = handedness.get(int(pid), {})
+        batter_hand = batter_hand_info.get("bat_side", "R")
+        hand_real   = int(pid) in handedness
+
+        game_pk  = int(result.get("game_pk", 0))
+        game_date = str(result.get("game_date", ""))
         gp = game_pitchers.get(game_pk)
         pitcher_input = _LEAGUE_AVG_PITCHER
         sp_id_used = ""
+        sp_hand = "R"
+
+        raw_home = gp.get("home_team", "") if gp else ""
+        weather  = _build_backtest_weather(raw_home, game_date, weather_conn)
+        if weather is None and raw_home:
+            weather_unknown += 1
+
         if gp:
             batter_team = str(result.get("team", "")).lower()
             home_team = str(gp.get("home_team", "")).lower()
@@ -291,13 +512,17 @@ def run_backtest(
                 pitcher_input = _pitcher_row_to_input(pitcher_row)
                 sp_id_used = str(opp_sp_id)
                 sp_matched += 1
+                # Real SP handedness
+                sp_hand = handedness.get(int(opp_sp_id), {}).get("pitch_hand", "R")
 
         proxy_mode = batter_input["_provenance"].get("k_rate") != "measured"
         if proxy_mode:
             proxy_count += 1
 
         scored_result = _score_one(market, result, batter_input, pitcher_input,
-                                   sp_id_used, proxy_mode)
+                                   sp_id_used, proxy_mode,
+                                   batter_hand=batter_hand, sp_hand=sp_hand,
+                                   hand_real=hand_real, weather=weather)
         if scored_result is None:
             continue
 
@@ -317,8 +542,10 @@ def run_backtest(
 
         scored += 1
 
+    weather_conn.close()
     log.info(f"\nScored {scored} player-games | Unmatched batters: {unmatched} | "
-             f"SP matched: {sp_matched} | Proxy-mode: {proxy_count}")
+             f"SP matched: {sp_matched} | Proxy-mode: {proxy_count} | "
+             f"Weather unknown: {weather_unknown}")
     return {
         "market": market,
         "vig_factor": VIG_BY_MARKET.get(market, 0.535),
@@ -326,6 +553,7 @@ def run_backtest(
         "unmatched": unmatched,
         "sp_matched": sp_matched,
         "proxy_count": proxy_count,
+        "weather_unknown": weather_unknown,
         "buckets": buckets,
     }
 
@@ -373,13 +601,17 @@ def print_calibration_report(results: Dict) -> None:
         print(f"  {'OVERALL':<12} {total_plays:>6} {overall*100:>9.1f}% {roi_str:>12}")
 
     print()
+    weather_unknown = results.get("weather_unknown", 0)
     sp_matched = results.get("sp_matched", 0)
     sp_note = (f"{sp_matched:,} player-games used real SP stats (run backtest_enrich_sp.py to add more)"
                if sp_matched else "SP stats are league-average for all games (run backtest_enrich_sp.py)")
     print("  ⚠️  Caveats:")
     print(f"  - {sp_note}")
     print("  - Uses current season stats for ALL historical dates (snapshot bias)")
-    print("  - Batter handedness and weather defaulted to neutral")
+    print("  - Batter/SP handedness: real from MLBAM API (R default on fetch failure)")
+    print(f"  - Weather: real archive data from Open-Meteo; {weather_unknown} games weather-unknown "
+          "(scored as neutral — dome-equivalent 50.0)")
+    print("  - Weather-unknown games: archive fetch failed or home_team not in STADIUM_COORDS")
     print("  - ROI assumes no historical prop odds (Odds API Business needed for real vig)")
     print("=" * 60)
 
@@ -665,16 +897,12 @@ def run_ml_backtest(season: int = 2026) -> Dict:
         away_off_wrc = sum(away_wrc_vals) / len(away_wrc_vals) if away_wrc_vals else 100.0
 
         home_wp, _ = compute_win_probability(
-            home_sp_stats=home_sp_stats,
-            away_sp_stats=away_sp_stats,
-            home_off_wrc=home_off_wrc,
-            away_off_wrc=away_off_wrc,
-            home_bp_vuln=50.0,
-            away_bp_vuln=50.0,
-            home_run_diff=0.0,
-            away_run_diff=0.0,
-            home_implied_runs=0.0,
-            away_implied_runs=0.0,
+            home_sp_vuln,
+            away_sp_vuln,
+            home_off_wrc,
+            away_off_wrc,
+            50.0,   # home_bp_vuln — no per-game BP data in backtest
+            50.0,   # away_bp_vuln
         )
 
         # Pick the side the model favors and check if it won
