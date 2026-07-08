@@ -3816,7 +3816,7 @@ def fetch_team_roster(team_id: int) -> List[Dict]:
                 batters.append({
                     "player_id": pid,
                     "name": p["person"]["fullName"],
-                    "lineup_slot": 5,
+                    "lineup_slot": None,  # unknown — not yet in a confirmed lineup
                     "batter_hand": bat_hand or "R",
                     "position": pos_abbr,
                     "lineup_confirmed": False,
